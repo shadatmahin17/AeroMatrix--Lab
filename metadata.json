@@ -1,0 +1,6 @@
+{
+  "name": "AeroLab - 3D Aircraft CFD & 2D Airfoil Wind Tunnel",
+  "description": "Unified interactive 3D Biot-Savart aircraft wind tunnel and real-time 2D Lattice-Boltzmann airfoil lab with Bézier shape sculpting, NeuroFoil surrogate polars, and telemetry export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
