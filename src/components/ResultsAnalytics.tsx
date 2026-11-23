@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Plotly from "plotly.js-basic-dist-min";
+import * as d3 from "d3";
 import { Download, FileJson, FileSpreadsheet, Plus, RotateCcw, Trash2, TrendingUp } from "lucide-react";
-import { downloadBlob, downloadText, stem, toCsv } from "../lib/files.js";
+import { downloadText, stem, toCsv } from "../lib/files.js";
+import { downloadSvgAsPng, downloadSvgElement } from "../utils/telemetryExport";
 import type { BenchmarkRunDoc, NeutralReferenceData } from "../lib/airfoilRepository.ts";
 import type { TelemetrySample } from "../types/airfoil.ts";
 
@@ -66,250 +67,6 @@ function buildPolarPoints(samples: TelemetrySample[]): PolarPoint[] {
     .sort((a, b) => a.alpha - b.alpha);
 }
 
-function buildPlotSpec({
-  samples,
-  mode,
-  airfoilName,
-  neutralRef = null,
-  bestBenchmark = null,
-  forExport = false,
-}: {
-  samples: TelemetrySample[];
-  mode: ChartMode;
-  airfoilName: string;
-  neutralRef?: NeutralReferenceData | null;
-  bestBenchmark?: BenchmarkRunDoc | null;
-  forExport?: boolean;
-}) {
-  const valid = samples.filter((s) => s.cl !== null && s.cd !== null);
-  const polarPts = mode === "history" ? [] : buildPolarPoints(valid);
-
-  let data: Array<Record<string, unknown>> = [];
-  const isDualAxis = mode !== "ld";
-
-  if (mode === "history") {
-    const xs = valid.map((s) => s.id);
-    const custom = valid.map((s) => [
-      s.alpha.toFixed(1),
-      s.ld !== null ? s.ld.toFixed(2) : "—",
-      s.separationPct,
-      s.reynolds.toLocaleString(),
-    ]);
-    data = [
-      {
-        type: "scatter",
-        mode: valid.length <= 24 ? "lines+markers" : "lines",
-        name: "CL",
-        x: xs,
-        y: valid.map((s) => s.cl),
-        customdata: custom,
-        line: { color: "#1769AA", width: forExport ? 2.4 : 2 },
-        marker: { color: "#1769AA", size: forExport ? 5 : 4 },
-        fill: "tozeroy",
-        fillcolor: "rgba(23, 105, 170, 0.07)",
-        hovertemplate: "CL: <b>%{y:.3f}</b>  (α=%{customdata[0]}°, Sep=%{customdata[2]}%)<extra></extra>",
-      },
-      {
-        type: "scatter",
-        mode: valid.length <= 24 ? "lines+markers" : "lines",
-        name: "CD",
-        yaxis: "y2",
-        x: xs,
-        y: valid.map((s) => s.cd),
-        customdata: custom,
-        line: { color: "#D97706", width: forExport ? 2.2 : 1.8, dash: "dot" },
-        marker: { color: "#D97706", size: forExport ? 5 : 4, symbol: "diamond" },
-        hovertemplate: "CD: <b>%{y:.4f}</b>  (L/D=%{customdata[1]}, Re=%{customdata[3]})<extra></extra>",
-      },
-    ];
-    if (bestBenchmark && xs.length >= 2) {
-      data.push({
-        type: "scatter",
-        mode: "lines",
-        name: `Best CL (${bestBenchmark.airfoilName})`,
-        x: [xs[0], xs[xs.length - 1]],
-        y: [bestBenchmark.cl, bestBenchmark.cl],
-        line: { color: "#047857", width: 1.4, dash: "dashdot" },
-        hovertemplate: `Best CL: <b>%{y:.3f}</b> (${bestBenchmark.airfoilName})<extra></extra>`,
-      });
-    }
-  } else if (mode === "polar") {
-    const xs = polarPts.map((p) => p.alpha);
-    const custom = polarPts.map((p) => [p.ld.toFixed(2), p.sep, p.count]);
-    data = [
-      {
-        type: "scatter",
-        mode: "lines+markers",
-        name: "CL",
-        x: xs,
-        y: polarPts.map((p) => p.cl),
-        customdata: custom,
-        line: { color: "#1769AA", width: forExport ? 2.5 : 2, shape: "spline", smoothing: 0.45 },
-        marker: { color: "#1769AA", size: forExport ? 7 : 5.5 },
-        hovertemplate: "CL: <b>%{y:.3f}</b>  (L/D=%{customdata[0]}, n=%{customdata[2]})<extra></extra>",
-      },
-      {
-        type: "scatter",
-        mode: "lines+markers",
-        name: "CD",
-        yaxis: "y2",
-        x: xs,
-        y: polarPts.map((p) => p.cd),
-        customdata: custom,
-        line: { color: "#D97706", width: forExport ? 2.2 : 1.8, dash: "dash", shape: "spline", smoothing: 0.45 },
-        marker: { color: "#D97706", size: forExport ? 6.5 : 5, symbol: "diamond" },
-        hovertemplate: "CD: <b>%{y:.4f}</b>  (Sep=%{customdata[1]}%)<extra></extra>",
-      },
-    ];
-    if (neutralRef?.rows?.length) {
-      const refPrefix = neutralRef.label?.startsWith("NeuroFoil") ? "NeuroFoil" : "Ref";
-      data.push({
-        type: "scatter",
-        mode: "lines",
-        name: `${refPrefix} CL`,
-        x: neutralRef.rows.map((r) => r.alpha),
-        y: neutralRef.rows.map((r) => r.cl),
-        line: { color: "#64748B", width: 1.5, dash: "dot" },
-        hovertemplate: `${refPrefix} CL: <b>%{y:.3f}</b> (${neutralRef.airfoilName})<extra></extra>`,
-      });
-    }
-  } else {
-    const xs = polarPts.map((p) => p.alpha);
-    const custom = polarPts.map((p) => [p.cl.toFixed(3), p.cd.toFixed(4), p.sep]);
-    data = [
-      {
-        type: "scatter",
-        mode: "lines+markers",
-        name: "L/D",
-        x: xs,
-        y: polarPts.map((p) => p.ld),
-        customdata: custom,
-        line: { color: "#047857", width: forExport ? 2.5 : 2.1, shape: "spline", smoothing: 0.45 },
-        marker: { color: "#047857", size: forExport ? 7 : 5.5 },
-        fill: "tozeroy",
-        fillcolor: "rgba(4, 120, 87, 0.08)",
-        hovertemplate: "L/D: <b>%{y:.2f}</b>  (CL=%{customdata[0]}, CD=%{customdata[1]}, Sep=%{customdata[2]}%)<extra></extra>",
-      },
-    ];
-    if (neutralRef?.rows?.length) {
-      const refPrefix = neutralRef.label?.startsWith("NeuroFoil") ? "NeuroFoil" : "Ref";
-      data.push({
-        type: "scatter",
-        mode: "lines",
-        name: `${refPrefix} L/D`,
-        x: neutralRef.rows.map((r) => r.alpha),
-        y: neutralRef.rows.map((r) => r.ld),
-        line: { color: "#64748B", width: 1.5, dash: "dot" },
-        hovertemplate: `${refPrefix} L/D: <b>%{y:.2f}</b> (${neutralRef.airfoilName})<extra></extra>`,
-      });
-    }
-    if (bestBenchmark) {
-      data.push({
-        type: "scatter",
-        mode: "markers",
-        name: `Best (${bestBenchmark.airfoilName})`,
-        x: [bestBenchmark.alpha],
-        y: [bestBenchmark.ld],
-        marker: { color: "#D97706", size: forExport ? 11 : 9, symbol: "star" },
-        hovertemplate: `Best L/D: <b>%{y:.2f}</b> @ ${bestBenchmark.alpha.toFixed(1)}° (${bestBenchmark.airfoilName})<extra></extra>`,
-      });
-    }
-  }
-
-  const modeTitle = mode === "history" ? "Telemetry History" : mode === "polar" ? "AoA Polar (CL / CD)" : "Efficiency Polar (L/D)";
-  const hasData = mode === "history" ? valid.length > 0 : polarPts.length > 0;
-
-  const layout: Record<string, unknown> = {
-    paper_bgcolor: "#FFFFFF",
-    plot_bgcolor: "#FFFFFF",
-    font: { family: PLOT_FONT_MONO, size: forExport ? 12 : 9.5, color: "#5C6670" },
-    margin: forExport
-      ? { l: 64, r: isDualAxis ? 64 : 28, t: 68, b: 52 }
-      : { l: 38, r: isDualAxis ? 40 : 14, t: 26, b: 30 },
-    title: forExport
-      ? {
-          text: `<b>AeroLab 2D Wind Tunnel — ${airfoilName}</b><br><span style="font-size:12px;color:#5C6670">${modeTitle} · ${valid.length} samples · D2Q9 Smagorinsky LES</span>`,
-          font: { family: PLOT_FONT_SANS, size: 16, color: "#161A1D" },
-          x: 0.04,
-          y: 0.96,
-        }
-      : undefined,
-    showlegend: true,
-    legend: {
-      orientation: "h",
-      x: 0,
-      y: forExport ? 1.07 : 1.15,
-      xanchor: "left",
-      yanchor: "bottom",
-      bgcolor: "rgba(255,255,255,0)",
-      font: { family: PLOT_FONT_MONO, size: forExport ? 12 : 10, color: "#161A1D" },
-    },
-    hovermode: "x unified",
-    hoverlabel: {
-      bgcolor: "#FFFFFF",
-      bordercolor: "#D9DEE2",
-      font: { family: PLOT_FONT_MONO, size: 10.5, color: "#161A1D" },
-    },
-    uirevision: mode,
-    xaxis: {
-      title: forExport
-        ? { text: mode === "history" ? "Sample #" : "Angle of Attack α (°)", standoff: 10, font: { size: 12, color: "#161A1D" } }
-        : undefined,
-      tickprefix: mode === "history" ? "#" : "",
-      ticksuffix: mode === "history" ? "" : "°",
-      gridcolor: "#E5E9EC",
-      linecolor: "#D9DEE2",
-      mirror: true,
-      zeroline: mode !== "history",
-      zerolinecolor: "#CBD5E1",
-      zerolinewidth: 1,
-      tickfont: { size: forExport ? 11 : 9.5, color: "#5C6670" },
-    },
-    yaxis: {
-      title: forExport
-        ? { text: mode === "ld" ? "Lift / Drag (L/D)" : "Lift Coefficient (CL)", standoff: 8, font: { size: 12, color: mode === "ld" ? "#047857" : "#1769AA" } }
-        : undefined,
-      gridcolor: "#E5E9EC",
-      linecolor: "#D9DEE2",
-      mirror: !isDualAxis,
-      zeroline: true,
-      zerolinecolor: "#CBD5E1",
-      zerolinewidth: 1,
-      tickfont: { size: forExport ? 11 : 9.5, color: mode === "ld" ? "#047857" : "#1769AA" },
-    },
-    ...(isDualAxis
-      ? {
-          yaxis2: {
-            title: forExport
-              ? { text: "Drag Coefficient (CD)", standoff: 8, font: { size: 12, color: "#D97706" } }
-              : undefined,
-            overlaying: "y",
-            side: "right",
-            showgrid: false,
-            zeroline: false,
-            linecolor: "#D9DEE2",
-            tickfont: { size: forExport ? 11 : 9.5, color: "#D97706" },
-          },
-        }
-      : {}),
-    annotations: !hasData
-      ? [
-          {
-            text: "Waiting for solver telemetry…",
-            xref: "paper",
-            yref: "paper",
-            x: 0.5,
-            y: 0.5,
-            showarrow: false,
-            font: { family: PLOT_FONT_SANS, size: 12, color: "#5C6670" },
-          },
-        ]
-      : [],
-  };
-
-  return { data, layout };
-}
-
 interface ResultsAnalyticsProps {
   samples: TelemetrySample[];
   airfoilName: string;
@@ -327,107 +84,655 @@ export default function ResultsAnalytics({
   onRecordSnapshot,
   onClearSamples,
 }: ResultsAnalyticsProps) {
-  const plotRef = useRef<HTMLDivElement>(null);
-  const isReadyRef = useRef(false);
-  const [chartMode, setChartMode] = useState<ChartMode>("history");
-  const [revisionBump, setRevisionBump] = useState(0);
-  const [visibleTick, setVisibleTick] = useState(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const zoomBehaviorRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
 
-  const spec = useMemo(
-    () =>
-      buildPlotSpec({
-        samples,
-        mode: chartMode,
-        airfoilName,
-        neutralRef,
-        bestBenchmark,
-        forExport: false,
-      }),
-    [samples, chartMode, airfoilName, neutralRef, bestBenchmark]
+  const [chartMode, setChartMode] = useState<ChartMode>("history");
+  const [dims, setDims] = useState<{ width: number; height: number }>({ width: 340, height: 212 });
+  const [zoomTransform, setZoomTransform] = useState<d3.ZoomTransform>(() => d3.zoomIdentity);
+  const [probeReadout, setProbeReadout] = useState<string | null>(null);
+
+  const validSamples = useMemo(
+    () => samples.filter((s) => s.cl !== null && s.cd !== null),
+    [samples]
+  );
+
+  const polarPts = useMemo(
+    () => (chartMode === "history" ? [] : buildPolarPoints(validSamples)),
+    [chartMode, validSamples]
   );
 
   useEffect(() => {
-    const el = plotRef.current as (HTMLDivElement & { _fullLayout?: unknown }) | null;
-    if (!el || !el.isConnected || el.offsetWidth === 0 || el.offsetHeight === 0) return;
-
-    let cancelled = false;
-    const layout = {
-      ...spec.layout,
-      uirevision: `${chartMode}-${revisionBump}`,
+    const el = containerRef.current;
+    if (!el) return;
+    const sync = () => {
+      const w = Math.max(240, Math.floor(el.clientWidth));
+      const h = Math.max(196, Math.floor(el.clientHeight) || 212);
+      setDims((prev) => (prev.width === w && prev.height === h ? prev : { width: w, height: h }));
     };
+    sync();
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(sync) : null;
+    ro?.observe(el);
+    return () => ro?.disconnect();
+  }, []);
 
-    void Plotly.react(el, spec.data, layout, {
-      responsive: false,
-      displayModeBar: false,
-      scrollZoom: true,
-    })
-      .then(() => {
-        if (!cancelled) {
-          isReadyRef.current = true;
-        }
-      })
-      .catch(() => {
-        // Ignore transient errors if element unmounted mid-render
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [spec, chartMode, revisionBump, visibleTick]);
+  const handleResetZoom = useCallback(() => {
+    setZoomTransform(d3.zoomIdentity);
+    if (svgRef.current && zoomBehaviorRef.current) {
+      d3.select(svgRef.current).call(zoomBehaviorRef.current.transform, d3.zoomIdentity);
+    }
+  }, []);
 
   useEffect(() => {
-    const el = plotRef.current as (HTMLDivElement & { _fullLayout?: unknown }) | null;
-    if (!el) return undefined;
+    setProbeReadout(null);
+    handleResetZoom();
+  }, [chartMode, handleResetZoom]);
 
-    const ro =
-      typeof ResizeObserver !== "undefined"
-        ? new ResizeObserver(() => {
-            if (!el.isConnected || el.offsetWidth === 0 || el.offsetHeight === 0) return;
-            if (isReadyRef.current && el._fullLayout) {
-              try {
-                Plotly.Plots.resize(el);
-              } catch {
-                // Ignore if Plotly layout is mid-transition
-              }
-            } else {
-              setVisibleTick((t) => t + 1);
-            }
-          })
-        : null;
+  useEffect(() => {
+    const svgEl = svgRef.current;
+    if (!svgEl) return;
 
-    ro?.observe(el);
-    return () => {
-      ro?.disconnect();
-      isReadyRef.current = false;
-      try {
-        Plotly.purge(el);
-      } catch {
-        // Ignore purge errors on detached nodes
-      }
+    const svg = d3.select(svgEl);
+    svg.selectAll("*").remove();
+
+    const { width, height } = dims;
+    svg
+      .attr("viewBox", `0 0 ${width} ${height}`)
+      .attr("width", width)
+      .attr("height", height);
+
+    svg
+      .append("rect")
+      .attr("class", "export-bg")
+      .attr("x", 0)
+      .attr("y", 0)
+      .attr("width", width)
+      .attr("height", height)
+      .attr("fill", "#FFFFFF");
+
+    const isDualAxis = chartMode !== "ld";
+    const margin = {
+      top: 24,
+      right: isDualAxis ? 42 : 14,
+      bottom: 26,
+      left: 38,
     };
-  }, []);
+    const innerW = Math.max(100, width - margin.left - margin.right);
+    const innerH = Math.max(80, height - margin.top - margin.bottom);
+
+    const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+    const hasData = chartMode === "history" ? validSamples.length > 0 : polarPts.length > 0;
+
+    if (!hasData) {
+      g.append("rect")
+        .attr("x", 0)
+        .attr("y", 0)
+        .attr("width", innerW)
+        .attr("height", innerH)
+        .attr("fill", "none")
+        .attr("stroke", "#E5E9EC");
+
+      g.append("text")
+        .attr("x", innerW / 2)
+        .attr("y", innerH / 2)
+        .attr("text-anchor", "middle")
+        .attr("dominant-baseline", "middle")
+        .style("font-family", PLOT_FONT_SANS)
+        .style("font-size", "12px")
+        .attr("fill", "#5C6670")
+        .text("Waiting for solver telemetry…");
+      return;
+    }
+
+    const defs = svg.append("defs");
+    const clipId = `telemetry-2d-clip-${chartMode}`;
+    defs
+      .append("clipPath")
+      .attr("id", clipId)
+      .append("rect")
+      .attr("width", innerW)
+      .attr("height", innerH);
+
+    const refPrefix = neutralRef?.label?.startsWith("NeuroFoil") ? "NeuroFoil" : "Ref";
+
+    // Compute domains
+    let xDomain: [number, number];
+    if (chartMode === "history") {
+      const xs = validSamples.map((s) => s.id);
+      const xMin = d3.min(xs) ?? 1;
+      const xMax = d3.max(xs) ?? 2;
+      xDomain = xMin === xMax ? [xMin - 1, xMax + 1] : [xMin, xMax];
+    } else {
+      const xs = [
+        ...polarPts.map((p) => p.alpha),
+        ...(neutralRef?.rows?.map((r) => r.alpha) ?? []),
+        ...(chartMode === "ld" && bestBenchmark ? [bestBenchmark.alpha] : []),
+      ];
+      const xMin = d3.min(xs) ?? -5;
+      const xMax = d3.max(xs) ?? 15;
+      xDomain = xMin === xMax ? [xMin - 2, xMax + 2] : [xMin - 0.5, xMax + 0.5];
+    }
+
+    const baseX = d3.scaleLinear().domain(xDomain).range([0, innerW]);
+    const x = zoomTransform.rescaleX(baseX);
+
+    let y1Domain: [number, number];
+    if (chartMode === "history") {
+      const cls = [
+        ...validSamples.map((s) => s.cl ?? 0),
+        ...(bestBenchmark ? [bestBenchmark.cl] : []),
+        0,
+      ];
+      const yMin = d3.min(cls) ?? 0;
+      const yMax = d3.max(cls) ?? 1;
+      const pad = Math.max(0.12, (yMax - yMin) * 0.14);
+      y1Domain = [yMin - pad * 0.4, yMax + pad];
+    } else if (chartMode === "polar") {
+      const cls = [
+        ...polarPts.map((p) => p.cl),
+        ...(neutralRef?.rows?.map((r) => r.cl) ?? []),
+        0,
+      ];
+      const yMin = d3.min(cls) ?? -0.5;
+      const yMax = d3.max(cls) ?? 1.5;
+      const pad = Math.max(0.15, (yMax - yMin) * 0.12);
+      y1Domain = [yMin - pad * 0.5, yMax + pad];
+    } else {
+      const lds = [
+        ...polarPts.map((p) => p.ld),
+        ...(neutralRef?.rows?.map((r) => r.ld) ?? []),
+        ...(bestBenchmark ? [bestBenchmark.ld] : []),
+        0,
+      ];
+      const yMin = d3.min(lds) ?? 0;
+      const yMax = d3.max(lds) ?? 20;
+      const pad = Math.max(2, (yMax - yMin) * 0.14);
+      y1Domain = [Math.min(0, yMin - pad * 0.3), yMax + pad];
+    }
+
+    const y1 = d3.scaleLinear().domain(y1Domain).nice(5).range([innerH, 0]);
+
+    let y2: d3.ScaleLinear<number, number> | null = null;
+    if (isDualAxis) {
+      const cds =
+        chartMode === "history"
+          ? validSamples.map((s) => s.cd ?? 0)
+          : polarPts.map((p) => p.cd);
+      const cdMax = Math.max(0.05, d3.max(cds) ?? 0.1);
+      y2 = d3.scaleLinear().domain([0, cdMax * 1.18]).nice(4).range([innerH, 0]);
+    }
+
+    // Legend strip in top margin
+    const legendItems: Array<{ color: string; label: string; dashed?: boolean }> = [];
+    if (chartMode === "history") {
+      legendItems.push({ color: "#1769AA", label: "CL" });
+      legendItems.push({ color: "#D97706", label: "CD", dashed: true });
+      if (bestBenchmark && validSamples.length >= 2) {
+        legendItems.push({ color: "#047857", label: "Best CL", dashed: true });
+      }
+    } else if (chartMode === "polar") {
+      legendItems.push({ color: "#1769AA", label: "CL" });
+      legendItems.push({ color: "#D97706", label: "CD", dashed: true });
+      if (neutralRef?.rows?.length) {
+        legendItems.push({ color: "#64748B", label: `${refPrefix} CL`, dashed: true });
+      }
+    } else {
+      legendItems.push({ color: "#047857", label: "L/D" });
+      if (neutralRef?.rows?.length) {
+        legendItems.push({ color: "#64748B", label: `${refPrefix} L/D`, dashed: true });
+      }
+      if (bestBenchmark) {
+        legendItems.push({ color: "#D97706", label: "Best" });
+      }
+    }
+
+    let lx = margin.left;
+    for (const item of legendItems) {
+      const itemG = svg.append("g").attr("transform", `translate(${lx}, 8)`);
+      itemG
+        .append("line")
+        .attr("x1", 0)
+        .attr("x2", 12)
+        .attr("y1", 5)
+        .attr("y2", 5)
+        .attr("stroke", item.color)
+        .attr("stroke-width", 2)
+        .attr("stroke-dasharray", item.dashed ? "3 2" : "none");
+      itemG
+        .append("text")
+        .attr("x", 16)
+        .attr("y", 8)
+        .style("font-family", PLOT_FONT_MONO)
+        .style("font-size", "9.5px")
+        .style("font-weight", "600")
+        .attr("fill", "#161A1D")
+        .text(item.label);
+      lx += item.label.length * 6.2 + 26;
+    }
+
+    // Hairline Gridlines
+    g.append("g")
+      .call(d3.axisLeft(y1).ticks(5).tickSize(-innerW).tickFormat(() => ""))
+      .call((sel) => sel.select(".domain").remove())
+      .call((sel) =>
+        sel
+          .selectAll("line")
+          .attr("stroke", "#E5E9EC")
+          .attr("stroke-width", 1)
+      );
+
+    g.append("g")
+      .attr("transform", `translate(0,${innerH})`)
+      .call(d3.axisBottom(x).ticks(5).tickSize(-innerH).tickFormat(() => ""))
+      .call((sel) => sel.select(".domain").remove())
+      .call((sel) =>
+        sel
+          .selectAll("line")
+          .attr("stroke", "#E5E9EC")
+          .attr("stroke-width", 1)
+      );
+
+    // Zero lines
+    if (y1.domain()[0] <= 0 && y1.domain()[1] >= 0) {
+      g.append("line")
+        .attr("x1", 0)
+        .attr("x2", innerW)
+        .attr("y1", y1(0))
+        .attr("y2", y1(0))
+        .attr("stroke", "#CBD5E1")
+        .attr("stroke-width", 1);
+    }
+    if (chartMode !== "history" && x.domain()[0] <= 0 && x.domain()[1] >= 0) {
+      g.append("line")
+        .attr("x1", x(0))
+        .attr("x2", x(0))
+        .attr("y1", 0)
+        .attr("y2", innerH)
+        .attr("stroke", "#CBD5E1")
+        .attr("stroke-width", 1);
+    }
+
+    // Plot Box Frame
+    g.append("rect")
+      .attr("x", 0)
+      .attr("y", 0)
+      .attr("width", innerW)
+      .attr("height", innerH)
+      .attr("fill", "none")
+      .attr("stroke", "#D9DEE2");
+
+    const plotArea = g.append("g").attr("clip-path", `url(#${clipId})`);
+    const diamondGen = d3.symbol().type(d3.symbolDiamond).size(24);
+    const starGen = d3.symbol().type(d3.symbolStar).size(72);
+
+    if (chartMode === "history") {
+      const zeroY = Math.min(innerH, Math.max(0, y1(0)));
+      const clArea = d3
+        .area<TelemetrySample>()
+        .x((d) => x(d.id))
+        .y0(zeroY)
+        .y1((d) => y1(d.cl ?? 0));
+
+      plotArea
+        .append("path")
+        .datum(validSamples)
+        .attr("d", clArea)
+        .attr("fill", "rgba(23, 105, 170, 0.08)");
+
+      const clLine = d3
+        .line<TelemetrySample>()
+        .x((d) => x(d.id))
+        .y((d) => y1(d.cl ?? 0));
+
+      plotArea
+        .append("path")
+        .datum(validSamples)
+        .attr("d", clLine)
+        .attr("fill", "none")
+        .attr("stroke", "#1769AA")
+        .attr("stroke-width", 2);
+
+      if (y2) {
+        const cdLine = d3
+          .line<TelemetrySample>()
+          .x((d) => x(d.id))
+          .y((d) => y2!(d.cd ?? 0));
+
+        plotArea
+          .append("path")
+          .datum(validSamples)
+          .attr("d", cdLine)
+          .attr("fill", "none")
+          .attr("stroke", "#D97706")
+          .attr("stroke-width", 1.8)
+          .attr("stroke-dasharray", "2 3");
+      }
+
+      if (validSamples.length <= 24) {
+        plotArea
+          .selectAll("circle.cl-pt")
+          .data(validSamples)
+          .join("circle")
+          .attr("class", "cl-pt")
+          .attr("cx", (d) => x(d.id))
+          .attr("cy", (d) => y1(d.cl ?? 0))
+          .attr("r", 2.8)
+          .attr("fill", "#1769AA");
+
+        if (y2) {
+          plotArea
+            .selectAll("path.cd-pt")
+            .data(validSamples)
+            .join("path")
+            .attr("class", "cd-pt")
+            .attr("d", diamondGen)
+            .attr("transform", (d) => `translate(${x(d.id)},${y2!(d.cd ?? 0)})`)
+            .attr("fill", "#D97706");
+        }
+      }
+
+      if (bestBenchmark && validSamples.length >= 2) {
+        plotArea
+          .append("line")
+          .attr("x1", 0)
+          .attr("x2", innerW)
+          .attr("y1", y1(bestBenchmark.cl))
+          .attr("y2", y1(bestBenchmark.cl))
+          .attr("stroke", "#047857")
+          .attr("stroke-width", 1.4)
+          .attr("stroke-dasharray", "6 3 2 3");
+      }
+    } else if (chartMode === "polar") {
+      if (neutralRef?.rows?.length) {
+        const refLine = d3
+          .line<{ alpha: number; cl: number }>()
+          .x((d) => x(d.alpha))
+          .y((d) => y1(d.cl))
+          .curve(d3.curveMonotoneX);
+
+        plotArea
+          .append("path")
+          .datum(neutralRef.rows)
+          .attr("d", refLine)
+          .attr("fill", "none")
+          .attr("stroke", "#64748B")
+          .attr("stroke-width", 1.5)
+          .attr("stroke-dasharray", "2 3");
+      }
+
+      const clLine = d3
+        .line<PolarPoint>()
+        .x((d) => x(d.alpha))
+        .y((d) => y1(d.cl))
+        .curve(d3.curveMonotoneX);
+
+      plotArea
+        .append("path")
+        .datum(polarPts)
+        .attr("d", clLine)
+        .attr("fill", "none")
+        .attr("stroke", "#1769AA")
+        .attr("stroke-width", 2);
+
+      plotArea
+        .selectAll("circle.cl-pt")
+        .data(polarPts)
+        .join("circle")
+        .attr("class", "cl-pt")
+        .attr("cx", (d) => x(d.alpha))
+        .attr("cy", (d) => y1(d.cl))
+        .attr("r", 3.2)
+        .attr("fill", "#1769AA")
+        .attr("stroke", "#FFFFFF")
+        .attr("stroke-width", 1);
+
+      if (y2) {
+        const cdLine = d3
+          .line<PolarPoint>()
+          .x((d) => x(d.alpha))
+          .y((d) => y2!(d.cd))
+          .curve(d3.curveMonotoneX);
+
+        plotArea
+          .append("path")
+          .datum(polarPts)
+          .attr("d", cdLine)
+          .attr("fill", "none")
+          .attr("stroke", "#D97706")
+          .attr("stroke-width", 1.8)
+          .attr("stroke-dasharray", "5 3");
+
+        plotArea
+          .selectAll("path.cd-pt")
+          .data(polarPts)
+          .join("path")
+          .attr("class", "cd-pt")
+          .attr("d", diamondGen)
+          .attr("transform", (d) => `translate(${x(d.alpha)},${y2!(d.cd)})`)
+          .attr("fill", "#D97706");
+      }
+    } else {
+      const zeroY = Math.min(innerH, Math.max(0, y1(0)));
+      const ldArea = d3
+        .area<PolarPoint>()
+        .x((d) => x(d.alpha))
+        .y0(zeroY)
+        .y1((d) => y1(d.ld))
+        .curve(d3.curveMonotoneX);
+
+      plotArea
+        .append("path")
+        .datum(polarPts)
+        .attr("d", ldArea)
+        .attr("fill", "rgba(4, 120, 87, 0.08)");
+
+      if (neutralRef?.rows?.length) {
+        const refLine = d3
+          .line<{ alpha: number; ld: number }>()
+          .x((d) => x(d.alpha))
+          .y((d) => y1(d.ld))
+          .curve(d3.curveMonotoneX);
+
+        plotArea
+          .append("path")
+          .datum(neutralRef.rows)
+          .attr("d", refLine)
+          .attr("fill", "none")
+          .attr("stroke", "#64748B")
+          .attr("stroke-width", 1.5)
+          .attr("stroke-dasharray", "2 3");
+      }
+
+      const ldLine = d3
+        .line<PolarPoint>()
+        .x((d) => x(d.alpha))
+        .y((d) => y1(d.ld))
+        .curve(d3.curveMonotoneX);
+
+      plotArea
+        .append("path")
+        .datum(polarPts)
+        .attr("d", ldLine)
+        .attr("fill", "none")
+        .attr("stroke", "#047857")
+        .attr("stroke-width", 2.1);
+
+      plotArea
+        .selectAll("circle.ld-pt")
+        .data(polarPts)
+        .join("circle")
+        .attr("class", "ld-pt")
+        .attr("cx", (d) => x(d.alpha))
+        .attr("cy", (d) => y1(d.ld))
+        .attr("r", 3.2)
+        .attr("fill", "#047857")
+        .attr("stroke", "#FFFFFF")
+        .attr("stroke-width", 1);
+
+      if (bestBenchmark) {
+        plotArea
+          .append("path")
+          .attr("d", starGen)
+          .attr("transform", `translate(${x(bestBenchmark.alpha)},${y1(bestBenchmark.ld)})`)
+          .attr("fill", "#D97706")
+          .attr("stroke", "#FFFFFF")
+          .attr("stroke-width", 1);
+      }
+    }
+
+    // Axes
+    g.append("g")
+      .attr("transform", `translate(0,${innerH})`)
+      .call(
+        d3
+          .axisBottom(x)
+          .ticks(5)
+          .tickFormat((v) =>
+            chartMode === "history" ? `#${Math.round(Number(v))}` : `${Number(v).toFixed(0)}°`
+          )
+      )
+      .call((sel) => sel.select(".domain").attr("stroke", "#D9DEE2"))
+      .call((sel) => sel.selectAll("line").attr("stroke", "#D9DEE2"))
+      .call((sel) =>
+        sel
+          .selectAll("text")
+          .style("font-family", PLOT_FONT_MONO)
+          .style("font-size", "9.5px")
+          .attr("fill", "#5C6670")
+      );
+
+    g.append("g")
+      .call(d3.axisLeft(y1).ticks(5))
+      .call((sel) => sel.select(".domain").attr("stroke", "#D9DEE2"))
+      .call((sel) => sel.selectAll("line").attr("stroke", "#D9DEE2"))
+      .call((sel) =>
+        sel
+          .selectAll("text")
+          .style("font-family", PLOT_FONT_MONO)
+          .style("font-size", "9.5px")
+          .attr("fill", chartMode === "ld" ? "#047857" : "#1769AA")
+      );
+
+    if (y2) {
+      g.append("g")
+        .attr("transform", `translate(${innerW},0)`)
+        .call(d3.axisRight(y2).ticks(4))
+        .call((sel) => sel.select(".domain").attr("stroke", "#D9DEE2"))
+        .call((sel) => sel.selectAll("line").attr("stroke", "#D9DEE2"))
+        .call((sel) =>
+          sel
+            .selectAll("text")
+            .style("font-family", PLOT_FONT_MONO)
+            .style("font-size", "9.5px")
+            .attr("fill", "#D97706")
+        );
+    }
+
+    // Crosshair + Bisector Hover Probe
+    const focusG = g.append("g").style("display", "none").attr("pointer-events", "none");
+    const focusLine = focusG
+      .append("line")
+      .attr("y1", 0)
+      .attr("y2", innerH)
+      .attr("stroke", "#161A1D")
+      .attr("stroke-width", 1)
+      .attr("stroke-dasharray", "3 2")
+      .attr("opacity", 0.45);
+    const focusDot1 = focusG
+      .append("circle")
+      .attr("r", 4.5)
+      .attr("fill", chartMode === "ld" ? "#047857" : "#1769AA")
+      .attr("stroke", "#FFFFFF")
+      .attr("stroke-width", 1.5);
+    const focusDot2 = focusG
+      .append("circle")
+      .attr("r", 4)
+      .attr("fill", "#D97706")
+      .attr("stroke", "#FFFFFF")
+      .attr("stroke-width", 1.5)
+      .style("display", isDualAxis ? "inline" : "none");
+
+    const zoomBehavior = d3
+      .zoom<SVGSVGElement, unknown>()
+      .scaleExtent([1, 10])
+      .translateExtent([
+        [0, 0],
+        [width, height],
+      ])
+      .on("zoom", (event) => {
+        setZoomTransform(event.transform);
+      });
+
+    zoomBehaviorRef.current = zoomBehavior;
+    svg.call(zoomBehavior);
+    svg.on("dblclick.zoom", () => {
+      handleResetZoom();
+    });
+
+    const overlay = g
+      .append("rect")
+      .attr("width", innerW)
+      .attr("height", innerH)
+      .attr("fill", "transparent")
+      .style("cursor", "crosshair")
+      .on("mouseleave", () => {
+        focusG.style("display", "none");
+        setProbeReadout(null);
+      })
+      .on("mousemove", (event) => {
+        const [mx] = d3.pointer(event, overlay.node()!);
+        const xVal = x.invert(mx);
+
+        if (chartMode === "history") {
+          const bisect = d3.bisector<TelemetrySample, number>((d) => d.id).center;
+          const idx = Math.max(0, Math.min(validSamples.length - 1, bisect(validSamples, xVal)));
+          const pt = validSamples[idx];
+          if (!pt) return;
+          const px = x(pt.id);
+          const py1 = y1(pt.cl ?? 0);
+          const py2 = y2 ? y2(pt.cd ?? 0) : py1;
+          focusG.style("display", null);
+          focusLine.attr("x1", px).attr("x2", px);
+          focusDot1.attr("cx", px).attr("cy", py1);
+          if (isDualAxis) focusDot2.attr("cx", px).attr("cy", py2);
+          setProbeReadout(
+            `#${pt.id} · α=${pt.alpha.toFixed(1)}° · CL ${(pt.cl ?? 0).toFixed(3)} · CD ${(pt.cd ?? 0).toFixed(4)} · Sep ${pt.separationPct}%`
+          );
+        } else {
+          const bisect = d3.bisector<PolarPoint, number>((d) => d.alpha).center;
+          const idx = Math.max(0, Math.min(polarPts.length - 1, bisect(polarPts, xVal)));
+          const pt = polarPts[idx];
+          if (!pt) return;
+          const px = x(pt.alpha);
+          const py1 = chartMode === "ld" ? y1(pt.ld) : y1(pt.cl);
+          const py2 = y2 ? y2(pt.cd) : py1;
+          focusG.style("display", null);
+          focusLine.attr("x1", px).attr("x2", px);
+          focusDot1.attr("cx", px).attr("cy", py1);
+          if (isDualAxis) focusDot2.attr("cx", px).attr("cy", py2);
+          setProbeReadout(
+            chartMode === "ld"
+              ? `α=${pt.alpha.toFixed(1)}° · L/D ${pt.ld.toFixed(2)} · CL ${pt.cl.toFixed(3)} · Sep ${pt.sep}%`
+              : `α=${pt.alpha.toFixed(1)}° · CL ${pt.cl.toFixed(3)} · CD ${pt.cd.toFixed(4)} · L/D ${pt.ld.toFixed(1)}`
+          );
+        }
+      });
+  }, [dims, chartMode, validSamples, polarPts, neutralRef, bestBenchmark, zoomTransform, handleResetZoom]);
 
   const handleExportImage = useCallback(
     async (format: "png" | "svg") => {
-      if (!samples.length) return;
-      const exportSpec = buildPlotSpec({
-        samples,
-        mode: chartMode,
-        airfoilName,
-        neutralRef,
-        bestBenchmark,
-        forExport: true,
-      });
-      const dataUrl = await Plotly.toImage(
-        { data: exportSpec.data, layout: exportSpec.layout },
-        { format, width: 1100, height: 620, scale: format === "png" ? 2 : 1 }
-      );
+      if (!samples.length || !svgRef.current) return;
       const base = stem(airfoilName).replace(/[^\w.-]+/g, "_");
-      const res = await fetch(dataUrl);
-      const blob = await res.blob();
-      downloadBlob(`${base}_${chartMode}_graph.${format}`, blob);
+      const fileBase = `${base}_${chartMode}_graph`;
+      if (format === "svg") {
+        downloadSvgElement(svgRef.current, fileBase);
+      } else {
+        await downloadSvgAsPng(svgRef.current, fileBase, 2);
+      }
     },
-    [samples, chartMode, airfoilName, neutralRef, bestBenchmark]
+    [samples.length, chartMode, airfoilName]
   );
 
   const sheetRows = useMemo(
@@ -481,7 +786,7 @@ export default function ResultsAnalytics({
           <div className="flex items-center gap-1 shrink-0">
             <button
               type="button"
-              onClick={() => setRevisionBump((n) => n + 1)}
+              onClick={handleResetZoom}
               title="Reset zoom"
               aria-label="Reset graph zoom"
               className="p-1.5 rounded-md text-[#5C6670] hover:text-[#1769AA] bg-[var(--bg)] border border-[var(--border)] transition-colors cursor-pointer"
@@ -534,19 +839,28 @@ export default function ResultsAnalytics({
         </div>
 
         <div
-          ref={plotRef}
+          ref={containerRef}
           className="w-full h-52 sm:h-56 rounded-lg border border-[var(--border)] bg-white overflow-hidden"
-        />
+        >
+          <svg
+            ref={svgRef}
+            className="w-full h-full block select-none"
+            role="img"
+            aria-label={`D3.js 2D Wind Tunnel ${chartMode} telemetry chart`}
+          />
+        </div>
 
-        <div className="flex items-center justify-between text-[11px] font-mono tabular-nums text-[#5C6670]">
-          <span>
-            {chartMode === "history"
-              ? "Drag to zoom · Double-click resets"
-              : chartMode === "polar"
-                ? "Mean CL & CD vs α°"
-                : "Aerodynamic efficiency L/D vs α°"}
+        <div className="flex items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-[#5C6670]">
+          <span className="truncate text-[#161A1D]">
+            {probeReadout
+              ? probeReadout
+              : chartMode === "history"
+                ? "Scroll/drag to zoom · Double-click resets"
+                : chartMode === "polar"
+                  ? "Mean CL & CD vs α° (D3 SVG)"
+                  : "Aerodynamic efficiency L/D vs α° (D3 SVG)"}
           </span>
-          <span>{samples.length} pts</span>
+          <span className="shrink-0">{samples.length} pts</span>
         </div>
       </div>
 

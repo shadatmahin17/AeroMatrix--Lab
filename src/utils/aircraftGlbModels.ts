@@ -297,6 +297,23 @@ export function applyWireframeShading(root: THREE.Group, enabled: boolean): void
   });
 }
 
+const configureArrowOverlay = (arrow: THREE.ArrowHelper, renderOrder: number) => {
+  const lineMat = arrow.line.material as THREE.LineBasicMaterial;
+  const coneMat = arrow.cone.material as THREE.MeshBasicMaterial;
+  lineMat.transparent = true;
+  lineMat.opacity = 0.92;
+  lineMat.depthTest = false;
+  coneMat.transparent = true;
+  coneMat.opacity = 0.94;
+  coneMat.depthTest = false;
+  arrow.renderOrder = renderOrder;
+};
+
+export interface ForceVectorOptions {
+  cl?: number;
+  cd?: number;
+}
+
 /**
  * Creates 3D Force Vectors (Lift, Drag, Resultant, Center of Pressure)
  */
@@ -304,16 +321,17 @@ export function createAeroForceVectorsGroup(): THREE.Group {
   const group = new THREE.Group();
   group.name = 'AeroForceVectors';
 
-  // 1. Lift Vector (Emerald Green arrow, points +Y)
+  // 1. Lift Vector (Emerald Green arrow, points +Y or -Y)
   const liftArrow = new THREE.ArrowHelper(
     new THREE.Vector3(0, 1, 0),
     new THREE.Vector3(0, 0, 0),
     3.5,
     0x10b981,
-    0.6,
-    0.35
+    0.58,
+    0.34
   );
   liftArrow.name = 'liftArrow';
+  configureArrowOverlay(liftArrow, 25);
   group.add(liftArrow);
 
   // 2. Drag Vector (Crimson Red arrow, points +X downstream)
@@ -323,9 +341,10 @@ export function createAeroForceVectorsGroup(): THREE.Group {
     2.0,
     0xef4444,
     0.5,
-    0.3
+    0.29
   );
   dragArrow.name = 'dragArrow';
+  configureArrowOverlay(dragArrow, 25);
   group.add(dragArrow);
 
   // 3. Resultant Aerodynamic Force Vector (Azure Cyan arrow)
@@ -338,6 +357,7 @@ export function createAeroForceVectorsGroup(): THREE.Group {
     0.35
   );
   resultantArrow.name = 'resultantArrow';
+  configureArrowOverlay(resultantArrow, 26);
   group.add(resultantArrow);
 
   // 4. Center of Pressure (CP) Target Ring
@@ -348,23 +368,28 @@ export function createAeroForceVectorsGroup(): THREE.Group {
     side: THREE.DoubleSide,
     transparent: true,
     opacity: 0.9,
+    depthTest: false,
   });
   const cpRing = new THREE.Mesh(cpRingGeo, cpRingMat);
   cpRing.name = 'cpRing';
+  cpRing.renderOrder = 24;
   group.add(cpRing);
 
   return group;
 }
 
 /**
- * Updates 3D Force Vectors based on live aerodynamic telemetry
+ * Updates 3D Force Vectors proportionally to live calculated force magnitudes (|L|, |D|, |R|).
+ * Suppresses the Lift arrow completely when |L| < 0.05 kN (50 N) or |CL| < 0.002,
+ * and inverts it downward (-Y) when L < 0.
  */
 export function updateAeroForceVectors(
   group: THREE.Group,
   lift_N: number,
   drag_N: number,
   aoaDeg: number,
-  visible = true
+  visible = true,
+  options?: ForceVectorOptions
 ): void {
   group.visible = visible;
   if (!visible) return;
@@ -374,28 +399,67 @@ export function updateAeroForceVectors(
   const resultantArrow = group.getObjectByName('resultantArrow') as THREE.ArrowHelper | undefined;
   const cpRing = group.getObjectByName('cpRing') as THREE.Mesh | undefined;
 
-  // Scale forces logarithmically or normalized to wind tunnel viewport [0.5, 6.0 units]
-  const maxRefForce = 2.5e6; // ~2.5 MN
-  const liftMagnitude = Math.max(0.4, Math.min(6.5, (Math.abs(lift_N) / maxRefForce) * 5.0 + 1.2));
-  const dragMagnitude = Math.max(0.3, Math.min(4.8, (Math.abs(drag_N) / (maxRefForce * 0.35)) * 4.0 + 0.8));
+  const absLift = Math.abs(lift_N);
+  const absDrag = Math.abs(drag_N);
+  const clSmall = options?.cl !== undefined && Math.abs(options.cl) < 0.002;
+  const isZeroLift = absLift < 50 || clSmall;
 
-  const liftSign = lift_N >= 0 ? 1 : -1;
+  const effectiveLift = isZeroLift ? 0 : lift_N;
+  const absEffLift = Math.abs(effectiveLift);
+  const effectiveDrag = absDrag < 1 ? 0 : absDrag;
+  const resultantForce = Math.hypot(absEffLift, effectiveDrag);
 
-  if (liftArrow) {
-    liftArrow.setDirection(new THREE.Vector3(0, liftSign, 0));
-    liftArrow.setLength(liftMagnitude, 0.6, 0.35);
-  }
+  if (resultantForce < 1) {
+    if (liftArrow) liftArrow.visible = false;
+    if (dragArrow) dragArrow.visible = false;
+    if (resultantArrow) resultantArrow.visible = false;
+  } else {
+    // Smoothly map |R| across micro airfoils (~0.2 kN) to heavy jets (~1500+ kN)
+    // while strictly preserving vector triangle proportionality L : D : R.
+    const totalVisualLen = Math.min(6.4, Math.max(0.45, 1.15 * Math.pow(resultantForce / 1000, 0.23)));
+    const scale = totalVisualLen / resultantForce;
+    const liftMagnitude = absEffLift * scale;
+    const dragMagnitude = effectiveDrag * scale;
+    const liftSign = effectiveLift >= 0 ? 1 : -1;
 
-  if (dragArrow) {
-    dragArrow.setDirection(new THREE.Vector3(1, 0, 0));
-    dragArrow.setLength(dragMagnitude, 0.5, 0.3);
-  }
+    if (liftArrow) {
+      if (isZeroLift || liftMagnitude < 0.04) {
+        liftArrow.visible = false;
+      } else {
+        liftArrow.visible = true;
+        const headLen = Math.min(0.58, liftMagnitude * 0.34);
+        const headWid = headLen * 0.58;
+        liftArrow.setDirection(new THREE.Vector3(0, liftSign, 0));
+        liftArrow.setLength(liftMagnitude, headLen, headWid);
+      }
+    }
 
-  if (resultantArrow) {
-    const resultantDir = new THREE.Vector3(dragMagnitude, liftMagnitude * liftSign, 0).normalize();
-    const resultantLen = Math.hypot(liftMagnitude, dragMagnitude);
-    resultantArrow.setDirection(resultantDir);
-    resultantArrow.setLength(resultantLen, 0.6, 0.35);
+    if (dragArrow) {
+      if (dragMagnitude < 0.04) {
+        dragArrow.visible = false;
+      } else {
+        dragArrow.visible = true;
+        const headLen = Math.min(0.5, dragMagnitude * 0.36);
+        const headWid = headLen * 0.58;
+        dragArrow.setDirection(new THREE.Vector3(1, 0, 0));
+        dragArrow.setLength(dragMagnitude, headLen, headWid);
+      }
+    }
+
+    if (resultantArrow) {
+      // When Lift is zero, Resultant equals Drag (avoid overlapping dragArrow)
+      if (isZeroLift || liftMagnitude < 0.04) {
+        resultantArrow.visible = false;
+      } else {
+        resultantArrow.visible = true;
+        const resultantDir = new THREE.Vector3(dragMagnitude, liftMagnitude * liftSign, 0).normalize();
+        const resultantLen = Math.hypot(liftMagnitude, dragMagnitude);
+        const headLen = Math.min(0.6, resultantLen * 0.34);
+        const headWid = headLen * 0.58;
+        resultantArrow.setDirection(resultantDir);
+        resultantArrow.setLength(resultantLen, headLen, headWid);
+      }
+    }
   }
 
   if (cpRing) {

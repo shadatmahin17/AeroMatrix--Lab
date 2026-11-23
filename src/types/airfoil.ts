@@ -33,12 +33,26 @@ export interface TelemetrySample {
   timestamp: string;
 }
 
+export interface TunnelAnnotationState {
+  showStagnation?: boolean;
+  showTransition?: boolean;
+  showSeparation?: boolean;
+  showVortexFilaments?: boolean;
+  showDownwash?: boolean;
+  stagnationXc?: number;
+  xTransitionUpper?: number;
+  xSeparationUpper?: number;
+  downwashAngleDeg?: number;
+  boundCirculation_m2_s?: number;
+}
+
 export interface TunnelController {
   setAlpha: (a: number) => void;
   setU0: (u: number) => void;
   setField: (modeIdx: number) => void;
   setCoords: (coords: Coord2D[], name?: string) => void;
   setPaused: (paused: boolean) => void;
+  setAnnotations?: (annotations: TunnelAnnotationState) => void;
   resetFlow: () => void;
   savePng: () => void;
   getCoords: () => Coord2D[];

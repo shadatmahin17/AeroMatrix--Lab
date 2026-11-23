@@ -19,14 +19,14 @@ export interface SurfaceSample {
 }
 
 /**
- * Spatial Vertex & Signed Surface Distance Field (SDF) extracted directly from
- * 3D aircraft mesh triangles and vertices.
+ * Reduced-Order Approximate Spatial Surface Distance Field (SDF) on an 84×48×84
+ * uniform voxel grid extracted from 3D aircraft mesh triangles and vertices.
  *
  * Uses dense triangle surface sampling + 26-connected 3D Euclidean Distance
- * Transform + 6-connected exterior flood-fill (BFS) so `dist` is a true SIGNED
- * distance (`dist < 0` inside the solid body, `dist == 0` on the skin,
- * `dist > 0` in surrounding air). As a result, grad(sdf) points strictly
- * OUTWARD both outside and deep inside the aircraft/airfoil/cylinder.
+ * Transform + 6-connected exterior flood-fill (BFS) so `dist` is an approximate
+ * signed distance (`dist < 0` inside solid, `dist > 0` in air) used solely for
+ * 60 FPS tangential slip / no-penetration visual particle constraints—never a
+ * body-fitted Navier–Stokes CFD volume mesh.
  */
 export class AircraftSurfaceField {
   public readonly minX: number;
@@ -245,8 +245,13 @@ export class AircraftSurfaceField {
       }
     }
 
-    // 3. Build 6-separating surface shell and flood-fill exterior air from outer boundary
-    const shellThresh = 0.68 * Math.max(this.dx, this.dy, this.dz);
+    // 3. Build 6-separating surface shell and flood-fill exterior air from outer boundary.
+    // Threshold must exceed 0.5 * voxel diagonal so a surface passing through a cell center
+    // never slips between the 8 surrounding grid vertices without marking shell voxels.
+    const shellThresh = Math.max(
+      0.85 * Math.max(this.dx, this.dy, this.dz),
+      0.58 * Math.hypot(this.dx, this.dy, this.dz)
+    );
     const shell = new Uint8Array(total);
     for (let i = 0; i < total; i++) {
       if (distGrid[i] <= shellThresh) {
@@ -340,7 +345,8 @@ export class AircraftSurfaceField {
   }
 
   /**
-   * Samples a triangle densely onto a point buffer so large faces have zero surface gaps.
+   * Samples a triangle densely onto a point buffer using shortest-edge-apex anisotropic
+   * stepping so high-aspect extruded airfoil/wing triangles have zero surface gaps.
    */
   private static sampleTriangle(
     ax: number, ay: number, az: number,
@@ -349,30 +355,90 @@ export class AircraftSurfaceField {
     targetStep: number,
     pushPt: (x: number, y: number, z: number) => void
   ): void {
-    const e0 = Math.hypot(bx - ax, by - ay, bz - az);
-    const e1 = Math.hypot(cx - bx, cy - by, cz - bz);
-    const e2 = Math.hypot(ax - cx, ay - cy, az - cz);
-    const maxEdge = Math.max(e0, e1, e2);
+    const eAB = Math.hypot(bx - ax, by - ay, bz - az);
+    const eBC = Math.hypot(cx - bx, cy - by, cz - bz);
+    const eCA = Math.hypot(ax - cx, ay - cy, az - cz);
+    const maxEdge = Math.max(eAB, eBC, eCA);
 
     if (maxEdge <= targetStep) {
       pushPt((ax + bx + cx) / 3, (ay + by + cy) / 3, (az + bz + cz) / 3);
       return;
     }
 
-    const steps = Math.min(16, Math.max(2, Math.ceil(maxEdge / targetStep)));
-    const invSteps = 1 / steps;
-    for (let i = 0; i <= steps; i++) {
-      const u = i * invSteps;
-      for (let j = 0; j <= steps - i; j++) {
-        const v = j * invSteps;
-        const w = 1 - u - v;
-        pushPt(
-          ax * w + bx * u + cx * v,
-          ay * w + by * u + cy * v,
-          az * w + bz * u + cz * v
-        );
+    // Orient vertices so (p1 -> p2) is the shortest edge and p0 is the opposite apex.
+    let p0x = ax, p0y = ay, p0z = az;
+    let p1x = bx, p1y = by, p1z = bz;
+    let p2x = cx, p2y = cy, p2z = cz;
+    let shortLen = eBC;
+    let longLen = Math.max(eAB, eCA);
+
+    if (eAB <= eBC && eAB <= eCA) {
+      p0x = cx; p0y = cy; p0z = cz;
+      p1x = ax; p1y = ay; p1z = az;
+      p2x = bx; p2y = by; p2z = bz;
+      shortLen = eAB;
+      longLen = Math.max(eCA, eBC);
+    } else if (eCA <= eAB && eCA <= eBC) {
+      p0x = bx; p0y = by; p0z = bz;
+      p1x = cx; p1y = cy; p1z = cz;
+      p2x = ax; p2y = ay; p2z = az;
+      shortLen = eCA;
+      longLen = Math.max(eAB, eBC);
+    }
+
+    const rows = Math.min(128, Math.max(2, Math.ceil(longLen / targetStep)));
+    for (let r = 0; r <= rows; r++) {
+      const t = r / rows;
+      const lx = p0x + (p1x - p0x) * t;
+      const ly = p0y + (p1y - p0y) * t;
+      const lz = p0z + (p1z - p0z) * t;
+
+      const rx = p0x + (p2x - p0x) * t;
+      const ry = p0y + (p2y - p0y) * t;
+      const rz = p0z + (p2z - p0z) * t;
+
+      const spanWidth = t * shortLen;
+      const cols = r === 0 ? 0 : Math.min(48, Math.max(1, Math.ceil(spanWidth / targetStep)));
+      if (cols === 0) {
+        pushPt(lx, ly, lz);
+      } else {
+        for (let c = 0; c <= cols; c++) {
+          const s = c / cols;
+          pushPt(
+            lx + (rx - lx) * s,
+            ly + (ry - ly) * s,
+            lz + (rz - lz) * s
+          );
+        }
       }
     }
+  }
+
+  private static estimateTriangleSamples(
+    ax: number, ay: number, az: number,
+    bx: number, by: number, bz: number,
+    cx: number, cy: number, cz: number,
+    targetStep: number
+  ): number {
+    const eAB = Math.hypot(bx - ax, by - ay, bz - az);
+    const eBC = Math.hypot(cx - bx, cy - by, cz - bz);
+    const eCA = Math.hypot(ax - cx, ay - cy, az - cz);
+    const maxEdge = Math.max(eAB, eBC, eCA);
+    if (maxEdge <= targetStep) return 1;
+
+    let shortLen = eBC;
+    let longLen = Math.max(eAB, eCA);
+    if (eAB <= eBC && eAB <= eCA) {
+      shortLen = eAB;
+      longLen = Math.max(eCA, eBC);
+    } else if (eCA <= eAB && eCA <= eBC) {
+      shortLen = eCA;
+      longLen = Math.max(eAB, eBC);
+    }
+
+    const rows = Math.min(128, Math.max(2, Math.ceil(longLen / targetStep)));
+    const maxCols = Math.min(48, Math.max(1, Math.ceil(shortLen / targetStep)));
+    return Math.ceil((rows + 1) * (0.5 * maxCols + 1));
   }
 
   /**
@@ -427,7 +493,7 @@ export class AircraftSurfaceField {
     const estDz = (maxZ - minZ + 3.6) / 83;
     const targetStep = Math.max(0.06, Math.min(estDx, estDy, estDz) * 0.52);
 
-    const maxSamples = 120000;
+    const maxSamples = 140000;
     const pts = new Float32Array(maxSamples * 3);
     let count = 0;
 
@@ -466,7 +532,7 @@ export class AircraftSurfaceField {
         count++;
       };
 
-      const vBudget = Math.max(4, Math.floor(meshBudget * 0.35));
+      const vBudget = Math.max(4, Math.floor(meshBudget * 0.25));
       const vStep = posAttr.count <= 64 ? 1 : Math.max(1, Math.ceil(posAttr.count / vBudget));
       for (let i = 0; i < posAttr.count && count < meshLimit; i += vStep) {
         vPos.fromBufferAttribute(posAttr, i).applyMatrix4(mesh.matrixWorld);
@@ -475,6 +541,27 @@ export class AircraftSurfaceField {
 
       const tBudget = Math.max(1, meshLimit - count);
       const tStep = triCount <= 64 ? 1 : Math.max(1, Math.ceil(triCount / tBudget));
+
+      let meshStep = targetStep;
+      let estSamples = 0;
+      for (let t = 0; t < triCount; t += tStep) {
+        const i0 = indexAttr ? indexAttr.getX(t * 3) : t * 3;
+        const i1 = indexAttr ? indexAttr.getX(t * 3 + 1) : t * 3 + 1;
+        const i2 = indexAttr ? indexAttr.getX(t * 3 + 2) : t * 3 + 2;
+        vA.fromBufferAttribute(posAttr, i0).applyMatrix4(mesh.matrixWorld);
+        vB.fromBufferAttribute(posAttr, i1).applyMatrix4(mesh.matrixWorld);
+        vC.fromBufferAttribute(posAttr, i2).applyMatrix4(mesh.matrixWorld);
+        estSamples += AircraftSurfaceField.estimateTriangleSamples(
+          vA.x, vA.y, vA.z,
+          vB.x, vB.y, vB.z,
+          vC.x, vC.y, vC.z,
+          meshStep
+        );
+      }
+      if (estSamples > tBudget * 0.9) {
+        meshStep *= Math.max(1.15, Math.sqrt(estSamples / (tBudget * 0.85)));
+      }
+
       for (let t = 0; t < triCount && count < meshLimit; t += tStep) {
         const i0 = indexAttr ? indexAttr.getX(t * 3) : t * 3;
         const i1 = indexAttr ? indexAttr.getX(t * 3 + 1) : t * 3 + 1;
@@ -486,7 +573,7 @@ export class AircraftSurfaceField {
           vA.x, vA.y, vA.z,
           vB.x, vB.y, vB.z,
           vC.x, vC.y, vC.z,
-          targetStep,
+          meshStep,
           pushMeshPt
         );
       }
@@ -520,7 +607,7 @@ export class AircraftSurfaceField {
     const estDz = (maxZ - minZ + 3.6) / 83;
     const targetStep = Math.max(0.06, Math.min(estDx, estDy, estDz) * 0.52);
 
-    const maxSamples = 65000;
+    const maxSamples = 140000;
     const pts = new Float32Array(maxSamples * 3);
     let count = 0;
 
@@ -542,6 +629,28 @@ export class AircraftSurfaceField {
       pushSample(v.x, v.y, v.z);
     }
 
+    const tBudget = Math.max(1, maxSamples - count);
+    let procStep = targetStep;
+    let estSamples = 0;
+    for (const face of mesh.faces) {
+      const idx = face.indices;
+      if (idx.length < 3) continue;
+      const v0 = mesh.vertices[idx[0]];
+      for (let i = 1; i < idx.length - 1; i++) {
+        const v1 = mesh.vertices[idx[i]];
+        const v2 = mesh.vertices[idx[i + 1]];
+        estSamples += AircraftSurfaceField.estimateTriangleSamples(
+          v0.x, v0.y, v0.z,
+          v1.x, v1.y, v1.z,
+          v2.x, v2.y, v2.z,
+          procStep
+        );
+      }
+    }
+    if (estSamples > tBudget * 0.9) {
+      procStep *= Math.max(1.15, Math.sqrt(estSamples / (tBudget * 0.85)));
+    }
+
     for (const face of mesh.faces) {
       const idx = face.indices;
       if (idx.length < 3) continue;
@@ -553,7 +662,7 @@ export class AircraftSurfaceField {
           v0.x, v0.y, v0.z,
           v1.x, v1.y, v1.z,
           v2.x, v2.y, v2.z,
-          targetStep,
+          procStep,
           pushSample
         );
       }

@@ -1,5 +1,16 @@
-import { Point2D, PolygonSurfacePoint, AircraftModelType, AircraftModelConfig } from '../types/aerodynamics';
+import { Point2D, PolygonSurfacePoint, AircraftModelType, AircraftModelConfig, AeroTelemetry, ChordwiseCpStation } from '../types/aerodynamics';
 import { AeroCalibration, BoundingBoxDims, DEFAULT_CALIBRATION, formatModelClassLabel } from '../lib/calibration';
+import {
+  computeChordwiseCpAndLift,
+  computeDimensionlessAndGuardrails,
+  computeFiniteWingAerodynamics,
+  computeFlatPlateSkinFriction,
+  computeISA,
+  computeSeparationOnset,
+  computeTotalDrag,
+  ISA_CONSTANTS,
+  SOLVER_LABEL_3D,
+} from '../lib/aeroPhysics';
 
 export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
   f22: {
@@ -10,6 +21,9 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     wingspan: 13.56,
     chord: 4.8,
     sweepDeg: 42,
+    oswaldEfficiency: 0.76,
+    thicknessRatio: 0.055,
+    camberRatio: 0.01,
     stallAngle: 22,
     cl0: 0.12,
     clMax: 1.85,
@@ -27,6 +41,9 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     wingspan: 60.1,
     chord: 6.5,
     sweepDeg: 32,
+    oswaldEfficiency: 0.85,
+    thicknessRatio: 0.11,
+    camberRatio: 0.024,
     stallAngle: 15,
     cl0: 0.38,
     clMax: 2.25,
@@ -44,6 +61,9 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     wingspan: 11.0,
     chord: 1.6,
     sweepDeg: 0,
+    oswaldEfficiency: 0.82,
+    thicknessRatio: 0.12,
+    camberRatio: 0.02,
     stallAngle: 16,
     // 2D section Cl0 ≈ 0.25 with α_{L=0} = -2.1°; 3D finite-wing CL(0) scales with CLα(AR, M) around α_{L=0}
     cl0: 0.25,
@@ -63,6 +83,9 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     wingspan: 10.0,
     chord: 1.5,
     sweepDeg: 0,
+    oswaldEfficiency: 0.82,
+    thicknessRatio: 0.12,
+    camberRatio: 0.0,
     stallAngle: 15,
     cl0: 0.0,
     alphaZeroLift: 0.0,
@@ -81,6 +104,9 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     wingspan: 10.5,
     chord: 1.55,
     sweepDeg: 0,
+    oswaldEfficiency: 0.82,
+    thicknessRatio: 0.12,
+    camberRatio: 0.015,
     stallAngle: 15.5,
     cl0: 0.0,
     alphaZeroLift: 0.0,
@@ -97,6 +123,9 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     wingspan: 14.0,
     chord: 4.0,
     sweepDeg: 18,
+    oswaldEfficiency: 0.80,
+    thicknessRatio: 0.10,
+    camberRatio: 0.015,
     stallAngle: 16,
     cl0: 0.15,
     alphaZeroLift: -1.8,
@@ -114,6 +143,9 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     wingspan: 25.6,
     chord: 9.2,
     sweepDeg: 55,
+    oswaldEfficiency: 0.62,
+    thicknessRatio: 0.035,
+    camberRatio: 0.008,
     stallAngle: 19,
     cl0: 0.05,
     clMax: 1.40,
@@ -131,6 +163,9 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     wingspan: 5.0,
     chord: 2.0,
     sweepDeg: 0,
+    oswaldEfficiency: 0.70,
+    thicknessRatio: 0.44,
+    camberRatio: 0.0,
     stallAngle: 0,
     cl0: 0.0,
     alphaZeroLift: 0.0,
@@ -153,12 +188,23 @@ export function setCustom3DAirfoilConfig(cfg: {
   stallAngle: number;
 }) {
   activeCustomCoords = cfg.coords.map(([x, y]) => [x, y]);
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const [, y] of activeCustomCoords) {
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  const estThickness = Number.isFinite(maxY - minY) ? Math.max(0.04, Math.min(0.28, maxY - minY)) : 0.12;
+  const estCamber = Math.max(0, Math.min(0.08, Math.abs(cfg.cl0) / (2 * Math.PI * 1.8)));
+
   AIRCRAFT_MODELS.custom_airfoil.name = `${cfg.name} (2D Lab 3D Wing)`;
   AIRCRAFT_MODELS.custom_airfoil.cl0 = cfg.cl0;
   AIRCRAFT_MODELS.custom_airfoil.alphaZeroLift = cfg.alphaZeroLift;
   AIRCRAFT_MODELS.custom_airfoil.clMax = cfg.clMax;
   AIRCRAFT_MODELS.custom_airfoil.cd0 = cfg.cd0;
   AIRCRAFT_MODELS.custom_airfoil.stallAngle = cfg.stallAngle;
+  AIRCRAFT_MODELS.custom_airfoil.thicknessRatio = Number(estThickness.toFixed(3));
+  AIRCRAFT_MODELS.custom_airfoil.camberRatio = Number(estCamber.toFixed(4));
 }
 
 export function getCustom3DAirfoilCoords(): [number, number][] {
@@ -219,6 +265,10 @@ export function setCustom3DGlbConfig(
   AIRCRAFT_MODELS.custom_glb.wingspan = Number(refSpan.toFixed(2));
   AIRCRAFT_MODELS.custom_glb.chord = Number(refChord.toFixed(2));
   AIRCRAFT_MODELS.custom_glb.sweepDeg = calibration.modelClass === 'delta_fighter' ? 48 : calibration.modelClass === 'airliner' ? 30 : 12;
+  AIRCRAFT_MODELS.custom_glb.oswaldEfficiency = calibration.oswaldEfficiency;
+  AIRCRAFT_MODELS.custom_glb.thicknessRatio =
+    calibration.modelClass === 'delta_fighter' ? 0.06 : calibration.modelClass === 'glider' ? 0.14 : 0.10;
+  AIRCRAFT_MODELS.custom_glb.camberRatio = Math.max(0, Math.min(0.05, Math.abs(calibration.cl0) * 0.08));
   AIRCRAFT_MODELS.custom_glb.stallAngle = calibration.stallAngleDeg;
   AIRCRAFT_MODELS.custom_glb.cl0 = calibration.cl0;
   AIRCRAFT_MODELS.custom_glb.alphaZeroLift = zeroLiftAlphaDeg;
@@ -235,48 +285,51 @@ export function getCustom3DGlbCalibration(): AeroCalibration {
 }
 
 /**
- * International Standard Atmosphere (ISA) calculations at given altitude in feet,
- * including Sutherland's law dynamic viscosity μ(T).
+ * International Standard Atmosphere (ISA) UI wrapper (valid 0–20,000 m / 0–65,617 ft),
+ * clamping UI foot inputs cleanly to [0, 20,000 m] and delegating strictly to computeISA().
  */
 export function getAtmosphere(altitude_ft: number) {
-  const alt_m = Math.max(0, Math.min(altitude_ft * 0.3048, 16000));
-  const T0 = 288.15; // Sea level standard temp in K
-  const P0 = 101325; // Sea level pressure in Pa
-  const L = 0.0065; // Troposphere temperature lapse rate K/m
-  const R = 287.058; // Specific gas constant J/(kg·K)
-  const gamma = 1.4; // Adiabatic index
-  const g0 = 9.80665; // Standard gravity m/s^2
-  const tropopause_m = 11000;
-
-  let T: number;
-  let P: number;
-  if (alt_m <= tropopause_m) {
-    T = T0 - L * alt_m;
-    P = P0 * Math.pow(T / T0, 5.25588);
-  } else {
-    const T11 = T0 - L * tropopause_m;
-    const P11 = P0 * Math.pow(T11 / T0, 5.25588);
-    T = T11;
-    P = P11 * Math.exp((-g0 * (alt_m - tropopause_m)) / (R * T11));
-  }
-
-  const rho = P / (R * T); // kg/m^3
-  const speedOfSound = Math.sqrt(gamma * R * T); // m/s
-
-  // Sutherland's formula for dynamic viscosity of air (Pa·s)
-  const mu0 = 1.7894e-5; // ISA sea-level reference viscosity at 288.15 K
-  const sutherlandC = 110.4; // K
-  const dynamicViscosity =
-    mu0 * Math.pow(T / T0, 1.5) * ((T0 + sutherlandC) / (T + sutherlandC));
-
+  const altM = Math.max(0, Math.min(ISA_CONSTANTS.MAX_ALTITUDE_M, altitude_ft * ISA_CONSTANTS.FT_TO_M));
+  const isa = computeISA(altM);
   return {
-    altitude_m: alt_m,
-    temperature_K: T,
-    pressure_Pa: P,
-    density_kg_m3: rho,
-    dynamicViscosity_Pa_s: dynamicViscosity,
-    speedOfSound_ms: speedOfSound,
-    speedOfSound_kts: speedOfSound * 1.94384,
+    ...isa,
+    speedOfSound_kts: isa.speedOfSound_ms / ISA_CONSTANTS.KTS_TO_MS,
+  };
+}
+
+/**
+ * Solves for ISA altitude (ft) and airspeed (kts) that match a target wind-tunnel
+ * Reynolds number (default 3.0×10^6) and Mach number (default 0.15) for NACA 0012 / 2412.
+ */
+export function computeBenchmarkMatchConditions(
+  modelType: 'naca0012' | 'naca2412',
+  targetRe = 3_000_000,
+  targetMach = 0.15
+): { altitude_ft: number; airspeed_kts: number; actualRe: number; actualMach: number } {
+  const chord = AIRCRAFT_MODELS[modelType].chord;
+  let lo = 0;
+  let hi: number = ISA_CONSTANTS.MAX_ALTITUDE_M;
+  for (let i = 0; i < 40; i++) {
+    const mid = 0.5 * (lo + hi);
+    const isa = computeISA(mid);
+    const v = targetMach * isa.speedOfSound_ms;
+    const re = (isa.density_kg_m3 * v * chord) / isa.dynamicViscosity_Pa_s;
+    if (re > targetRe) lo = mid;
+    else hi = mid;
+  }
+  const bestM = 0.5 * (lo + hi);
+  const isaBest = computeISA(bestM);
+  const vBest = targetMach * isaBest.speedOfSound_ms;
+  const altitude_ft = Math.round(bestM / ISA_CONSTANTS.FT_TO_M);
+  const airspeed_kts = Number((vBest / ISA_CONSTANTS.KTS_TO_MS).toFixed(1));
+  const clampedM = Math.max(0, Math.min(ISA_CONSTANTS.MAX_ALTITUDE_M, altitude_ft * ISA_CONSTANTS.FT_TO_M));
+  const isaFinal = computeISA(clampedM);
+  const vFinal = airspeed_kts * ISA_CONSTANTS.KTS_TO_MS;
+  return {
+    altitude_ft,
+    airspeed_kts,
+    actualRe: Math.round((isaFinal.density_kg_m3 * vFinal * chord) / isaFinal.dynamicViscosity_Pa_s),
+    actualMach: Number((vFinal / isaFinal.speedOfSound_ms).toFixed(3)),
   };
 }
 
@@ -645,26 +698,43 @@ export function calculateFiniteWingLiftSlopePerDeg(
 }
 
 /**
- * Calculate Aerodynamic Lift, Drag, and Flow coefficients
+ * Internal SI aerodynamic solver returning telemetry + chordwise Cp stations.
+ * All internal variables are strictly SI (m, s, kg, Pa, K, rad).
  */
-export function calculateAeroTelemetry(
+function solveAeroStateSI(
   type: AircraftModelType,
   aoaDeg: number,
-  airspeedKts: number,
-  altitudeFt: number,
+  airspeedMs: number,
+  altitudeM: number,
   flapDeg: number
-): import('../types/aerodynamics').AeroTelemetry {
+): { telemetry: AeroTelemetry; cpStations: ChordwiseCpStation[] } {
   const config = AIRCRAFT_MODELS[type];
-  const atmo = getAtmosphere(altitudeFt);
-  const v_ms = airspeedKts * 0.514444; // kts to m/s
-  const mach = v_ms / atmo.speedOfSound_ms;
-  const rho = atmo.density_kg_m3;
-  const dynP = 0.5 * rho * v_ms * v_ms; // dynamic pressure q (Pa)
+  const clampedAltM = Math.max(0, Math.min(ISA_CONSTANTS.MAX_ALTITUDE_M, altitudeM));
+  const safeAirspeedMs = Math.max(0.1, airspeedMs);
 
-  // Reynolds number based on mean chord and Sutherland viscosity at altitude
-  const reynolds = (rho * v_ms * config.chord) / atmo.dynamicViscosity_Pa_s;
+  const isa = computeISA(clampedAltM);
+  const dim = computeDimensionlessAndGuardrails({
+    density_kg_m3: isa.density_kg_m3,
+    dynamicViscosity_Pa_s: isa.dynamicViscosity_Pa_s,
+    speedOfSound_ms: isa.speedOfSound_ms,
+    velocity_ms: safeAirspeedMs,
+    chord_m: config.chord,
+  });
 
-  // Flap lift & parasite drag increments
+  const mach = dim.mach;
+  const rho = isa.density_kg_m3;
+  const dynP = dim.dynamicPressure_Pa;
+  const reynolds = dim.reynolds;
+
+  const wingArea_m2 = config.wingspan * config.chord;
+  const aspectRatio = (config.wingspan * config.wingspan) / Math.max(1e-4, wingArea_m2);
+  const customCal = type === 'custom_glb' ? activeCustomGlbCalibration : null;
+  const oswaldEfficiency = Math.max(
+    0.1,
+    Math.min(1.0, customCal ? customCal.oswaldEfficiency : (config.oswaldEfficiency ?? 0.82))
+  );
+
+  // Flap lift & profile drag increments
   const effectiveFlap = config.flapCapable ? Math.max(0, flapDeg) : 0;
   const flapLiftBonus = config.flapCapable ? (effectiveFlap / 40) * 0.45 : 0;
   const flapDragBonus = config.flapCapable ? Math.pow(effectiveFlap / 40, 2) * 0.08 : 0;
@@ -681,16 +751,25 @@ export function calculateAeroTelemetry(
       ? Math.min(posStallAngle - aoaDeg, aoaDeg - -negStallAngle)
       : 90;
 
-  let cl = 0;
-  let cd = config.cd0 + flapDragBonus;
+  // Empirical/heuristic separation onset & Kirchhoff stall factor
+  const sep = computeSeparationOnset({
+    aoaDeg,
+    posStallAngle,
+    negStallAngle,
+    reynolds,
+    isBluffCylinder: type === 'cylinder',
+  });
 
-  // Cylinder or non-lifting bluff body special handling
+  let cl = 0;
+  // Strictly use the exact preset cd0 defined in AIRCRAFT_MODELS (+ flap drag increment when flaps deflected)
+  const cd0 = config.cd0 + flapDragBonus;
+  let cdSep = 0;
+  let cdWave = 0;
+
   if (type === 'cylinder') {
     cl = 0.05 * Math.sin((aoaDeg * Math.PI) / 180);
-    cd = 1.15 + 0.1 * Math.sin(Math.abs(aoaDeg * 0.1));
+    cdSep = 0.1 * Math.sin(Math.abs(aoaDeg * 0.1));
   } else {
-    const customCal = type === 'custom_glb' ? activeCustomGlbCalibration : null;
-    const aspectRatio = config.wingspan / config.chord;
     const sweepDeg = config.sweepDeg ?? 0;
     const liftSlopePerDeg = customCal
       ? (customCal.liftSlope * Math.PI) / 180
@@ -708,84 +787,208 @@ export function calculateAeroTelemetry(
     const isSymmetric = config.cl0 === 0 && effectiveFlap === 0;
     const clMinEff = isSymmetric ? -config.clMax : -config.clMax * 0.85 + flapLiftBonus * 0.5;
 
-    if (!isStalled) {
+    if (sep.xSeparationUpper >= 0.999) {
       cl = Math.max(clMinEff, Math.min(clMaxEff, linearCl(aoaDeg)));
-    } else if (aoaDeg >= 0) {
-      // Positive stall lift breakdown (continuous from attached peak at posStallAngle)
-      const clPeak = Math.min(clMaxEff, Math.max(0.2, linearCl(posStallAngle)));
-      cl =
-        clPeak *
-        Math.exp(-degPastStall * 0.08) *
-        Math.max(0, Math.cos((degPastStall * Math.PI) / 60));
-      cl = Math.max(0.15, cl);
     } else {
-      // Negative stall lift breakdown (continuous from negative peak; always strictly negative)
-      const clNegPeak = Math.max(clMinEff, Math.min(-0.2, linearCl(-negStallAngle)));
-      cl =
-        clNegPeak *
-        Math.exp(-degPastStall * 0.08) *
-        Math.max(0, Math.cos((degPastStall * Math.PI) / 60));
-      cl = Math.min(-0.15, cl);
+      const attachedCl = linearCl(aoaDeg);
+      const kirchhoffCl = attachedCl * sep.kirchhoffLiftFactor;
+      const aoaRad = (aoaDeg * Math.PI) / 180;
+      const postStallPlateCl = 1.05 * Math.sin(2 * aoaRad);
+      const plateBlend =
+        sep.xSeparationUpper < 0.55
+          ? Math.min(1, (0.55 - sep.xSeparationUpper) / 0.41)
+          : 0;
+      const blendedCl =
+        kirchhoffCl * (1 - 0.55 * plateBlend) + postStallPlateCl * (0.55 * plateBlend);
+      cl = Math.max(clMinEff, Math.min(clMaxEff, blendedCl));
     }
 
-    // Induced drag: Cdi = Cl^2 / (pi * e * AR)
-    const oswaldEfficiency = customCal ? customCal.oswaldEfficiency : 0.82;
-    const cdi = Math.pow(cl, 2) / (Math.PI * oswaldEfficiency * Math.max(1.2, aspectRatio));
-
-    // Separation drag in stall (degPastStall is guaranteed >= 0)
     const wakeGain = customCal ? 0.6 + customCal.wakeTurbulenceOnset * 0.8 : 1.0;
-    const separationDrag = isStalled
-      ? Math.min(0.95, Math.pow(degPastStall / 10, 1.8) * 0.35 * wakeGain)
-      : 0;
+    cdSep =
+      sep.separationIntensity > 0
+        ? Math.min(0.98, Math.pow(sep.separationIntensity, 1.65) * 0.72 * wakeGain)
+        : 0;
 
-    // Transonic / Supersonic wave drag
-    let waveDrag = 0;
+    // Empirical transonic / Ackeret supersonic wave drag
     const mCrit = config.supersonicCapable ? 0.92 : 0.78;
     if (mach > mCrit) {
       if (mach <= 1.05) {
-        waveDrag = 0.04 * Math.pow((mach - mCrit) / (1.05 - mCrit), 2);
+        cdWave = 0.04 * Math.pow((mach - mCrit) / (1.05 - mCrit), 2);
       } else {
-        waveDrag = 0.035 / Math.sqrt(Math.max(0.01, Math.pow(mach, 2) - 1));
+        cdWave = 0.035 / Math.sqrt(Math.max(0.01, Math.pow(mach, 2) - 1));
       }
     }
-
-    cd = config.cd0 + flapDragBonus + cdi + separationDrag + waveDrag;
   }
 
-  // Lift and drag in Newtons: F = q * S * C
-  const wingArea = config.wingspan * config.chord;
-  const lift_N = cl * dynP * wingArea;
-  const drag_N = cd * dynP * wingArea;
-  const ldRatio = cd > 0.0001 ? cl / cd : 0;
+  // Pure SI finite-wing lifting-line metrics (alpha_i, downwash epsilon = 2*alpha_i, CDi, Gamma_eq, Gamma_0, Lift)
+  const finiteWing = computeFiniteWingAerodynamics({
+    wingspan_m: config.wingspan,
+    chord_m: config.chord,
+    oswaldEfficiency,
+    cl,
+    velocity_ms: safeAirspeedMs,
+    density_kg_m3: rho,
+  });
 
-  // Determine flow state classification
-  let flowState: import('../types/aerodynamics').AeroTelemetry['flowState'] = 'Laminar';
+  // Exact rounded drag components so runtime telemetry & exported reports match 100%
+  const cd0Out = Number(cd0.toFixed(4));
+  const cdiOut = Number(finiteWing.cdi.toFixed(4));
+  const cdSepOut = Number(cdSep.toFixed(4));
+  const cdWaveOut = Number(cdWave.toFixed(4));
+  const cdTotal = Number(
+    computeTotalDrag({
+      cd0: cd0Out,
+      cdi: cdiOut,
+      cdSep: cdSepOut,
+      cdWave: cdWaveOut,
+    }).toFixed(4)
+  );
+
+  // Surrogate surface Cp & empirical boundary-layer reference estimates
+  const cpResult = computeChordwiseCpAndLift({
+    targetCl: cl,
+    aoaDeg,
+    mach,
+    reynolds,
+    thicknessRatio: config.thicknessRatio ?? 0.12,
+    camberRatio: config.camberRatio ?? 0.015,
+    flapsDeg: effectiveFlap,
+    xSeparationUpper: sep.xSeparationUpper,
+    isStalled,
+    degPastStall,
+    isBluffCylinder: type === 'cylinder',
+  });
+
+  const flatPlateRef = computeFlatPlateSkinFriction(Math.max(1e3, reynolds));
+
+  // Consistency check values (never presented as independent RANS verification)
+  const kuttaLift_N = rho * safeAirspeedMs * finiteWing.equivalentCirculation_m2_s * config.wingspan;
+  const pressureLiftCheck_N = dynP * wingArea_m2 * (cpResult.clUpper + cpResult.clLower);
+
+  const lift_N = finiteWing.lift_N;
+  const drag_N = cdTotal * dynP * wingArea_m2;
+  const ldRatio = cdTotal > 0.0001 ? cl / cdTotal : 0;
+
+  const isPureAirfoil =
+    type === 'naca0012' || type === 'naca2412' || type === 'custom_airfoil';
+
+  let flowState: AeroTelemetry['flowState'] = 'Laminar';
   if (mach >= 1.2) {
     flowState = 'Supersonic Wave';
   } else if (mach >= 0.85) {
     flowState = 'Transonic Shock';
-  } else if (isStalled && degPastStall > 4) {
+  } else if (isStalled && (degPastStall > 4 || sep.xSeparationUpper < 0.45)) {
     flowState = 'Deep Stall';
-  } else if (isStalled) {
+  } else if (isStalled || sep.xSeparationUpper < 0.92) {
     flowState = 'Incipient Stall';
-  } else if (reynolds > 500000) {
+  } else if (cpResult.boundaryLayerRegime !== 'Fully Laminar') {
     flowState = 'Attached Turbulent';
   } else {
     flowState = 'Laminar';
   }
 
   return {
-    cl: Number(cl.toFixed(3)),
-    cd: Number(cd.toFixed(3)),
-    ldRatio: Number(ldRatio.toFixed(2)),
-    lift_N: Math.round(lift_N),
-    drag_N: Math.round(drag_N),
-    reynolds: Math.round(reynolds),
-    mach: Number(mach.toFixed(2)),
-    dynamic_pressure_pa: Math.round(dynP),
-    air_density_kg_m3: Number(rho.toFixed(4)),
-    isStalled,
-    stallMargin: Number(stallMargin.toFixed(1)),
-    flowState,
+    telemetry: {
+      cl: Number(cl.toFixed(3)),
+      cd: cdTotal,
+      ldRatio: Number(ldRatio.toFixed(2)),
+      lift_N: Math.round(lift_N),
+      drag_N: Math.round(drag_N),
+      reynolds: Math.round(reynolds),
+      reynoldsRegime: dim.reynoldsRegime,
+      reynoldsRegimeLabel: dim.reynoldsRegimeLabel,
+      mach: Number(mach.toFixed(3)),
+      knudsen: dim.knudsen,
+      dynamic_pressure_pa: Math.round(dynP),
+      air_density_kg_m3: Number(rho.toFixed(4)),
+
+      altitude_m: Number(isa.altitude_m.toFixed(1)),
+      airspeed_ms: Number(safeAirspeedMs.toFixed(2)),
+      temperature_K: Number(isa.temperature_K.toFixed(2)),
+      pressure_Pa: Math.round(isa.pressure_Pa),
+      dynamic_viscosity_Pa_s: isa.dynamicViscosity_Pa_s,
+      speed_of_sound_ms: Number(isa.speedOfSound_ms.toFixed(2)),
+      prandtlGlauertFactor: Number(dim.prandtlGlauertFactor.toFixed(4)),
+      compressibilityRegime: dim.compressibilityRegime,
+      continuumValid: dim.continuumValid,
+      regimeWarnings: dim.regimeWarnings,
+
+      clUpper: cpResult.clUpper,
+      clLower: cpResult.clLower,
+      suctionPercentage: cpResult.suctionPercentage,
+      compressionPercentage: cpResult.compressionPercentage,
+      surfacePressureSplitMode: isPureAirfoil ? 'integrated-surrogate-cp' : 'illustrative-split',
+      kuttaTeDeltaCp: cpResult.kuttaTeDeltaCp,
+      equivalentCirculation_m2_s: Number(finiteWing.equivalentCirculation_m2_s.toFixed(2)),
+      ellipticRootCirculation_m2_s: Number(finiteWing.ellipticRootCirculation_m2_s.toFixed(2)),
+      boundCirculation_m2_s: Number(finiteWing.equivalentCirculation_m2_s.toFixed(2)),
+      kuttaLift_N: Math.round(kuttaLift_N),
+      pressureLiftCheck_N: Math.round(pressureLiftCheck_N),
+
+      aspectRatio: Number(finiteWing.aspectRatio.toFixed(2)),
+      oswaldEfficiency: Number(oswaldEfficiency.toFixed(3)),
+      inducedAlpha_deg: Number(finiteWing.inducedAlpha_deg.toFixed(2)),
+      downwashAngle_deg: Number(finiteWing.downwashAngle_deg.toFixed(2)),
+
+      cd0: cd0Out,
+      cdi: cdiOut,
+      cdSep: cdSepOut,
+      cdWave: cdWaveOut,
+
+      xTransitionUpper: cpResult.xTransitionUpper,
+      xTransitionLower: cpResult.xTransitionLower,
+      xSeparationUpper: cpResult.separationXc,
+      stagnationXc: cpResult.stagnationXc,
+      skinFrictionDrag_cdf: cpResult.skinFrictionDrag_cdf,
+      laminarFlatPlateCfMean: Number(flatPlateRef.laminarMeanCf.toFixed(5)),
+      turbulentFlatPlateCfMean: Number(flatPlateRef.turbulentMeanCf.toFixed(5)),
+      maxAdversePressureGrad: cpResult.maxAdversePressureGrad,
+      boundaryLayerRegime: cpResult.boundaryLayerRegime,
+
+      isStalled,
+      stallMargin: Number(stallMargin.toFixed(1)),
+      flowState,
+      solverModel: SOLVER_LABEL_3D,
+    },
+    cpStations: cpResult.stations,
   };
+}
+
+/**
+ * Calculate Aerodynamic Lift, Drag, ISA Atmosphere, Dimensionless Parameters & Kutta/Cp Telemetry
+ */
+export function calculateAeroTelemetry(
+  type: AircraftModelType,
+  aoaDeg: number,
+  airspeedKts: number,
+  altitudeFt: number,
+  flapDeg: number
+): AeroTelemetry {
+  return solveAeroStateSI(
+    type,
+    aoaDeg,
+    airspeedKts * ISA_CONSTANTS.KTS_TO_MS,
+    altitudeFt * ISA_CONSTANTS.FT_TO_M,
+    flapDeg
+  ).telemetry;
+}
+
+/**
+ * Returns first-principles chordwise Cp distribution along x/c in [0, 1]
+ * with Prandtl-Glauert compressibility correction and trailing-edge Kutta closure.
+ */
+export function computeSectionCpProfile(
+  type: AircraftModelType,
+  aoaDeg: number,
+  airspeedKts: number,
+  altitudeFt: number,
+  flapDeg: number
+): ChordwiseCpStation[] {
+  return solveAeroStateSI(
+    type,
+    aoaDeg,
+    airspeedKts * ISA_CONSTANTS.KTS_TO_MS,
+    altitudeFt * ISA_CONSTANTS.FT_TO_M,
+    flapDeg
+  ).cpStations;
 }

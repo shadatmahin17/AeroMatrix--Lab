@@ -2,6 +2,13 @@ import { AircraftModelType } from '../types/aerodynamics';
 import { AeroCalibration } from '../lib/calibration';
 import { Vertex3D } from '../utils/aircraft3DGeometry';
 import { AircraftSurfaceField, SpanSectionInfo, SurfaceSample } from './AircraftSurfaceField';
+import {
+  applyPrandtlGlauertCp,
+  clampCpForColorMap,
+  computeRawCp,
+  ISA_CONSTANTS,
+  SOLVER_LABEL_3D,
+} from '../lib/aeroPhysics';
 
 export interface Fluid3DParams {
   modelType: AircraftModelType;
@@ -10,6 +17,7 @@ export interface Fluid3DParams {
   mach: number;
   altitude_ft: number;
   flapsDeg: number;
+  /** Visual-only tuning parameter controlling Lamb-Oseen core diffusion & SDF boundary halo (NOT SI kinematic viscosity). */
   viscosity?: number;
   isStalled: boolean;
   cl: number;
@@ -20,14 +28,28 @@ export interface Fluid3DParams {
 }
 
 export interface Velocity3DResult {
-  u: number; // downstream (+X)
-  v: number; // vertical (+Y)
-  w: number; // spanwise (+Z)
-  speed: number;
-  pressureCoeff: number; // Cp = 1 - (V / V_inf)^2
+  u: number; // downstream (+X) in normalized tunnel coordinates
+  v: number; // vertical (+Y) in normalized tunnel coordinates
+  w: number; // spanwise (+Z) in normalized tunnel coordinates
+  speed: number; // normalized tunnel flow speed
+  cpIncompressible: number; // raw incompressible Cp,0 = 1 - (V / V_inf)^2 (unclamped)
+  pressureCoeff: number; // raw physical Cp with optional Prandtl-Glauert scaling (unclamped)
+  pressureCoeffClamped: number; // color-map clamped Cp in [-3.5, 1.0] for shaders/particles
   vorticity: number; // induced vortex magnitude
   isSeparated: boolean;
 }
+
+export const SOLVER_METADATA_3D = {
+  label: SOLVER_LABEL_3D,
+  isNavierStokes: false,
+  vortexPanelCount: 6,
+  spanwiseLoading: 'elliptic',
+  sdfGridResolution: '84x48x84',
+  velocityScaleNote:
+    'Normalized visual tunnel scale (350 kts / 180.0554 m/s mapped to V_inf = 1.2 tunnel units/s).',
+  viscosityNote:
+    'Visual viscosity parameter controls Lamb-Oseen core radius and SDF cushion halo; SI Reynolds number is computed separately in src/lib/aeroPhysics.ts.',
+} as const;
 
 // Reusable scratch objects to prevent per-frame GC allocations in 60fps particle loops
 const _surfSample: SurfaceSample = { dist: 0, nx: 0, ny: 1, nz: 0, inside: false };
@@ -39,9 +61,12 @@ const CYLINDER_HALF_HEIGHT = 3.8;
 
 /**
  * Evaluates the analytical Biot-Savart induced velocity of a finite straight vortex filament A -> B
- * with Vatistas/Lamb-Oseen viscous core regularization (coreRadius).
+ * with Vatistas/Lamb-Oseen viscous core regularization (`coreRadius` prevents 1/r singularity at r = 0).
+ *
+ * Right-hand rule convention: for positive `gamma` and filament vector dl = B - A,
+ * induced velocity follows dl x r1 / (|r1 x r2|^2 + coreRadius^2 |dl|^2) * (dot1 - dot2).
  */
-function addBiotSavartSegment(
+export function addBiotSavartSegment(
   px: number,
   py: number,
   pz: number,
@@ -78,8 +103,9 @@ function addBiotSavartSegment(
   const cz = r1x * r2y - r1y * r2x;
   const crossSq = cx * cx + cy * cy + cz * cz;
 
-  const denom = crossSq + coreRadius * coreRadius * dlSq;
-  if (denom < 1e-6) return 0;
+  const safeCore = Math.max(0, coreRadius);
+  const denom = crossSq + safeCore * safeCore * dlSq;
+  if (denom < 1e-9) return 0;
 
   const dot1 = (dlx * r1x + dly * r1y + dlz * r1z) / r1;
   const dot2 = (dlx * r2x + dly * r2y + dlz * r2z) / r2;
@@ -97,16 +123,51 @@ function addBiotSavartSegment(
 }
 
 /**
- * 3D Aerodynamic Fluid Dynamics Engine (Vortex Flow Law + Signed Surface Boundary Law)
+ * Pure allocation-returning wrapper around `addBiotSavartSegment` for diagnostics & unit testing.
+ */
+export function evaluateBiotSavartSegment(params: {
+  point: Vertex3D;
+  start: Vertex3D;
+  end: Vertex3D;
+  gamma: number;
+  coreRadius: number;
+}): { u: number; v: number; w: number; speed: number } {
+  const out = { u: 0, v: 0, w: 0 };
+  const speed = addBiotSavartSegment(
+    params.point.x,
+    params.point.y,
+    params.point.z,
+    params.start.x,
+    params.start.y,
+    params.start.z,
+    params.end.x,
+    params.end.y,
+    params.end.z,
+    params.gamma,
+    params.coreRadius,
+    out
+  );
+  return { ...out, speed };
+}
+
+/**
+ * 3D Reduced-Order Visual Flow Engine
+ * Solver Classification: Reduced-Order Biot–Savart Vortex-Lattice & Approximate SDF Surface-Constraint Model
+ * (Explicitly NOT a 3D Navier–Stokes RANS/LES solver.)
  *
  * Combines:
- *  1. Biot-Savart 3D Horseshoe Vortex Lattice (Kutta-Joukowski bound circulation,
- *     trailing vortex sheet, Lamb-Oseen diffused wingtip vortices, and delta leading-edge vortices).
- *  2. True 3D Signed Distance Field (SDF) Surface Boundary Law (strict no-penetration
- *     tangential slip along outward grad(sdf) with exterior constraint projection).
- *  3. Viscous boundary layer separation, stall wake shedding, and Mach oblique shock deflection.
+ *  1. 6-panel elliptical Biot–Savart 3D Horseshoe Vortex Filaments (normalized tunnel scale,
+ *     elliptic peak circulation Gamma_0 = (2/pi) * V_inf * c * C_L), trailing vortex sheet,
+ *     Lamb–Oseen diffused wingtip vortices, and delta leading-edge vortices.
+ *  2. Approximate 84×48×84 Signed Distance Field (SDF) surface constraint (no-penetration tangential
+ *     slip along grad(sdf) with exterior constraint projection).
+ *  3. Visual wake shedding, Prandtl–Glauert Cp scaling (raw physical Cp separated from color-map
+ *     clamping), and Mach cone deflection heuristics.
  */
 export class FluidDynamics3D {
+  public static readonly SOLVER_MODEL = SOLVER_LABEL_3D;
+  public static readonly METADATA = SOLVER_METADATA_3D;
+
   /**
    * Returns true if world-space point `p` lies inside or closer than `clearance`
    * to the solid model geometry.
@@ -137,9 +198,8 @@ export class FluidDynamics3D {
   }
 
   /**
-   * Projects world-space point `p` strictly outside the solid model surface
-   * by at least `minClearance`, preventing discrete RK2 steps from entering
-   * the cylinder, airfoil, fuselage, or engine nacelles.
+   * Projects world-space point `p` strictly outside the approximate solid model surface
+   * by at least `minClearance`, preventing discrete RK2 steps from entering the geometry.
    */
   public static constrainToExterior(
     p: Vertex3D,
@@ -160,7 +220,6 @@ export class FluidDynamics3D {
       if (Math.abs(by) < capY) {
         const rXZ = Math.hypot(bx, bz);
         if (rXZ < targetR) {
-          // If near top/bottom cap edge and closer to end cap than side wall, push over cap
           const distToSide = targetR - rXZ;
           const distToCap = capY - Math.abs(by);
           if (distToCap < distToSide && distToCap < 0.25) {
@@ -186,11 +245,11 @@ export class FluidDynamics3D {
     if (!sf) return p;
 
     let modified = false;
-    for (let iter = 0; iter < 4; iter++) {
+    for (let iter = 0; iter < 6; iter++) {
       if (!sf.sample(bx, by, bz, _surfSample)) break;
       if (_surfSample.dist >= minClearance) break;
 
-      const push = minClearance - _surfSample.dist + 0.02;
+      const push = Math.max(0.03, minClearance - _surfSample.dist + 0.02);
       bx += _surfSample.nx * push;
       by += _surfSample.ny * push;
       bz += _surfSample.nz * push;
@@ -215,7 +274,6 @@ export class FluidDynamics3D {
       aoaDeg,
       airspeed_kts,
       mach,
-      flapsDeg,
       viscosity = 0.1,
       isStalled,
       cl,
@@ -224,19 +282,18 @@ export class FluidDynamics3D {
       calibration = null,
     } = params;
 
-    const effViscosity = calibration
+    // Visual viscosity controls Lamb-Oseen core radius & boundary halo (not SI mu/rho)
+    const visualViscosity = calibration
       ? Math.max(0.01, Math.min(0.8, 0.55 * viscosity + 0.45 * calibration.viscosity))
       : viscosity;
 
-    // Free-stream speed normalized to wind tunnel simulation scale
-    const vInf = Math.max(0.4, (airspeed_kts / 350) * 1.2);
+    // Convert airspeed to SI (m/s), then scale to normalized 3D visual tunnel coordinates (180.0554 m/s = 350 kts -> 1.2)
+    const airspeedMs = Math.max(0.5, airspeed_kts * ISA_CONSTANTS.KTS_TO_MS);
+    const vInf = Math.max(0.4, (airspeedMs / 180.0554) * 1.2);
     const aoaRad = (aoaDeg * Math.PI) / 180;
     const sinA = Math.sin(aoaRad);
     const cosA = Math.cos(aoaRad);
 
-    // Body-frame coordinates matching rendered rotation.z = -aoaRad:
-    // Forward (body -> world): wx = bx*cosA + by*sinA, wy = -bx*sinA + by*cosA
-    // Inverse (world -> body): bx = p.x*cosA - p.y*sinA, by = p.x*sinA + p.y*cosA
     const bx = p.x * cosA - p.y * sinA;
     const by = p.x * sinA + p.y * cosA;
     const bz = p.z;
@@ -249,22 +306,18 @@ export class FluidDynamics3D {
 
     // -------------------------------------------------------------------------
     // 1. BLUFF BODY VERTICAL CYLINDER (Doublet in X-Z + von Kármán Vortex Street)
-    //    Geometry is vertical along Y (|by| <= 3.8) with circular cross-section
-    //    in X-Z (r = hypot(bx, bz) = 1.4).
     // -------------------------------------------------------------------------
     if (modelType === 'cylinder') {
       const R = CYLINDER_RADIUS;
-      const Reff = R * 1.07; // slight viscous displacement thickness
+      const Reff = R * 1.07;
       const halfH = CYLINDER_HALF_HEIGHT;
       const rXZSq = bx * bx + bz * bz;
       const rXZ = Math.sqrt(rXZSq);
 
-      // Height attenuation: full 2D bluff-body deflection along cylinder, smooth fade past top/bottom ends
       const endMargin = Math.max(0, Math.abs(by) - halfH);
       const heightBlend = endMargin <= 0 ? 1.0 : Math.max(0, 1.0 - endMargin / 0.85);
 
       if (heightBlend > 0.001) {
-        // Freestream vector in body frame
         const freestreamUb = vInf * cosA;
         const freestreamVb = vInf * sinA;
 
@@ -280,7 +333,6 @@ export class FluidDynamics3D {
           ub = freestreamUb * (1 - factor * cos2th);
           wb = -freestreamUb * factor * sin2th;
 
-          // End-cap tip spillover over top/bottom of finite cylinder
           if (Math.abs(by) > halfH - 0.65 && rXZ < R * 1.45) {
             const capSign = by >= 0 ? 1 : -1;
             const capFactor = Math.max(0, 1 - Math.abs(Math.abs(by) - halfH) / 0.75);
@@ -288,7 +340,6 @@ export class FluidDynamics3D {
           }
         }
 
-        // Biot-Savart alternating von Kármán vortex street shedding downstream in X-Z
         if (bx > R * 0.5 && Math.abs(by) <= halfH + 0.55) {
           const strouhal = 0.21 * (vInf / (2 * R));
           const wakeSpeed = vInf * 0.78;
@@ -325,10 +376,8 @@ export class FluidDynamics3D {
           }
         }
 
-        // Strict no-penetration boundary around vertical cylinder wall (X-Z) & end caps (Y)
         if (Math.abs(by) <= halfH + 0.28 && rXZ < R + 0.45) {
           if (Math.abs(by) > halfH - 0.12 && rXZ < R * 0.92) {
-            // Top / bottom cap deflection
             const capNy = by >= 0 ? 1 : -1;
             const vDotCap = vb * capNy;
             if (vDotCap < 0) vb -= vDotCap * capNy;
@@ -343,21 +392,18 @@ export class FluidDynamics3D {
               ub -= vDotN * nx;
               wb -= vDotN * nz;
             }
-            // Outward boundary cushion & front-stagnation split
             const clearance = R + 0.22 - rXZ;
             if (clearance > 0) {
               const push = Math.min(2.0 * vInf, (clearance / 0.22) * 1.35 * vInf);
               ub += nx * push;
               wb += nz * push;
             }
-            // Break exact dead-center stagnation at front (nx ~ -1, bz ~ 0)
             if (nx < -0.75 && Math.hypot(ub, wb) < 0.22 * vInf) {
               wb += (bz >= 0 ? 1 : -1) * 0.35 * vInf;
             }
           }
         }
 
-        // Convert body-frame velocity back to world frame & blend with freestream beyond ends
         const wu = ub * cosA + vb * sinA;
         const wv = -ub * sinA + vb * cosA;
         const ww = wb;
@@ -368,7 +414,7 @@ export class FluidDynamics3D {
       }
     } else {
       // -----------------------------------------------------------------------
-      // 2. WINGED AIRCRAFT: BIOT-SAVART HORSESHOE VORTEX LATTICE + SDF BOUNDARY
+      // 2. WINGED AIRCRAFT: 6-PANEL ELLIPTICAL BIOT-SAVART HORSESHOE + SDF
       // -----------------------------------------------------------------------
       let halfSpan = 6.8;
       let rootChord = 7.5;
@@ -425,23 +471,21 @@ export class FluidDynamics3D {
           calibration?.modelClass === 'rocket' ||
           (calibration?.stallAngleDeg ?? 16) <= 0);
 
-      // Kutta-Joukowski bound circulation strength: Gamma_0 = (2 / pi) * V_inf * c * C_L
-      const flapGammaBoost = 1 + (flapsDeg / 40) * 0.35;
-      const effectiveCl = isNonLiftingCustom ? 0 : isStalled ? cl * 0.58 : cl;
+      // Elliptic Prandtl peak circulation in normalized tunnel units: Gamma_0 = (2/pi) * vInf * c * CL
+      const effectiveCl = isNonLiftingCustom ? 0 : cl;
       const gamma0 = isNonLiftingCustom
         ? 0
-        : (2 / Math.PI) * vInf * rootChord * effectiveCl * flapGammaBoost * 0.72;
+        : (2 / Math.PI) * vInf * rootChord * effectiveCl;
 
-      // Viscous Lamb-Oseen core radius grows downstream with kinematic viscosity
-      const baseCore = 0.38 + effViscosity * 1.15;
+      const baseCore = 0.38 + visualViscosity * 1.15;
 
-      // --- A. BIOT-SAVART 3D HORSESHOE VORTEX SYSTEM (Elliptic Spanwise Loading) ---
+      // --- A. 6-PANEL ELLIPTICAL BIOT-SAVART HORSESHOE VORTEX FILAMENTS ---
       _bsOut.u = 0;
       _bsOut.v = 0;
       _bsOut.w = 0;
 
       if (!isNonLiftingCustom && Math.abs(gamma0) > 1e-4) {
-        const panels = 6;
+        const panels = SOLVER_METADATA_3D.vortexPanelCount;
         const panelWidth = (2 * halfSpan) / panels;
 
         for (let i = 0; i < panels; i++) {
@@ -533,7 +577,7 @@ export class FluidDynamics3D {
         const wTipX = tipStartX * cosA + tipYMid * sinA;
         const wTipY = -tipStartX * sinA + tipYMid * cosA;
         const tipDx = Math.max(0, p.x - wTipX);
-        const tipCore = 0.28 + effViscosity * 0.85 + Math.sqrt(Math.max(0, 0.12 * effViscosity * tipDx));
+        const tipCore = 0.28 + visualViscosity * 0.85 + Math.sqrt(Math.max(0, 0.12 * visualViscosity * tipDx));
         const tipGamma = gamma0 * 1.15 * tipVortexMultiplier;
 
         for (const sign of [-1, 1]) {
@@ -550,7 +594,7 @@ export class FluidDynamics3D {
         }
       }
 
-      // --- C. DELTA LEADING-EDGE & CHINE VORTEX FILAMENTS (F-22, Concorde, or calibrated delta_fighter) ---
+      // --- C. DELTA LEADING-EDGE & CHINE VORTEX FILAMENTS ---
       const isDeltaClass =
         modelType === 'concorde' ||
         modelType === 'f22' ||
@@ -560,7 +604,7 @@ export class FluidDynamics3D {
           (aoaDeg / 18) *
           vInf *
           (modelType === 'concorde' ? 2.6 : calibration?.modelClass === 'delta_fighter' ? 2.2 : 1.7);
-        const levCore = 0.28 + effViscosity * 0.65;
+        const levCore = 0.28 + visualViscosity * 0.65;
         const apexX =
           modelType === 'concorde'
             ? -6.5
@@ -587,7 +631,6 @@ export class FluidDynamics3D {
         }
       }
 
-      // Apply Biot-Savart induced velocity field (clamped smoothly against singular spikes)
       const bsMag = Math.hypot(_bsOut.u, _bsOut.v, _bsOut.w);
       const maxBs = vInf * 1.45;
       if (bsMag > maxBs) {
@@ -601,12 +644,11 @@ export class FluidDynamics3D {
         w += _bsOut.w;
       }
 
-      // Prevent Biot-Savart upstream reversal BEFORE solid boundary projection
       if (!isStalled && u < vInf * 0.25) {
         u = vInf * 0.25;
       }
 
-      // --- D. BOUNDARY LAYER SEPARATION & STALL / BLUFF WAKE VORTEX SHEDDING ---
+      // --- D. VISUAL WAKE SHEDDING FOR STALLED / BLUFF BODIES ---
       const isBluffWake =
         calibration &&
         ((calibration.modelClass === 'bluff_body' && calibration.wakeTurbulenceOnset >= 0.25) ||
@@ -624,7 +666,7 @@ export class FluidDynamics3D {
         if (bx > stallStartX && by > wakeYMin && by < wakeYMax) {
           const wakeRefY = surfaceField ? 0.5 * (surfaceField.minY + surfaceField.maxY) : 0;
           const wakeProx =
-            Math.exp(-Math.max(0, by - wakeRefY) / (1.4 + effViscosity * 1.5)) * wakeOnsetFactor;
+            Math.exp(-Math.max(0, by - wakeRefY) / (1.4 + visualViscosity * 1.5)) * wakeOnsetFactor;
           const shedSpacing = 2.4;
           const shedSpeed = vInf * 0.65;
           const phase = (timeSec * shedSpeed) % shedSpacing;
@@ -641,7 +683,7 @@ export class FluidDynamics3D {
               edX, edY, bz - 1.5,
               edX, edY, bz + 1.5,
               edSign * vInf * 1.25 * wakeOnsetFactor,
-              0.52 + effViscosity * 0.7,
+              0.52 + visualViscosity * 0.7,
               _bsOut
             );
           }
@@ -653,7 +695,7 @@ export class FluidDynamics3D {
         }
       }
 
-      // --- E. SUPERSONIC OBLIQUE SHOCKWAVE DEFLECTION (Mach >= 1.0) ---
+      // --- E. SUPERSONIC MACH CONE KINEMATIC DEFLECTION (Mach >= 1.0) ---
       if (mach >= 1.0) {
         const noseX = surfaceField ? surfaceField.minX : -6.5;
         const wNoseX = noseX * cosA;
@@ -693,21 +735,19 @@ export class FluidDynamics3D {
         }
       }
 
-      // --- G. TRUE SIGNED-DISTANCE SURFACE BOUNDARY LAW (Applied LAST so nothing penetrates) ---
+      // --- G. APPROXIMATE 84x48x84 SDF SURFACE BOUNDARY CONSTRAINT ---
       if (surfaceField && surfaceField.sample(bx, by, bz, _surfSample)) {
-        const dist = _surfSample.dist; // < 0 inside solid body, > 0 outside
-        const bHalo = 0.44 + effViscosity * 0.22;
+        const dist = _surfSample.dist;
+        const bHalo = 0.56 + visualViscosity * 0.24;
 
         if (dist < bHalo) {
-          // Rotate strictly outward normal (grad sdf) from body frame to world frame
           const wnx = _surfSample.nx * cosA + _surfSample.ny * sinA;
           const wny = -_surfSample.nx * sinA + _surfSample.ny * cosA;
           const wnz = _surfSample.nz;
 
-          // 100% hard tangential slip at/inside surface (dist <= 0.09), smoothstep outside
           let wBlend = 1.0;
-          if (dist > 0.09) {
-            const t = Math.max(0, Math.min(1, (bHalo - dist) / (bHalo - 0.09)));
+          if (dist > 0.16) {
+            const t = Math.max(0, Math.min(1, (bHalo - dist) / (bHalo - 0.16)));
             wBlend = t * t * (3 - 2 * t);
           }
 
@@ -718,21 +758,22 @@ export class FluidDynamics3D {
             w -= vDotN * wnz * wBlend;
           }
 
-          // Outward skin cushion / expulsion if close to or inside the solid mesh
-          if (dist < 0.14) {
-            const pen = 0.14 - dist;
-            const cushion = Math.min(2.2 * vInf, (pen / 0.14) * 1.35 * vInf);
+          if (dist < 0.2) {
+            const pen = 0.2 - dist;
+            const cushion = Math.min(2.4 * vInf, (pen / 0.2) * 1.5 * vInf);
             u += wnx * cushion;
             v += wny * cushion;
             w += wnz * cushion;
           }
 
-          // Cleanly split stagnation flow over/under/around leading edge or nose without getting stuck
           if (wnx < -0.5) {
             const tangSpeed = Math.hypot(u, v, w);
-            if (tangSpeed < 0.28 * vInf) {
-              const splitDirY = _surfSample.ny >= -0.05 ? 1 : -1;
-              v += splitDirY * 0.32 * vInf;
+            if (tangSpeed < 0.35 * vInf) {
+              const splitDirY =
+                Math.abs(_surfSample.ny) >= 0.02
+                  ? (_surfSample.ny >= 0 ? 1 : -1)
+                  : (by >= 0 ? 1 : -1);
+              v += splitDirY * 0.38 * vInf;
               if (Math.abs(_surfSample.ny) < 0.15 && Math.abs(_surfSample.nz) >= 0.05) {
                 w += (_surfSample.nz >= 0 ? 1 : -1) * 0.25 * vInf;
               }
@@ -752,59 +793,125 @@ export class FluidDynamics3D {
     }
 
     // -------------------------------------------------------------------------
-    // 3. BERNOULLI PRESSURE COEFFICIENT (Cp = 1 - (V / V_inf)^2)
+    // 3. RAW PHYSICAL Cp + PRANDTL-GLAUERT SCALING SEPARATED FROM COLOR CLAMPING
     // -------------------------------------------------------------------------
     const speed = Math.hypot(u, v, w);
-    let cp = 1 - Math.pow(speed / vInf, 2);
-    cp = Math.max(-3.5, Math.min(1.0, cp));
+    const cpIncompressible = computeRawCp(speed, vInf);
+    const pressureCoeff = applyPrandtlGlauertCp(cpIncompressible, Math.max(0, mach));
+    const pressureCoeffClamped = clampCpForColorMap(pressureCoeff, -3.5, 1.0);
 
-    return { u, v, w, speed, pressureCoeff: cp, vorticity, isSeparated };
+    return {
+      u,
+      v,
+      w,
+      speed,
+      cpIncompressible,
+      pressureCoeff,
+      pressureCoeffClamped,
+      vorticity,
+      isSeparated,
+    };
   }
 
   /**
    * Numerically integrates a 3D vortex streamline using 2nd-order Runge-Kutta (RK2 / Midpoint Method)
-   * with exterior surface projection so streamlines wrap smoothly around every body without penetrating.
+   * with exterior surface projection and adaptive near-body sub-stepping so streamlines wrap smoothly
+   * around thick blunt leading edges without penetrating the surface or tube radius.
    */
   public static traceStreamline(
     start: Vertex3D,
     params: Fluid3DParams,
     steps = 165,
     ds = 0.22
-  ): (Vertex3D & { speed: number; pressureCoeff: number; vorticity: number; isSeparated: boolean })[] {
-    const points: (Vertex3D & { speed: number; pressureCoeff: number; vorticity: number; isSeparated: boolean })[] = [];
-    let cur: Vertex3D = FluidDynamics3D.constrainToExterior({ ...start }, params, 0.09);
+  ): (Vertex3D & { speed: number; pressureCoeff: number; pressureCoeffClamped: number; vorticity: number; isSeparated: boolean })[] {
+    const points: (Vertex3D & {
+      speed: number;
+      pressureCoeff: number;
+      pressureCoeffClamped: number;
+      vorticity: number;
+      isSeparated: boolean;
+    })[] = [];
+    const clearance = 0.16;
+    const aoaRad = (params.aoaDeg * Math.PI) / 180;
+    const sinA = Math.sin(aoaRad);
+    const cosA = Math.cos(aoaRad);
+    const sf = params.surfaceField;
 
-    for (let i = 0; i < steps; i++) {
-      const v1 = FluidDynamics3D.getVelocity(cur, params);
-      points.push({
-        x: cur.x,
-        y: cur.y,
-        z: cur.z,
-        speed: v1.speed,
-        pressureCoeff: v1.pressureCoeff,
-        vorticity: v1.vorticity,
-        isSeparated: v1.isSeparated,
-      });
+    let cur: Vertex3D = FluidDynamics3D.constrainToExterior({ ...start }, params, clearance);
 
-      if (cur.x > 22 || Math.abs(cur.y) > 9 || Math.abs(cur.z) > 14) break;
-
+    const advanceRK2 = (pt: Vertex3D, stepLen: number) => {
+      const v1 = FluidDynamics3D.getVelocity(pt, params);
       const len1 = v1.speed || 1;
       const midRaw: Vertex3D = {
-        x: cur.x + (v1.u / len1) * (ds * 0.5),
-        y: cur.y + (v1.v / len1) * (ds * 0.5),
-        z: cur.z + (v1.w / len1) * (ds * 0.5),
+        x: pt.x + (v1.u / len1) * (stepLen * 0.5),
+        y: pt.y + (v1.v / len1) * (stepLen * 0.5),
+        z: pt.z + (v1.w / len1) * (stepLen * 0.5),
       };
-      const mid = FluidDynamics3D.constrainToExterior(midRaw, params, 0.09);
-
+      const mid = FluidDynamics3D.constrainToExterior(midRaw, params, clearance);
       const v2 = FluidDynamics3D.getVelocity(mid, params);
       const len2 = v2.speed || 1;
-
       const nextRaw: Vertex3D = {
-        x: cur.x + (v2.u / len2) * ds,
-        y: cur.y + (v2.v / len2) * ds,
-        z: cur.z + (v2.w / len2) * ds,
+        x: pt.x + (v2.u / len2) * stepLen,
+        y: pt.y + (v2.v / len2) * stepLen,
+        z: pt.z + (v2.w / len2) * stepLen,
       };
-      cur = FluidDynamics3D.constrainToExterior(nextRaw, params, 0.09);
+      return {
+        next: FluidDynamics3D.constrainToExterior(nextRaw, params, clearance),
+        vel: v1,
+      };
+    };
+
+    for (let i = 0; i < steps; i++) {
+      if (cur.x > 22 || Math.abs(cur.y) > 9 || Math.abs(cur.z) > 14) break;
+
+      let nearBody = false;
+      if (sf) {
+        const bx = cur.x * cosA - cur.y * sinA;
+        const by = cur.x * sinA + cur.y * cosA;
+        if (sf.sample(bx, by, cur.z, _surfSample) && _surfSample.dist < 0.85) {
+          nearBody = true;
+        }
+      }
+
+      if (nearBody) {
+        const subDs = ds * 0.5;
+        const s1 = advanceRK2(cur, subDs);
+        points.push({
+          x: cur.x,
+          y: cur.y,
+          z: cur.z,
+          speed: s1.vel.speed,
+          pressureCoeff: s1.vel.pressureCoeff,
+          pressureCoeffClamped: s1.vel.pressureCoeffClamped,
+          vorticity: s1.vel.vorticity,
+          isSeparated: s1.vel.isSeparated,
+        });
+        const s2 = advanceRK2(s1.next, subDs);
+        points.push({
+          x: s1.next.x,
+          y: s1.next.y,
+          z: s1.next.z,
+          speed: s2.vel.speed,
+          pressureCoeff: s2.vel.pressureCoeff,
+          pressureCoeffClamped: s2.vel.pressureCoeffClamped,
+          vorticity: s2.vel.vorticity,
+          isSeparated: s2.vel.isSeparated,
+        });
+        cur = s2.next;
+      } else {
+        const step = advanceRK2(cur, ds);
+        points.push({
+          x: cur.x,
+          y: cur.y,
+          z: cur.z,
+          speed: step.vel.speed,
+          pressureCoeff: step.vel.pressureCoeff,
+          pressureCoeffClamped: step.vel.pressureCoeffClamped,
+          vorticity: step.vel.vorticity,
+          isSeparated: step.vel.isSeparated,
+        });
+        cur = step.next;
+      }
     }
 
     return points;

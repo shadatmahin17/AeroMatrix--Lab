@@ -156,9 +156,21 @@ function requireSupabase() {
   return supabase;
 }
 
-function emitSync(scope: "profiles" | "airfoils" | "benchmarks" | "glb_models") {
+export type SyncScope = "profiles" | "airfoils" | "benchmarks" | "glb_models";
+const SYNC_CHANNEL_NAME = "aerolab:realtime-sync";
+
+export function emitSync(scope: SyncScope) {
   if (typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent(SUPABASE_SYNC_EVENT, { detail: { scope } }));
+    if (typeof BroadcastChannel !== "undefined") {
+      try {
+        const bc = new BroadcastChannel(SYNC_CHANNEL_NAME);
+        bc.postMessage({ scope });
+        bc.close();
+      } catch {
+        // ignore BroadcastChannel failures
+      }
+    }
   }
 }
 
@@ -1341,6 +1353,14 @@ export function subscribePublicGlbModels(
   }
   const client = supabase;
   let active = true;
+  let latestItems: SharedGlbModelDoc[] = [];
+  let fallbackTimer: number | null = null;
+  let isSubscribed = false;
+
+  const publishSorted = (items: SharedGlbModelDoc[]) => {
+    latestItems = items.slice().sort((a, b) => b.createdAtMs - a.createdAtMs);
+    onData(latestItems);
+  };
 
   const fetchGlbModels = async () => {
     const { data, error } = await client
@@ -1355,10 +1375,24 @@ export function subscribePublicGlbModels(
       onError?.(formatSupabaseError(error, "Could not load saved 3D models."));
       return;
     }
-    const items = (data || [])
-      .map((row) => mapGlbModelRow(row as Record<string, unknown>))
-      .sort((a, b) => b.createdAtMs - a.createdAtMs);
-    onData(items);
+    const items = (data || []).map((row) => mapGlbModelRow(row as Record<string, unknown>));
+    publishSorted(items);
+  };
+
+  const startFallbackPolling = () => {
+    if (typeof window === "undefined" || fallbackTimer !== null) return;
+    fallbackTimer = window.setInterval(() => {
+      if (active && !isSubscribed) {
+        void fetchGlbModels();
+      }
+    }, 8000);
+  };
+
+  const stopFallbackPolling = () => {
+    if (fallbackTimer !== null && typeof window !== "undefined") {
+      window.clearInterval(fallbackTimer);
+      fallbackTimer = null;
+    }
   };
 
   void fetchGlbModels();
@@ -1373,21 +1407,89 @@ export function subscribePublicGlbModels(
     window.addEventListener(SUPABASE_SYNC_EVENT, onLocalSync);
   }
 
+  let bc: BroadcastChannel | null = null;
+  if (typeof BroadcastChannel !== "undefined") {
+    try {
+      bc = new BroadcastChannel(SYNC_CHANNEL_NAME);
+      bc.onmessage = (msg: MessageEvent<{ scope?: string }>) => {
+        if (msg.data?.scope === "glb_models") {
+          void fetchGlbModels();
+        }
+      };
+    } catch {
+      bc = null;
+    }
+  }
+
+  const onVisibilityOrFocus = () => {
+    if (!active) return;
+    if (typeof document === "undefined" || document.visibilityState === "visible") {
+      void fetchGlbModels();
+    }
+  };
+  if (typeof window !== "undefined") {
+    window.addEventListener("focus", onVisibilityOrFocus);
+  }
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", onVisibilityOrFocus);
+  }
+
+  const channelId = `public_glb_models_${Math.random().toString(36).slice(2, 8)}`;
   const channel = client
-    .channel("public_glb_models")
+    .channel(channelId)
     .on(
       "postgres_changes",
       { event: "*", schema: "public", table: "glb_models" },
-      () => {
+      (payload) => {
+        if (!active) return;
+        const eventType = payload.eventType;
+        if (eventType === "DELETE") {
+          const oldId = String((payload.old as Record<string, unknown> | undefined)?.id || "");
+          if (oldId) {
+            publishSorted(latestItems.filter((item) => item.id !== oldId));
+          }
+          void fetchGlbModels();
+          return;
+        }
+
+        const nextRow = payload.new as Record<string, unknown> | undefined;
+        if (nextRow && nextRow.id) {
+          const mapped = mapGlbModelRow(nextRow);
+          const isVisible = String(nextRow.visibility || "public") === "public";
+          const withoutCurrent = latestItems.filter((item) => item.id !== mapped.id);
+          publishSorted(isVisible ? [mapped, ...withoutCurrent] : withoutCurrent);
+        }
         void fetchGlbModels();
       }
     )
-    .subscribe();
+    .subscribe((status) => {
+      if (!active) return;
+      if (status === "SUBSCRIBED") {
+        isSubscribed = true;
+        stopFallbackPolling();
+        void fetchGlbModels();
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        isSubscribed = false;
+        startFallbackPolling();
+      }
+    });
 
   return () => {
     active = false;
+    stopFallbackPolling();
     if (typeof window !== "undefined") {
       window.removeEventListener(SUPABASE_SYNC_EVENT, onLocalSync);
+      window.removeEventListener("focus", onVisibilityOrFocus);
+    }
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", onVisibilityOrFocus);
+    }
+    if (bc) {
+      try {
+        bc.close();
+      } catch {
+        // ignore close errors
+      }
     }
     void client.removeChannel(channel);
   };

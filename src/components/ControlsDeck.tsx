@@ -1,6 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { SimulationParams, AircraftModelType } from '../types/aerodynamics';
-import { AIRCRAFT_MODELS, getAtmosphere, getEffectiveStallAngles } from '../utils/airfoilGenerators';
+import {
+  AIRCRAFT_MODELS,
+  computeBenchmarkMatchConditions,
+  getAtmosphere,
+  getEffectiveStallAngles,
+} from '../utils/airfoilGenerators';
 import { AeroCalibration } from '../lib/calibration';
 import type { SharedGlbModelDoc } from '../lib/airfoilRepository.ts';
 import { CustomGlbAsset, GlbUploader, MeshPcaAnalysis } from './GlbUploader';
@@ -186,6 +191,34 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
         onParamChange('flaps_deg', 0);
       },
     },
+    {
+      name: 'NACA 0012 Benchmark',
+      tag: 'Re 3.0×10⁶ · M 0.15',
+      desc: 'Matched TR-824 wind-tunnel mode',
+      apply: () => {
+        setIsAutoSweeping(false);
+        const match = computeBenchmarkMatchConditions('naca0012', 3_000_000, 0.15);
+        onParamChange('modelType', 'naca0012');
+        onParamChange('angle_of_attack', 6.0);
+        onParamChange('airspeed_kts', Math.round(match.airspeed_kts));
+        onParamChange('altitude_ft', match.altitude_ft);
+        onParamChange('flaps_deg', 0);
+      },
+    },
+    {
+      name: 'NACA 2412 Benchmark',
+      tag: 'Re 3.0×10⁶ · M 0.15',
+      desc: 'Matched TR-824 wind-tunnel mode',
+      apply: () => {
+        setIsAutoSweeping(false);
+        const match = computeBenchmarkMatchConditions('naca2412', 3_000_000, 0.15);
+        onParamChange('modelType', 'naca2412');
+        onParamChange('angle_of_attack', 6.0);
+        onParamChange('airspeed_kts', Math.round(match.airspeed_kts));
+        onParamChange('altitude_ft', match.altitude_ft);
+        onParamChange('flaps_deg', 0);
+      },
+    },
   ];
 
   const getModelFileSize = (type: AircraftModelType) => {
@@ -279,6 +312,34 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
               onResetDefault={onResetCustomGlbToDefault}
             />
           )}
+
+        {/* Wind-Tunnel Benchmark Mode shortcut when NACA 0012 or NACA 2412 is active */}
+        {(params.modelType === 'naca0012' || params.modelType === 'naca2412') && (
+          <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="text-[11px] font-bold text-emerald-900 truncate">
+                Wind-Tunnel Benchmark Mode
+              </div>
+              <p className="text-[10px] font-mono text-emerald-800 truncate">
+                Re = 3.0×10⁶ · M = 0.15 (NACA TR-824)
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                const targetModel = params.modelType === 'naca0012' ? 'naca0012' : 'naca2412';
+                const match = computeBenchmarkMatchConditions(targetModel, 3_000_000, 0.15);
+                setIsAutoSweeping(false);
+                onParamChange('airspeed_kts', Math.round(match.airspeed_kts));
+                onParamChange('altitude_ft', match.altitude_ft);
+                onParamChange('flaps_deg', 0);
+              }}
+              className="px-2.5 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white font-semibold text-[11px] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              Match Re/M
+            </button>
+          </div>
+        )}
 
         {/* 2D Lab Sculpt Bridge when an airfoil section is selected */}
         {onOpen2DLab &&

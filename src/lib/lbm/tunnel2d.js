@@ -335,6 +335,18 @@ export function createWindTunnel2D(canvas, options = {}) {
     sep: 0,
     frame: 0,
     paused: false,
+    annotations: {
+      showStagnation: false,
+      showTransition: false,
+      showSeparation: false,
+      showVortexFilaments: false,
+      showDownwash: false,
+      stagnationXc: 0,
+      xTransitionUpper: 0.45,
+      xSeparationUpper: 1.0,
+      downwashAngleDeg: 0,
+      boundCirculation_m2_s: 0,
+    },
   };
 
   let foilName = initName;
@@ -697,6 +709,113 @@ export function createWindTunnel2D(canvas, options = {}) {
     cx.stroke();
   }
 
+  function chordPtToCanvas(xc, yOff = 0) {
+    const a = (-state.aDeg * Math.PI) / 180;
+    const ca = Math.cos(a);
+    const sa = Math.sin(a);
+    const dx = xc - 0.25;
+    const wx = 0.25 + dx * ca - yOff * sa;
+    const wy = dx * sa + yOff * ca;
+    return [w2cX(wx), w2cY(wy)];
+  }
+
+  function drawAnnotations() {
+    const ann = state.annotations;
+    if (
+      !ann ||
+      (!ann.showStagnation &&
+        !ann.showTransition &&
+        !ann.showSeparation &&
+        !ann.showVortexFilaments &&
+        !ann.showDownwash)
+    ) {
+      return;
+    }
+
+    cx.save();
+    cx.font = "600 9.5px 'JetBrains Mono', ui-monospace, monospace";
+    cx.textAlign = "left";
+
+    if (ann.showStagnation) {
+      const [sx, sy] = chordPtToCanvas(ann.stagnationXc ?? 0, -0.01);
+      cx.fillStyle = "#f59e0b";
+      cx.strokeStyle = "#fde047";
+      cx.lineWidth = 1.6;
+      cx.beginPath();
+      cx.arc(sx, sy, 4.2, 0, Math.PI * 2);
+      cx.fill();
+      cx.stroke();
+      cx.fillStyle = "#fde047";
+      cx.fillText(`STAG ${((ann.stagnationXc ?? 0) * 100).toFixed(0)}%`, sx - 16, sy + 14);
+    }
+
+    if (ann.showTransition) {
+      const xTr = Math.max(0.02, Math.min(1, ann.xTransitionUpper ?? 0.5));
+      const [tx, ty] = chordPtToCanvas(xTr, 0.065);
+      const [tx0, ty0] = chordPtToCanvas(xTr, 0.14);
+      cx.strokeStyle = "#10b981";
+      cx.lineWidth = 1.8;
+      cx.beginPath();
+      cx.moveTo(tx, ty);
+      cx.lineTo(tx0, ty0);
+      cx.stroke();
+      cx.fillStyle = "#34d399";
+      cx.fillText(`x_tr ${(xTr * 100).toFixed(0)}%`, tx0 - 10, ty0 - 4);
+    }
+
+    if (ann.showSeparation && (ann.xSeparationUpper ?? 1) < 0.995) {
+      const xSep = Math.max(0.1, Math.min(1, ann.xSeparationUpper ?? 1));
+      const [spx, spy] = chordPtToCanvas(xSep, 0.055);
+      const [spx0, spy0] = chordPtToCanvas(xSep, 0.15);
+      cx.strokeStyle = "#ef4444";
+      cx.lineWidth = 2.0;
+      cx.beginPath();
+      cx.moveTo(spx, spy);
+      cx.lineTo(spx0, spy0);
+      cx.stroke();
+      cx.fillStyle = "#f87171";
+      cx.fillText(`x_sep ${(xSep * 100).toFixed(0)}%`, spx0 - 12, spy0 - 4);
+    }
+
+    if (ann.showVortexFilaments) {
+      const [qx, qy] = chordPtToCanvas(0.25, 0);
+      cx.strokeStyle = "#38bdf8";
+      cx.lineWidth = 1.6;
+      cx.setLineDash([3, 3]);
+      cx.beginPath();
+      cx.arc(qx, qy, 18, 0.35, Math.PI * 1.75);
+      cx.stroke();
+      cx.setLineDash([]);
+      cx.fillStyle = "#7dd3fc";
+      cx.fillText(`Γ (c/4)`, qx - 16, qy - 22);
+    }
+
+    if (ann.showDownwash) {
+      const [tex, tey] = chordPtToCanvas(1.06, 0);
+      const epsRad = ((ann.downwashAngleDeg ?? 0) * Math.PI) / 180;
+      const len = 36;
+      const ex = tex + Math.cos(epsRad) * len;
+      const ey = tey + Math.sin(epsRad) * len;
+      cx.strokeStyle = "#22d3ee";
+      cx.fillStyle = "#22d3ee";
+      cx.lineWidth = 2;
+      cx.beginPath();
+      cx.moveTo(tex, tey);
+      cx.lineTo(ex, ey);
+      cx.stroke();
+      const ang = Math.atan2(ey - tey, ex - tex);
+      cx.beginPath();
+      cx.moveTo(ex, ey);
+      cx.lineTo(ex - 7 * Math.cos(ang - 0.5), ey - 7 * Math.sin(ang - 0.5));
+      cx.lineTo(ex - 7 * Math.cos(ang + 0.5), ey - 7 * Math.sin(ang + 0.5));
+      cx.closePath();
+      cx.fill();
+      cx.fillText(`ε ${(ann.downwashAngleDeg ?? 0).toFixed(1)}°`, ex + 4, ey + 3);
+    }
+
+    cx.restore();
+  }
+
   function drawBar() {
     const bx = PX + PW + 8;
     const by = PY;
@@ -798,6 +917,7 @@ export function createWindTunnel2D(canvas, options = {}) {
     cx.imageSmoothingQuality = "high";
     cx.drawImage(glcv, PX, PY, PW, PH);
     drawFoil();
+    drawAnnotations();
     cx.restore();
     drawBar();
     drawLabels();
@@ -875,6 +995,9 @@ export function createWindTunnel2D(canvas, options = {}) {
     },
     setPaused(paused) {
       state.paused = Boolean(paused);
+    },
+    setAnnotations(next) {
+      state.annotations = { ...state.annotations, ...(next || {}) };
     },
     resetFlow() {
       if (ok) populateLattice();

@@ -20,6 +20,7 @@ import {
   Keyboard,
   Cube,
   SidebarSimple,
+  GraduationCap,
 } from '@phosphor-icons/react';
 import {
   AlertTriangle,
@@ -61,6 +62,7 @@ import { WindTunnelCanvas3D } from './components/WindTunnelCanvas3D';
 import { WindTunnelCanvasWebGL } from './components/WindTunnelCanvasWebGL';
 import { TelemetryHUD } from './components/TelemetryHUD';
 import { AeroCharts } from './components/AeroCharts';
+import { D3AdvancedGraphs } from './components/D3AdvancedGraphs';
 import { AeroTheoryModal } from './components/AeroTheoryModal';
 import { ModelViewerModal } from './components/ModelViewerModal';
 import { probeWebGL2Support } from './utils/webglSupport';
@@ -71,9 +73,11 @@ import AirfoilPicker from './components/AirfoilPicker.tsx';
 import BenchmarkComparison from './components/BenchmarkComparison.tsx';
 import { useSupabase, type AppUser } from './components/SupabaseProvider.tsx';
 import ResultsAnalytics from './components/ResultsAnalytics.tsx';
+import D3AirfoilLabGraphs from './components/D3AirfoilLabGraphs.tsx';
 import ShapeEditor2D from './components/ShapeEditor2D.tsx';
 import { Alert, ParserBox, SliderField } from './components/ui.tsx';
 import ProfilePage from './pages/ProfilePage.tsx';
+import LearningLabPage from './pages/LearningLabPage.tsx';
 import { LBM, createWindTunnel2D, lbmNaca4, lbmSimRe } from './lib/lbm/tunnel2d.js';
 import { EXAMPLE_AIRFOILS, downloadText, loadExample } from './lib/files.js';
 import { parseDatText } from './lib/airfoilParser.js';
@@ -116,6 +120,11 @@ const INITIAL_3D_PARAMS: SimulationParams = {
   customAirfoilVersion: 0,
   customGlbVersion: 0,
   customGlbFlipNose: false,
+  show_stagnation_annotation: false,
+  show_transition_annotation: false,
+  show_separation_annotation: false,
+  show_vortex_filaments: false,
+  show_downwash_vectors: false,
 };
 
 const FIELD_MODES: Array<[string, string]> = [
@@ -149,6 +158,7 @@ interface WorkstationProps {
   userProfile: UserProfileDoc | null;
   benchmarks: BenchmarkRunDoc[];
   sharedAirfoils: SharedAirfoilDoc[];
+  sharedGlbModels: SharedGlbModelDoc[];
   cloudError: string | null;
   customRef: NeutralReferenceData | null;
   setCustomRef: Dispatch<SetStateAction<NeutralReferenceData | null>>;
@@ -165,6 +175,14 @@ interface WorkstationProps {
   tunnelRef: MutableRefObject<TunnelController | null>;
   pendingSavedGlb: CustomGlbAsset | null;
   onConsumePendingSavedGlb: () => void;
+  pendingLabPreset: {
+    modelType: SimulationParams['modelType'];
+    aoaDeg: number;
+    airspeedKts: number;
+    altitudeFt: number;
+    flapsDeg: number;
+  } | null;
+  onConsumePendingLabPreset: () => void;
 }
 
 function UnifiedWorkstation({
@@ -180,6 +198,7 @@ function UnifiedWorkstation({
   userProfile,
   benchmarks,
   sharedAirfoils,
+  sharedGlbModels,
   cloudError,
   customRef,
   setCustomRef,
@@ -196,6 +215,8 @@ function UnifiedWorkstation({
   tunnelRef,
   pendingSavedGlb,
   onConsumePendingSavedGlb,
+  pendingLabPreset,
+  onConsumePendingLabPreset,
 }: WorkstationProps) {
   // Shared layout state
   const [mobileTab, setMobileTab] = useState<PaneTab>('tunnel');
@@ -219,7 +240,7 @@ function UnifiedWorkstation({
   const [stepsPerFrame, setStepsPerFrame] = useState<number>(10);
   const [glError2D, setGlError2D] = useState<string | null>(null);
   const [controlsTab2D, setControlsTab2D] = useState<'flow' | 'airfoils' | 'shape'>('flow');
-  const [resultsTab2D, setResultsTab2D] = useState<'analytics' | 'neurofoil'>('analytics');
+  const [resultsTab2D, setResultsTab2D] = useState<'analytics' | 'd3' | 'neurofoil'>('analytics');
   const [stats2D, setStats2D] = useState<TunnelStats>({
     cl: null,
     cd: null,
@@ -342,6 +363,21 @@ function UnifiedWorkstation({
     onConsumePendingSavedGlb();
   }, [pendingSavedGlb, handleCustomGlbReady, setLabMode, onConsumePendingSavedGlb]);
 
+  useEffect(() => {
+    if (!pendingLabPreset) return;
+    setParams3D((prev) => ({
+      ...prev,
+      modelType: pendingLabPreset.modelType,
+      angle_of_attack: pendingLabPreset.aoaDeg,
+      airspeed_kts: pendingLabPreset.airspeedKts,
+      altitude_ft: pendingLabPreset.altitudeFt,
+      flaps_deg: pendingLabPreset.flapsDeg,
+    }));
+    setLabMode('3d');
+    setMobileTab('tunnel');
+    onConsumePendingLabPreset();
+  }, [pendingLabPreset, setLabMode, onConsumePendingLabPreset]);
+
   const handleCustomGlbCloudLinked = useCallback(
     (fileName: string, doc: SharedGlbModelDoc) => {
       setCustomGlbAsset((prev) =>
@@ -358,6 +394,27 @@ function UnifiedWorkstation({
     },
     []
   );
+
+  useEffect(() => {
+    const cloudId = customGlbAsset?.cloudId;
+    if (!cloudId) return;
+    const remote = sharedGlbModels.find((m) => m.id === cloudId);
+    if (!remote) return;
+    const currentKey = JSON.stringify(customGlbAsset.calibration);
+    const remoteKey = JSON.stringify(remote.calibration);
+    if (currentKey === remoteKey) return;
+
+    const orientedBounds = computeOrientedBounds(customGlbAsset.bounds, remote.calibration);
+    setCustom3DGlbConfig(customGlbAsset.fileName, remote.calibration, orientedBounds);
+    setCustomGlbAsset((prev) =>
+      prev && prev.cloudId === cloudId ? { ...prev, calibration: remote.calibration } : prev
+    );
+    setParams3D((prev) =>
+      prev.modelType === 'custom_glb'
+        ? { ...prev, customGlbVersion: (prev.customGlbVersion || 0) + 1 }
+        : prev
+    );
+  }, [sharedGlbModels, customGlbAsset, computeOrientedBounds]);
 
   const handleCustomGlbCalibrationUpdated = useCallback(
     (cal: AeroCalibration, fallbackUsed: boolean, reason?: string, pca?: MeshPcaAnalysis) => {
@@ -613,6 +670,46 @@ function UnifiedWorkstation({
 
   const currentModel3D = AIRCRAFT_MODELS[params3D.modelType];
 
+  // Sync visual engineering annotations into the 2D D2Q9 LBM canvas when in 2D mode
+  useEffect(() => {
+    if (labMode !== '2d' || !tunnelRef.current?.setAnnotations) return;
+    const foilKey = choice.toLowerCase().includes('2412')
+      ? 'naca2412'
+      : choice.toLowerCase().includes('0012')
+      ? 'naca0012'
+      : 'custom_airfoil';
+    const foilTelemetry = calculateAeroTelemetry(
+      foilKey,
+      alpha2D,
+      Math.max(40, u0Scaled * 2.5),
+      0,
+      0
+    );
+    tunnelRef.current.setAnnotations({
+      showStagnation: Boolean(params3D.show_stagnation_annotation),
+      showTransition: Boolean(params3D.show_transition_annotation),
+      showSeparation: Boolean(params3D.show_separation_annotation),
+      showVortexFilaments: Boolean(params3D.show_vortex_filaments),
+      showDownwash: Boolean(params3D.show_downwash_vectors),
+      stagnationXc: foilTelemetry.stagnationXc,
+      xTransitionUpper: foilTelemetry.xTransitionUpper,
+      xSeparationUpper: foilTelemetry.xSeparationUpper,
+      downwashAngleDeg: foilTelemetry.downwashAngle_deg,
+      boundCirculation_m2_s: foilTelemetry.boundCirculation_m2_s,
+    });
+  }, [
+    labMode,
+    choice,
+    alpha2D,
+    u0Scaled,
+    params3D.show_stagnation_annotation,
+    params3D.show_transition_annotation,
+    params3D.show_separation_annotation,
+    params3D.show_vortex_filaments,
+    params3D.show_downwash_vectors,
+    tunnelRef,
+  ]);
+
   // 2D Derived State
   const sepPct2D = stats2D.separationPct;
   const isStalled2D = sepPct2D >= 25;
@@ -642,65 +739,65 @@ function UnifiedWorkstation({
         AeroLab - Unified 3D Aircraft CFD &amp; 2D Airfoil Wind Tunnel Workstation
       </h1>
 
-      {/* 1. UNIFIED 3-ZONE TOP HEADER */}
-      <header className="h-12 sm:h-14 px-2.5 sm:px-4 pl-[max(0.625rem,env(safe-area-inset-left))] pr-[max(0.625rem,env(safe-area-inset-right))] border-b border-[var(--border)] bg-[var(--nav-bg)] backdrop-blur-md flex items-center justify-between gap-2 z-30 flex-shrink-0">
-        {/* Zone 1: Brand Lockup & Compact Status Readout (xl+) */}
-        <div className="flex items-center gap-2.5 min-w-0 shrink-0">
-          <div className="flex items-center gap-2">
-            <img
-              src="/aerolab-logo.png"
-              alt="AeroLab"
-              className="h-6 sm:h-7 w-auto object-contain shrink-0"
-            />
-            <span className="hidden md:inline font-script text-xl leading-none text-[#1769AA] pt-0.5 whitespace-nowrap">
-              Wind Tunnel
-            </span>
+      {/* 1. UNIFIED RESPONSIVE WORKSTATION HEADER */}
+      <header className="border-b border-[var(--border)] bg-[var(--nav-bg)] backdrop-blur-md z-30 flex-shrink-0">
+        {/* Row 1: Brand, Engine Mode Switcher & All Workstation Actions */}
+        <div className="min-h-11 sm:min-h-12 lg:h-14 px-2 sm:px-4 pl-[max(0.5rem,env(safe-area-inset-left))] pr-[max(0.5rem,env(safe-area-inset-right))] py-1 lg:py-0 flex flex-wrap lg:flex-nowrap items-center justify-between gap-x-1.5 gap-y-1 sm:gap-2">
+          {/* Zone 1: Brand Lockup & Compact Status Readout (xl+) */}
+          <div className="flex items-center gap-2 min-w-0 shrink-0">
+            <div className="flex items-center gap-2">
+              <img
+                src="/aerolab-logo.png"
+                alt="AeroLab"
+                className="h-5 sm:h-6 lg:h-7 w-auto object-contain shrink-0"
+              />
+              <span className="hidden lg:inline font-script text-xl leading-none text-[#1769AA] pt-0.5 whitespace-nowrap">
+                Wind Tunnel
+              </span>
+            </div>
+
+            <div className="hidden xl:flex items-center gap-2 pl-2.5 border-l border-[var(--border)] text-xs font-mono tabular-nums text-[#5C6670] whitespace-nowrap">
+              {labMode === '3d' ? (
+                <>
+                  <span className="font-sans font-semibold text-[#161A1D] max-w-44 truncate">
+                    {currentModel3D.name.split(' (')[0]}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-[#1769AA] font-semibold">
+                    M {telemetry3D.mach.toFixed(2)}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-[#1769AA] font-semibold">
+                    α {params3D.angle_of_attack >= 0 ? '+' : ''}
+                    {params3D.angle_of_attack.toFixed(1)}°
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className={telemetry3D.isStalled ? 'text-red-600 font-bold' : 'text-[#5C6670]'}>
+                    {telemetry3D.flowState}
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className="font-sans font-semibold text-[#161A1D] max-w-40 truncate">
+                    {airfoil.name}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-[#1769AA] font-semibold">
+                    α {alpha2D >= 0 ? '+' : ''}
+                    {alpha2D.toFixed(1)}°
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>Re {simRe2D.toLocaleString()}</span>
+                  <span aria-hidden="true">·</span>
+                  <span style={{ color: flowState2D.color }} className="font-semibold">
+                    {flowState2D.label}
+                  </span>
+                </>
+              )}
+            </div>
           </div>
 
-          <div className="hidden xl:flex items-center gap-2 pl-2.5 border-l border-[var(--border)] text-xs font-mono tabular-nums text-[#5C6670] whitespace-nowrap">
-            {labMode === '3d' ? (
-              <>
-                <span className="font-sans font-semibold text-[#161A1D] max-w-44 truncate">
-                  {currentModel3D.name.split(' (')[0]}
-                </span>
-                <span aria-hidden="true">·</span>
-                <span className="text-[#1769AA] font-semibold">
-                  M {telemetry3D.mach.toFixed(2)}
-                </span>
-                <span aria-hidden="true">·</span>
-                <span className="text-[#1769AA] font-semibold">
-                  α {params3D.angle_of_attack >= 0 ? '+' : ''}
-                  {params3D.angle_of_attack.toFixed(1)}°
-                </span>
-                <span aria-hidden="true">·</span>
-                <span className={telemetry3D.isStalled ? 'text-red-600 font-bold' : 'text-[#5C6670]'}>
-                  {telemetry3D.flowState}
-                </span>
-              </>
-            ) : (
-              <>
-                <span className="font-sans font-semibold text-[#161A1D] max-w-40 truncate">
-                  {airfoil.name}
-                </span>
-                <span aria-hidden="true">·</span>
-                <span className="text-[#1769AA] font-semibold">
-                  α {alpha2D >= 0 ? '+' : ''}
-                  {alpha2D.toFixed(1)}°
-                </span>
-                <span aria-hidden="true">·</span>
-                <span>Re {simRe2D.toLocaleString()}</span>
-                <span aria-hidden="true">·</span>
-                <span style={{ color: flowState2D.color }} className="font-semibold">
-                  {flowState2D.label}
-                </span>
-              </>
-            )}
-          </div>
-        </div>
-
-        {/* Zone 2: Lab Mode Switcher + Mobile Pane Tabs */}
-        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-          {/* Primary Lab Switcher: 3D Aircraft CFD vs 2D Airfoil Lab */}
+          {/* Zone 2: Primary Lab Mode Switcher (3D CFD vs 2D Airfoil) */}
           <div
             role="tablist"
             aria-label="Simulation Engine Mode"
@@ -711,183 +808,200 @@ function UnifiedWorkstation({
               role="tab"
               aria-selected={labMode === '3d'}
               onClick={() => setLabMode('3d')}
-              className={`px-2 sm:px-3 py-1 sm:py-1.5 rounded-md font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`px-1.5 sm:px-3 py-1 sm:py-1.5 rounded-md font-semibold flex items-center gap-1 sm:gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 labMode === '3d'
                   ? 'bg-[#1769AA] text-white'
                   : 'text-[#5C6670] hover:text-[#161A1D]'
               }`}
             >
               <Box className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-              <span className="hidden min-[440px]:inline">3D CFD</span>
-              <span className="min-[440px]:hidden">3D</span>
+              <span className="hidden min-[420px]:inline">3D CFD</span>
+              <span className="min-[420px]:hidden">3D</span>
             </button>
             <button
               type="button"
               role="tab"
               aria-selected={labMode === '2d'}
               onClick={() => setLabMode('2d')}
-              className={`px-2 sm:px-3 py-1 sm:py-1.5 rounded-md font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`px-1.5 sm:px-3 py-1 sm:py-1.5 rounded-md font-semibold flex items-center gap-1 sm:gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 labMode === '2d'
                   ? 'bg-[#1769AA] text-white'
                   : 'text-[#5C6670] hover:text-[#161A1D]'
               }`}
             >
               <Spline className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-              <span className="hidden min-[440px]:inline">2D Airfoil</span>
-              <span className="min-[440px]:hidden">2D</span>
+              <span className="hidden min-[420px]:inline">2D Airfoil</span>
+              <span className="min-[420px]:hidden">2D</span>
             </button>
           </div>
 
-          {/* Mobile & Tablet Pane Switcher (< lg) */}
-          <nav
-            aria-label="Mobile workspace panes"
-            className="flex lg:hidden items-center p-0.5 rounded-lg bg-[var(--bg)] border border-[var(--border)] text-[11px] shrink-0"
-          >
+          {/* Zone 3: Workstation Toggles, Modals & Pilot Profile (All buttons stay visible across mobile & desktop) */}
+          <div className="flex items-center gap-1 sm:gap-1.5 shrink-0 ml-auto lg:ml-0">
+            {/* Desktop Left/Right Sidebar Toggles */}
             <button
               type="button"
-              onClick={() => setMobileTab('controls')}
-              className={`px-2 py-1 rounded-md font-semibold flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                mobileTab === 'controls'
-                  ? 'bg-[#1769AA] text-white'
-                  : 'text-[#5C6670] hover:text-[#161A1D]'
+              onClick={() => setShowLeftSidebar((p) => !p)}
+              className={`hidden lg:flex px-2 py-1.5 rounded-lg border transition-colors text-xs font-semibold items-center gap-1.5 whitespace-nowrap cursor-pointer ${
+                showLeftSidebar
+                  ? 'bg-[var(--accent-light)] border-[#1769AA]/30 text-[#1769AA]'
+                  : 'bg-[var(--surface)] border-[var(--border)] text-[#5C6670] hover:text-[#161A1D]'
               }`}
-              aria-label="Controls"
+              title={showLeftSidebar ? 'Collapse Left Controls Deck' : 'Expand Left Controls Deck'}
             >
-              <SlidersHorizontal weight="duotone" className="w-3.5 h-3.5 shrink-0" />
-              <span className="hidden sm:inline">Setup</span>
+              <SidebarSimple weight={showLeftSidebar ? 'duotone' : 'regular'} className="w-4 h-4" />
+              <span className="hidden 2xl:inline text-[11px]">Controls</span>
             </button>
+
             <button
               type="button"
-              onClick={() => setMobileTab('tunnel')}
-              className={`px-2 py-1 rounded-md font-semibold flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                mobileTab === 'tunnel'
-                  ? 'bg-[#1769AA] text-white'
-                  : 'text-[#5C6670] hover:text-[#161A1D]'
+              onClick={() => setShowRightSidebar((p) => !p)}
+              className={`hidden lg:flex px-2 py-1.5 rounded-lg border transition-colors text-xs font-semibold items-center gap-1.5 whitespace-nowrap cursor-pointer ${
+                showRightSidebar
+                  ? 'bg-[var(--accent-light)] border-[#1769AA]/30 text-[#1769AA]'
+                  : 'bg-[var(--surface)] border-[var(--border)] text-[#5C6670] hover:text-[#161A1D]'
               }`}
-              aria-label="Wind Tunnel"
+              title={showRightSidebar ? 'Collapse Right Results Deck' : 'Expand Right Results Deck'}
             >
-              <Wind weight="duotone" className="w-3.5 h-3.5 shrink-0" />
-              <span className="hidden sm:inline">Tunnel</span>
+              <span className="hidden 2xl:inline text-[11px]">Results</span>
+              <SidebarSimple weight={showRightSidebar ? 'duotone' : 'regular'} className="w-4 h-4 scale-x-[-1]" />
             </button>
-            <button
-              type="button"
-              onClick={() => setMobileTab('results')}
-              className={`px-2 py-1 rounded-md font-semibold flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                mobileTab === 'results'
-                  ? 'bg-[#1769AA] text-white'
-                  : 'text-[#5C6670] hover:text-[#161A1D]'
-              }`}
-              aria-label="Results"
-            >
-              <Pulse weight="duotone" className="w-3.5 h-3.5 shrink-0" />
-              <span className="hidden sm:inline">Data</span>
-            </button>
-          </nav>
-        </div>
 
-        {/* Zone 3: Workstation Toggles, Modals & Pilot Profile */}
-        <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
-          {/* Desktop Left/Right Sidebar Toggles */}
-          <button
-            type="button"
-            onClick={() => setShowLeftSidebar((p) => !p)}
-            className={`hidden lg:flex px-2 py-1.5 rounded-lg border transition-colors text-xs font-semibold items-center gap-1.5 whitespace-nowrap cursor-pointer ${
-              showLeftSidebar
-                ? 'bg-[var(--accent-light)] border-[#1769AA]/30 text-[#1769AA]'
-                : 'bg-[var(--surface)] border-[var(--border)] text-[#5C6670] hover:text-[#161A1D]'
-            }`}
-            title={showLeftSidebar ? 'Collapse Left Controls Deck' : 'Expand Left Controls Deck'}
-          >
-            <SidebarSimple weight={showLeftSidebar ? 'duotone' : 'regular'} className="w-4 h-4" />
-            <span className="hidden 2xl:inline text-[11px]">Controls</span>
-          </button>
+            <div className="hidden lg:block w-px h-5 bg-[var(--border)] mx-0.5" />
 
-          <button
-            type="button"
-            onClick={() => setShowRightSidebar((p) => !p)}
-            className={`hidden lg:flex px-2 py-1.5 rounded-lg border transition-colors text-xs font-semibold items-center gap-1.5 whitespace-nowrap cursor-pointer ${
-              showRightSidebar
-                ? 'bg-[var(--accent-light)] border-[#1769AA]/30 text-[#1769AA]'
-                : 'bg-[var(--surface)] border-[var(--border)] text-[#5C6670] hover:text-[#161A1D]'
-            }`}
-            title={showRightSidebar ? 'Collapse Right Results Deck' : 'Expand Right Results Deck'}
-          >
-            <span className="hidden 2xl:inline text-[11px]">Results</span>
-            <SidebarSimple weight={showRightSidebar ? 'duotone' : 'regular'} className="w-4 h-4 scale-x-[-1]" />
-          </button>
+            {labMode === '3d' && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setIsModelViewerOpen(true)}
+                  className="h-7 w-7 sm:h-8 sm:w-auto sm:px-2.5 rounded-lg bg-[var(--surface)] border border-[var(--border)] hover:border-[#1769AA] text-xs font-semibold text-[#161A1D] hover:text-[#1769AA] transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                  title="Inspect 3D GLB CAD Model"
+                  aria-label="Inspect 3D GLB CAD Model"
+                >
+                  <Cube weight="duotone" className="w-4 h-4 text-[#1769AA] shrink-0" />
+                  <span className="hidden md:inline">CAD</span>
+                </button>
 
-          <div className="hidden lg:block w-px h-5 bg-[var(--border)] mx-0.5" />
-
-          {labMode === '3d' && (
-            <>
-              <button
-                type="button"
-                onClick={() => setIsModelViewerOpen(true)}
-                className="p-1.5 sm:px-2.5 sm:py-1.5 rounded-lg bg-[var(--surface)] border border-[var(--border)] hover:border-[#1769AA] text-xs font-semibold text-[#161A1D] hover:text-[#1769AA] transition-colors flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
-                title="Inspect 3D GLB CAD Model"
-              >
-                <Cube weight="duotone" className="w-4 h-4 text-[#1769AA]" />
-                <span className="hidden md:inline">CAD</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => handleParam3DChange('audio_enabled', !params3D.audio_enabled)}
-                className={`hidden sm:flex p-1.5 rounded-lg border transition-colors cursor-pointer ${
-                  params3D.audio_enabled
-                    ? 'bg-[var(--accent-light)] text-[#1769AA] border-[#1769AA]/40'
-                    : 'bg-[var(--surface)] text-[#5C6670] border-[var(--border)] hover:text-[#161A1D]'
-                }`}
-                title={params3D.audio_enabled ? 'Mute Wind Audio (M)' : 'Enable Wind Audio (M)'}
-              >
-                {params3D.audio_enabled ? (
-                  <SpeakerHigh weight="duotone" className="w-4 h-4" />
-                ) : (
-                  <SpeakerSlash weight="duotone" className="w-4 h-4" />
-                )}
-              </button>
-            </>
-          )}
-
-          <button
-            type="button"
-            onClick={() => setIsTheoryOpen(true)}
-            className="hidden sm:flex p-1.5 sm:px-2.5 sm:py-1.5 rounded-lg bg-[var(--surface)] border border-[var(--border)] hover:border-[#1769AA] text-xs font-semibold text-[#161A1D] hover:text-[#1769AA] transition-colors items-center gap-1.5 whitespace-nowrap cursor-pointer"
-            title="Aerodynamics Theory Guide"
-          >
-            <BookOpenText weight="duotone" className="w-4 h-4 text-[#1769AA]" />
-            <span className="hidden lg:inline">Theory</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={labMode === '3d' ? handleReset3D : handleReset2D}
-            className="hidden sm:flex p-1.5 rounded-lg text-[#5C6670] hover:text-[#161A1D] bg-[var(--surface)] hover:bg-[var(--bg)] transition-colors border border-[var(--border)] cursor-pointer"
-            title="Reset Active Simulation (R)"
-          >
-            <ArrowCounterClockwise weight="bold" className="w-4 h-4" />
-          </button>
-
-          <Link
-            to="/profile"
-            aria-label="Open pilot profile page"
-            className="px-2 sm:px-2.5 py-1.5 rounded-lg text-[11px] sm:text-xs font-semibold bg-[var(--surface)] border border-[var(--border)] text-[#161A1D] hover:border-[#1769AA] hover:text-[#1769AA] transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
-          >
-            {user?.photoURL ? (
-              <img
-                src={user.photoURL}
-                alt={profileLabel}
-                className="w-4 h-4 rounded-full object-cover shrink-0"
-                referrerPolicy="no-referrer"
-              />
-            ) : user ? (
-              <UserCheck size={13} className="text-[#1769AA] shrink-0" aria-hidden="true" />
-            ) : (
-              <User size={13} className="text-[#1769AA] shrink-0" aria-hidden="true" />
+                <button
+                  type="button"
+                  onClick={() => handleParam3DChange('audio_enabled', !params3D.audio_enabled)}
+                  className={`flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-lg border transition-colors shrink-0 cursor-pointer ${
+                    params3D.audio_enabled
+                      ? 'bg-[var(--accent-light)] text-[#1769AA] border-[#1769AA]/40'
+                      : 'bg-[var(--surface)] text-[#5C6670] border-[var(--border)] hover:text-[#161A1D]'
+                  }`}
+                  title={params3D.audio_enabled ? 'Mute Wind Audio (M)' : 'Enable Wind Audio (M)'}
+                  aria-label={params3D.audio_enabled ? 'Mute Wind Audio' : 'Enable Wind Audio'}
+                >
+                  {params3D.audio_enabled ? (
+                    <SpeakerHigh weight="duotone" className="w-4 h-4" />
+                  ) : (
+                    <SpeakerSlash weight="duotone" className="w-4 h-4" />
+                  )}
+                </button>
+              </>
             )}
-            <span className="hidden md:inline max-w-24 truncate">{profileLabel}</span>
-          </Link>
+
+            <button
+              type="button"
+              onClick={() => setIsTheoryOpen((prev) => !prev)}
+              className={`flex h-7 w-7 sm:h-8 sm:w-auto sm:px-2.5 rounded-lg border text-xs font-semibold transition-colors items-center justify-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                isTheoryOpen
+                  ? 'bg-[var(--accent-light)] border-[#1769AA] text-[#1769AA]'
+                  : 'bg-[var(--surface)] border-[var(--border)] hover:border-[#1769AA] text-[#161A1D] hover:text-[#1769AA]'
+              }`}
+              title="Aerodynamics Theory & Verification Lab"
+              aria-label="Aerodynamics Theory & Verification Lab"
+            >
+              <BookOpenText weight="duotone" className="w-4 h-4 text-[#1769AA] shrink-0" />
+              <span className="hidden md:inline">Theory</span>
+            </button>
+
+            <Link
+              to="/learning-lab"
+              className="flex h-7 w-7 sm:h-8 sm:w-auto sm:px-2.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] hover:border-[#1769AA] text-xs font-semibold text-[#161A1D] hover:text-[#1769AA] transition-colors items-center justify-center gap-1.5 whitespace-nowrap shrink-0"
+              title="Interactive Aerospace Engineering Learning Lab"
+              aria-label="Interactive Aerospace Engineering Learning Lab"
+            >
+              <GraduationCap weight="duotone" className="w-4 h-4 text-[#1769AA] shrink-0" />
+              <span className="hidden xl:inline">Learning Lab</span>
+              <span className="hidden md:inline xl:hidden">Learn</span>
+            </Link>
+
+            <button
+              type="button"
+              onClick={labMode === '3d' ? handleReset3D : handleReset2D}
+              className="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-[#5C6670] hover:text-[#161A1D] bg-[var(--surface)] hover:bg-[var(--bg)] transition-colors border border-[var(--border)] shrink-0 cursor-pointer"
+              title="Reset Active Simulation (R)"
+              aria-label="Reset Active Simulation"
+            >
+              <ArrowCounterClockwise weight="bold" className="w-4 h-4" />
+            </button>
+
+            <Link
+              to="/profile"
+              aria-label="Open pilot profile page"
+              title={profileLabel}
+              className="h-7 sm:h-8 px-1.5 sm:px-2.5 rounded-lg text-[11px] sm:text-xs font-semibold bg-[var(--surface)] border border-[var(--border)] text-[#161A1D] hover:border-[#1769AA] hover:text-[#1769AA] transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0"
+            >
+              {user?.photoURL ? (
+                <img
+                  src={user.photoURL}
+                  alt={profileLabel}
+                  className="w-4 h-4 rounded-full object-cover shrink-0"
+                  referrerPolicy="no-referrer"
+                />
+              ) : user ? (
+                <UserCheck size={14} className="text-[#1769AA] shrink-0" aria-hidden="true" />
+              ) : (
+                <User size={14} className="text-[#1769AA] shrink-0" aria-hidden="true" />
+              )}
+              <span className="hidden sm:inline max-w-20 md:max-w-28 truncate">{profileLabel}</span>
+            </Link>
+          </div>
         </div>
+
+        {/* Row 2: Dedicated Mobile & Tablet Pane Switcher (< lg) so Setup, Tunnel & Data never crowd Row 1 */}
+        <nav
+          aria-label="Mobile workspace panes"
+          className="grid grid-cols-3 lg:hidden border-t border-[var(--border)] bg-[var(--bg)]/80 px-2 pl-[max(0.5rem,env(safe-area-inset-left))] pr-[max(0.5rem,env(safe-area-inset-right))] py-1 gap-1"
+        >
+          <button
+            type="button"
+            onClick={() => setMobileTab('controls')}
+            className={`py-1.5 px-2 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer ${
+              mobileTab === 'controls'
+                ? 'bg-[#1769AA] text-white'
+                : 'text-[#5C6670] hover:text-[#161A1D] hover:bg-[var(--surface)]'
+            }`}
+          >
+            <SlidersHorizontal weight="duotone" className="w-3.5 h-3.5 shrink-0" />
+            <span>Setup</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setMobileTab('tunnel')}
+            className={`py-1.5 px-2 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer ${
+              mobileTab === 'tunnel'
+                ? 'bg-[#1769AA] text-white'
+                : 'text-[#5C6670] hover:text-[#161A1D] hover:bg-[var(--surface)]'
+            }`}
+          >
+            <Wind weight="duotone" className="w-3.5 h-3.5 shrink-0" />
+            <span>Tunnel</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setMobileTab('results')}
+            className={`py-1.5 px-2 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer ${
+              mobileTab === 'results'
+                ? 'bg-[#1769AA] text-white'
+                : 'text-[#5C6670] hover:text-[#161A1D] hover:bg-[var(--surface)]'
+            }`}
+          >
+            <Pulse weight="duotone" className="w-3.5 h-3.5 shrink-0" />
+            <span>Data</span>
+          </button>
+        </nav>
       </header>
 
       {/* 2. UNIFIED 3-COLUMN WORKSTATION (Controls Left · Tunnel Center · Telemetry/Results Right) */}
@@ -1286,7 +1400,7 @@ function UnifiedWorkstation({
                   />
 
                   <div className="px-3 py-1.5 border-t border-[var(--dark-surface)] flex items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-slate-400 flex-shrink-0 bg-[#11161A]">
-                    <span className="truncate">640 × 320 D2Q9 Smagorinsky LES</span>
+                    <span className="truncate">640 × 320 Incompressible GPU D2Q9 Lattice-Boltzmann (LBM) Solver</span>
                     <span className="shrink-0">
                       α = {alpha2D.toFixed(1)}° · Re ≈ {simRe2D.toLocaleString()}
                     </span>
@@ -1394,7 +1508,7 @@ function UnifiedWorkstation({
               </h2>
             </div>
             <span className="text-[11px] font-mono text-[#5C6670] truncate">
-              {labMode === '3d' ? 'Vortex Lattice' : `${airfoil.name} · ${alpha2D.toFixed(1)}°`}
+              {labMode === '3d' ? 'Reduced-Order VLM' : `${airfoil.name} · ${alpha2D.toFixed(1)}°`}
             </span>
           </div>
 
@@ -1417,15 +1531,27 @@ function UnifiedWorkstation({
                 customGlbVersion={params3D.customGlbVersion}
               />
 
+              <D3AdvancedGraphs
+                modelType={params3D.modelType}
+                currentAoa={params3D.angle_of_attack}
+                airspeedKts={params3D.airspeed_kts}
+                altitudeFt={params3D.altitude_ft}
+                flapsDeg={params3D.flaps_deg}
+                telemetry={telemetry3D}
+                customGlbVersion={params3D.customGlbVersion}
+              />
+
               <div className="antigravity-glass p-3.5 rounded-xl text-xs text-[#5C6670] flex flex-col gap-2 leading-relaxed">
                 <div className="flex items-center gap-2 text-[#161A1D] font-semibold">
                   <div className="w-6 h-6 rounded-lg bg-gradient-to-br from-[#1769AA]/16 to-[#0EA5E9]/14 ring-1 ring-[#1769AA]/20 flex items-center justify-center text-[#1769AA]">
                     <Wind weight="duotone" className="w-3.5 h-3.5" />
                   </div>
-                  <span className="text-[#161A1D] font-bold text-xs">Vortex &amp; Vertex Flow Law</span>
+                  <span className="text-[#161A1D] font-bold text-xs">
+                    Reduced-Order Biot–Savart Vortex-Lattice &amp; Surface-Constraint Model
+                  </span>
                 </div>
                 <p className="text-[11px] leading-relaxed text-[#5C6670]">
-                  Streamlines and PIV streaks are integrated with RK2 midpoint advection through a 3D Biot-Savart horseshoe vortex lattice coupled to real surface vertex normals for boundary tangential slip.
+                  Streamlines and PIV streaks are integrated with RK2 midpoint advection through a 3D Biot-Savart horseshoe vortex lattice coupled to real surface vertex normals for boundary tangential slip (not a 3D Navier–Stokes RANS/LES solver).
                   {telemetry3D.isStalled ? (
                     <span className="text-red-700 font-medium block mt-2 p-2 rounded-lg bg-red-50 border border-red-200">
                       Critical angle of attack exceeded. Adverse pressure gradients have detached the boundary layer, shedding unsteady von Kármán wake vortices.
@@ -1485,11 +1611,12 @@ function UnifiedWorkstation({
               <div
                 role="tablist"
                 aria-label="2D Results Views"
-                className="grid grid-cols-2 p-0.5 rounded-lg bg-[var(--surface)] border border-[var(--border)] text-[11.5px] gap-0.5 shrink-0"
+                className="grid grid-cols-3 p-0.5 rounded-lg bg-[var(--surface)] border border-[var(--border)] text-[11px] gap-0.5 shrink-0"
               >
                 {(
                   [
                     { id: 'analytics', label: 'Analytics', Icon: TrendingUp },
+                    { id: 'd3', label: 'D3 Lab', Icon: Layers },
                     { id: 'neurofoil', label: 'NeuroFoil', Icon: Radar },
                   ] as const
                 ).map(({ id, label, Icon }) => {
@@ -1501,7 +1628,7 @@ function UnifiedWorkstation({
                       role="tab"
                       aria-selected={active}
                       onClick={() => setResultsTab2D(id)}
-                      className={`py-1.5 px-2 rounded-md font-semibold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer ${
+                      className={`py-1.5 px-1.5 rounded-md font-semibold flex items-center justify-center gap-1 transition-colors whitespace-nowrap cursor-pointer ${
                         active
                           ? 'bg-[#1769AA] text-white'
                           : 'text-[#5C6670] hover:text-[#161A1D]'
@@ -1525,6 +1652,16 @@ function UnifiedWorkstation({
                     sampleIdRef.current = 0;
                     setSamples([]);
                   }}
+                />
+              )}
+
+              {resultsTab2D === 'd3' && (
+                <D3AirfoilLabGraphs
+                  samples={samples}
+                  stats={stats2D}
+                  alpha={alpha2D}
+                  airfoilName={airfoil.name}
+                  neutralRef={customRef || neurofoilPrediction.asReference}
                 />
               )}
 
@@ -1597,8 +1734,15 @@ function UnifiedWorkstation({
         </div>
       </footer>
 
-      {/* Shared Theory & 3D CAD Inspector Modals */}
-      <AeroTheoryModal isOpen={isTheoryOpen} onClose={() => setIsTheoryOpen(false)} />
+      {/* Collapsible Interactive Theory & Verification Drawer + 3D CAD Inspector */}
+      <AeroTheoryModal
+        isOpen={isTheoryOpen}
+        onClose={() => setIsTheoryOpen(false)}
+        telemetry={telemetry3D}
+        params={params3D}
+        onParamChange={handleParam3DChange}
+        labMode={labMode}
+      />
 
       <ModelViewerModal
         isOpen={isModelViewerOpen}
@@ -1649,6 +1793,13 @@ export default function App() {
     cloudError,
   } = useSupabase();
   const [pendingSavedGlb, setPendingSavedGlb] = useState<CustomGlbAsset | null>(null);
+  const [pendingLabPreset, setPendingLabPreset] = useState<{
+    modelType: SimulationParams['modelType'];
+    aoaDeg: number;
+    airspeedKts: number;
+    altitudeFt: number;
+    flapsDeg: number;
+  } | null>(null);
 
   const [customRef, setCustomRef] = useState<NeutralReferenceData | null>(null);
   const [alpha2D, setAlpha2D] = useState(DEFAULT_ALPHA_2D);
@@ -1790,6 +1941,24 @@ export default function App() {
     setPendingSavedGlb(null);
   }, []);
 
+  const handleApplyLabPreset = useCallback(
+    (preset: {
+      modelType: SimulationParams['modelType'];
+      aoaDeg: number;
+      airspeedKts: number;
+      altitudeFt: number;
+      flapsDeg: number;
+    }) => {
+      setPendingLabPreset(preset);
+      setLabMode('3d');
+    },
+    []
+  );
+
+  const handleConsumePendingLabPreset = useCallback(() => {
+    setPendingLabPreset(null);
+  }, []);
+
   return (
     <Routes>
       <Route
@@ -1808,6 +1977,7 @@ export default function App() {
             userProfile={userProfile}
             benchmarks={benchmarks}
             sharedAirfoils={sharedAirfoils}
+            sharedGlbModels={sharedGlbModels}
             cloudError={cloudError}
             customRef={customRef}
             setCustomRef={setCustomRef}
@@ -1824,8 +1994,14 @@ export default function App() {
             tunnelRef={tunnelRef}
             pendingSavedGlb={pendingSavedGlb}
             onConsumePendingSavedGlb={handleConsumePendingSavedGlb}
+            pendingLabPreset={pendingLabPreset}
+            onConsumePendingLabPreset={handleConsumePendingLabPreset}
           />
         }
+      />
+      <Route
+        path="/learning-lab"
+        element={<LearningLabPage onApplyToWorkstation={handleApplyLabPreset} />}
       />
       <Route
         path="/profile"

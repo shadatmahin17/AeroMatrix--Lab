@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { SimulationParams, AeroTelemetry } from '../types/aerodynamics';
-import { AIRCRAFT_MODELS } from '../utils/airfoilGenerators';
+import { AIRCRAFT_MODELS, getEffectiveStallAngles } from '../utils/airfoilGenerators';
 import { getAircraft3DModel, Vertex3D } from '../utils/aircraft3DGeometry';
 import {
   loadGlbAircraftModel,
@@ -27,6 +27,7 @@ import {
   Cube,
   Camera,
   ArrowsClockwise,
+  Info,
 } from '@phosphor-icons/react';
 
 interface WindTunnelCanvasWebGLProps {
@@ -40,7 +41,7 @@ interface WindTunnelCanvasWebGLProps {
 }
 
 interface TracedCurveData {
-  points: (Vertex3D & { speed: number; pressureCoeff: number; vorticity: number; isSeparated: boolean })[];
+  points: (Vertex3D & { speed: number; pressureCoeff: number; pressureCoeffClamped: number; vorticity: number; isSeparated: boolean })[];
 }
 
 export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
@@ -91,6 +92,8 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
   const machConeMeshRef = useRef<THREE.Mesh | null>(null);
   const forceVectorsGroupRef = useRef<THREE.Group | null>(null);
   const afterburnerGroupRef = useRef<THREE.Group | null>(null);
+  const bodyAnnotationsGroupRef = useRef<THREE.Group | null>(null);
+  const worldAnnotationsGroupRef = useRef<THREE.Group | null>(null);
 
   // UI state
   const [activePreset, setActivePreset] = useState<'iso' | 'side' | 'top' | 'front' | 'chase'>('iso');
@@ -362,6 +365,17 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     scene.add(forceGroup);
     forceVectorsGroupRef.current = forceGroup;
 
+    // 12b. Phase 4 Engineering Annotations (Body-fixed chord markers + World-space downwash/trailing filaments)
+    const bodyAnnGroup = new THREE.Group();
+    bodyAnnGroup.name = 'BodyEngineeringAnnotations';
+    aircraftGroup.add(bodyAnnGroup);
+    bodyAnnotationsGroupRef.current = bodyAnnGroup;
+
+    const worldAnnGroup = new THREE.Group();
+    worldAnnGroup.name = 'WorldEngineeringAnnotations';
+    scene.add(worldAnnGroup);
+    worldAnnotationsGroupRef.current = worldAnnGroup;
+
     // 13. 60fps Simulation Loop (RK2 Particle Advection + Travelling Smoke Pulses)
     let lastTime = performance.now();
     const animate = () => {
@@ -484,9 +498,9 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
                 hr = 0.96; hg = 0.28; hb = 0.28; // Separated turbulent wake
               } else if (v2.vorticity > 0.35) {
                 hr = 0.35; hg = 0.92; hb = 1.0; // Intense Biot-Savart vortex swirl
-              } else if (v2.pressureCoeff < -0.55) {
+              } else if (v2.pressureCoeffClamped < -0.55) {
                 hr = 0.09; hg = 0.58; hb = 0.92; // Bernoulli suction peak
-              } else if (v2.pressureCoeff > 0.25) {
+              } else if (v2.pressureCoeffClamped > 0.25) {
                 hr = 0.98; hg = 0.72; hb = 0.16; // Stagnation / compression
               } else {
                 hr = 0.20; hg = 0.83; hb = 0.60; // Laminar freestream
@@ -872,9 +886,189 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
       telemetry.lift_N,
       telemetry.drag_N,
       params.angle_of_attack,
-      params.show_pressure_vectors
+      params.show_pressure_vectors,
+      { cl: telemetry.cl, cd: telemetry.cd }
     );
-  }, [telemetry.lift_N, telemetry.drag_N, params.angle_of_attack, params.show_pressure_vectors]);
+  }, [telemetry.lift_N, telemetry.drag_N, telemetry.cl, telemetry.cd, params.angle_of_attack, params.show_pressure_vectors]);
+
+  // Phase 4: Update Engineering Annotations (Stagnation, x_tr, x_sep, Bound Vortex Filaments, Downwash Vectors)
+  useEffect(() => {
+    const bodyGrp = bodyAnnotationsGroupRef.current;
+    const worldGrp = worldAnnotationsGroupRef.current;
+    if (!bodyGrp || !worldGrp) return;
+
+    const disposeGroup = (grp: THREE.Group) => {
+      grp.traverse((obj) => {
+        if ((obj as THREE.Mesh).geometry) (obj as THREE.Mesh).geometry.dispose();
+        const mat = (obj as THREE.Mesh).material;
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else if (mat) mat.dispose();
+      });
+      grp.clear();
+    };
+
+    disposeGroup(bodyGrp);
+    disposeGroup(worldGrp);
+
+    const anyEnabled =
+      params.show_stagnation_annotation ||
+      params.show_transition_annotation ||
+      params.show_separation_annotation ||
+      params.show_vortex_filaments ||
+      params.show_downwash_vectors;
+
+    if (!anyEnabled) return;
+
+    const sf = surfaceFieldRef.current;
+    const halfSpan = sf ? sf.halfSpan : 6.0;
+    const isWingOnly =
+      params.modelType === 'naca0012' ||
+      params.modelType === 'naca2412' ||
+      params.modelType === 'custom_airfoil';
+    const refZ = isWingOnly ? 0 : halfSpan * 0.42;
+    const sec = { leX: -3.0, teX: 3.0, quarterChordX: -1.5, chord: 6.0, yMid: 0, thickness: 0.45 };
+    if (sf) {
+      sf.getSpanSection(refZ, sec);
+    }
+
+    const chord = Math.max(0.6, sec.chord);
+    const wingYTop = sec.yMid + Math.max(0.18, sec.thickness * 0.52);
+    const spanLimit = Math.max(1.0, halfSpan * 0.92);
+    const aoaRad = (params.angle_of_attack * Math.PI) / 180;
+
+    // 1. Stagnation Point Marker (Body-fixed)
+    if (params.show_stagnation_annotation) {
+      const stagX = sec.leX + telemetry.stagnationXc * chord;
+      const stagY = sec.yMid - Math.sin(aoaRad) * Math.max(0.12, sec.thickness * 0.25);
+      const stagZPositions = isWingOnly ? [0] : [-refZ, 0, refZ];
+      const stagMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b });
+      const ringMat = new THREE.MeshBasicMaterial({
+        color: 0xfde047,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.85,
+      });
+
+      for (const zPos of stagZPositions) {
+        const sGeo = new THREE.SphereGeometry(0.14, 16, 12);
+        const sMesh = new THREE.Mesh(sGeo, stagMat);
+        sMesh.position.set(stagX, stagY, zPos);
+        bodyGrp.add(sMesh);
+
+        const rGeo = new THREE.RingGeometry(0.2, 0.27, 24);
+        rGeo.rotateY(Math.PI / 2);
+        const rMesh = new THREE.Mesh(rGeo, ringMat);
+        rMesh.position.set(stagX - 0.04, stagY, zPos);
+        bodyGrp.add(rMesh);
+      }
+    }
+
+    // 2. Boundary-Layer Transition Line x_tr/c (Body-fixed)
+    if (params.show_transition_annotation) {
+      const trX = sec.leX + telemetry.xTransitionUpper * chord;
+      const trGeo = new THREE.CylinderGeometry(0.035, 0.035, spanLimit * 2, 10);
+      trGeo.rotateX(Math.PI / 2);
+      const trMat = new THREE.MeshBasicMaterial({
+        color: 0x10b981,
+        transparent: true,
+        opacity: 0.9,
+      });
+      const trMesh = new THREE.Mesh(trGeo, trMat);
+      trMesh.position.set(trX, wingYTop, 0);
+      bodyGrp.add(trMesh);
+    }
+
+    // 3. Boundary-Layer Separation Onset Line x_sep/c (Body-fixed)
+    if (params.show_separation_annotation && telemetry.xSeparationUpper < 0.995) {
+      const sepX = sec.leX + telemetry.xSeparationUpper * chord;
+      const sepGeo = new THREE.CylinderGeometry(0.045, 0.045, spanLimit * 2, 10);
+      sepGeo.rotateX(Math.PI / 2);
+      const sepMat = new THREE.MeshBasicMaterial({
+        color: 0xef4444,
+        transparent: true,
+        opacity: 0.95,
+      });
+      const sepMesh = new THREE.Mesh(sepGeo, sepMat);
+      sepMesh.position.set(sepX, wingYTop + 0.04, 0);
+      bodyGrp.add(sepMesh);
+    }
+
+    // 4. Quarter-Chord Bound Vortex Filament & Trailing Horseshoe Legs
+    if (params.show_vortex_filaments) {
+      const boundGeo = new THREE.CylinderGeometry(0.06, 0.06, spanLimit * 2, 14);
+      boundGeo.rotateX(Math.PI / 2);
+      const boundMat = new THREE.MeshBasicMaterial({
+        color: 0x38bdf8,
+        transparent: true,
+        opacity: 0.9,
+      });
+      const boundMesh = new THREE.Mesh(boundGeo, boundMat);
+      boundMesh.position.set(sec.quarterChordX, sec.yMid, 0);
+      bodyGrp.add(boundMesh);
+
+      // Trailing tip horseshoe filaments in world wake
+      const tipMat = new THREE.MeshBasicMaterial({
+        color: 0x0ea5e9,
+        transparent: true,
+        opacity: 0.72,
+      });
+      const teWorldX = sec.quarterChordX * Math.cos(aoaRad) + chord * 0.75 * Math.cos(aoaRad);
+      const teWorldY = sec.yMid - chord * 0.75 * Math.sin(aoaRad);
+      for (const tipSign of [-1, 1]) {
+        const legLen = 11.0;
+        const legGeo = new THREE.CylinderGeometry(0.04, 0.025, legLen, 10);
+        legGeo.rotateZ(-Math.PI / 2);
+        const legMesh = new THREE.Mesh(legGeo, tipMat);
+        const epsRad = (telemetry.downwashAngle_deg * Math.PI) / 180;
+        legMesh.rotation.z = -epsRad * 0.5;
+        legMesh.position.set(
+          teWorldX + legLen * 0.5 - 0.5,
+          teWorldY - Math.sin(epsRad * 0.5) * legLen * 0.5,
+          tipSign * spanLimit
+        );
+        worldGrp.add(legMesh);
+      }
+    }
+
+    // 5. Trefftz Downwash Velocity Vectors behind Trailing Edge (World-space)
+    if (params.show_downwash_vectors) {
+      const epsRad = (telemetry.downwashAngle_deg * Math.PI) / 180;
+      const dir = new THREE.Vector3(Math.cos(epsRad), -Math.sin(epsRad), 0).normalize();
+      const arrowLen = Math.max(1.2, Math.min(3.2, 1.4 + Math.abs(telemetry.cl) * 1.1));
+      const teWorldX = sec.teX * Math.cos(aoaRad) + sec.yMid * Math.sin(aoaRad) + 0.7;
+      const teWorldY = -sec.teX * Math.sin(aoaRad) + sec.yMid * Math.cos(aoaRad);
+
+      const zStations = isWingOnly
+        ? [-spanLimit * 0.65, 0, spanLimit * 0.65]
+        : [-spanLimit * 0.75, -spanLimit * 0.38, 0, spanLimit * 0.38, spanLimit * 0.75];
+
+      for (const zPos of zStations) {
+        const arrow = new THREE.ArrowHelper(
+          dir,
+          new THREE.Vector3(teWorldX, teWorldY, zPos),
+          arrowLen,
+          0x22d3ee,
+          0.38,
+          0.2
+        );
+        worldGrp.add(arrow);
+      }
+    }
+  }, [
+    params.show_stagnation_annotation,
+    params.show_transition_annotation,
+    params.show_separation_annotation,
+    params.show_vortex_filaments,
+    params.show_downwash_vectors,
+    params.modelType,
+    params.angle_of_attack,
+    telemetry.stagnationXc,
+    telemetry.xTransitionUpper,
+    telemetry.xSeparationUpper,
+    telemetry.downwashAngle_deg,
+    telemetry.cl,
+    surfaceVersion,
+  ]);
 
   // Update Dynamic Smoke Streamlines (Vortex Flow Law + Real Vertex Surface Field)
   useEffect(() => {
@@ -1029,9 +1223,9 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
           r = 0.98; g = 0.55; b = 0.18; // Jet exhaust
         } else if (pt.vorticity > 0.35 || fil.type === 'vortex') {
           r = 0.22; g = 0.86; b = 1.0; // Biot-Savart vortex core
-        } else if (pt.pressureCoeff < -0.5) {
+        } else if (pt.pressureCoeffClamped < -0.5) {
           r = 0.14; g = 0.62; b = 0.96; // Suction acceleration
-        } else if (pt.pressureCoeff > 0.25) {
+        } else if (pt.pressureCoeffClamped > 0.25) {
           r = 0.96; g = 0.72; b = 0.16; // Compression / ram
         }
 
@@ -1120,8 +1314,8 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
 
           let r = 0.22, g = 0.74, b = 0.97;
           if (vel.isSeparated) { r = 0.94; g = 0.27; b = 0.27; }
-          else if (vel.pressureCoeff < -0.5) { r = 0.14; g = 0.68; b = 0.98; }
-          else if (vel.pressureCoeff > 0.2) { r = 0.96; g = 0.72; b = 0.16; }
+          else if (vel.pressureCoeffClamped < -0.5) { r = 0.14; g = 0.68; b = 0.98; }
+          else if (vel.pressureCoeffClamped > 0.2) { r = 0.96; g = 0.72; b = 0.16; }
           else { r = 0.20; g = 0.83; b = 0.60; }
 
           colors.push(r * 0.4, g * 0.4, b * 0.4, r, g, b);
@@ -1189,6 +1383,13 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
   };
 
   const currentMeta = GLB_MODEL_REGISTRY[params.modelType];
+  const { posStallAngle, negStallAngle } = getEffectiveStallAngles(params.modelType, params.flaps_deg);
+  const isNearOrAboveStall =
+    telemetry.isStalled ||
+    (posStallAngle > 0 && params.angle_of_attack >= posStallAngle - 2) ||
+    (negStallAngle > 0 && params.angle_of_attack <= -(negStallAngle - 2));
+  const showStreamlineCaveat =
+    isNearOrAboveStall || params.modelType === 'concorde' || telemetry.mach > 0.7;
 
   return (
     <div className="relative w-full h-full min-h-[220px] sm:min-h-[360px] lg:min-h-[420px] rounded-xl overflow-hidden border border-[var(--border)] bg-[#0D1114] shadow-[var(--shadow-tech)] flex flex-col group select-none">
@@ -1244,27 +1445,50 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
       )}
 
       {/* Top Header Overlay (Solid #151A1E surface, zero backdrop-blur over WebGL) */}
-      <div className="absolute top-2.5 left-2.5 right-2.5 flex items-center justify-between gap-2 pointer-events-none z-10">
-        <div className="flex items-center gap-1.5 sm:gap-2 bg-[#151A1E]/95 px-2.5 sm:px-3 py-1 sm:py-1.5 rounded-lg border border-slate-700/80 pointer-events-auto text-[11px] sm:text-xs max-w-[56vw] sm:max-w-none overflow-hidden">
-          <span className="font-semibold text-slate-100 truncate">
-            {params.modelType === 'custom_glb' && customGlbAsset
-              ? `${customGlbAsset.fileName.replace(/\.glb$/i, '')} (${formatModelClassLabel(customGlbAsset.calibration.modelClass)})`
-              : currentMeta
-                ? currentMeta.name
-                : AIRCRAFT_MODELS[params.modelType].name}
-          </span>
-          <span className="hidden sm:inline text-slate-500" aria-hidden="true">·</span>
-          <span className="hidden sm:inline text-[11px] font-mono text-sky-300 whitespace-nowrap">
-            Biot-Savart Vortex + Vertex Flow
-          </span>
-          {telemetry.isStalled && (
-            <>
-              <span className="text-slate-500" aria-hidden="true">·</span>
-              <span className="text-[10px] sm:text-[11px] font-bold text-red-400 flex items-center gap-1 whitespace-nowrap shrink-0">
-                <Warning weight="duotone" className="w-3.5 h-3.5" />
-                STALL
-              </span>
-            </>
+      <div className="absolute top-2.5 left-2.5 right-2.5 flex items-start justify-between gap-2 pointer-events-none z-10">
+        <div className="flex flex-col items-start gap-1.5 min-w-0">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 bg-[#151A1E]/95 px-2.5 sm:px-3 py-1 sm:py-1.5 rounded-lg border border-slate-700/80 pointer-events-auto text-[11px] sm:text-xs">
+            <span className="font-semibold text-slate-100">
+              {params.modelType === 'custom_glb' && customGlbAsset
+                ? `${customGlbAsset.fileName.replace(/\.glb$/i, '')} (${formatModelClassLabel(customGlbAsset.calibration.modelClass)})`
+                : currentMeta
+                  ? currentMeta.name
+                  : AIRCRAFT_MODELS[params.modelType].name}
+            </span>
+            <span className="text-slate-500" aria-hidden="true">·</span>
+            <span className="sm:hidden text-[10px] font-mono text-sky-300">
+              Reduced-Order Biot–Savart VLM
+            </span>
+            <span className="hidden sm:inline text-[11px] font-mono text-sky-300">
+              Reduced-Order Biot–Savart Vortex-Lattice &amp; Approximate SDF Model
+            </span>
+            {telemetry.isStalled && (
+              <>
+                <span className="text-slate-500" aria-hidden="true">·</span>
+                <span className="text-[10px] sm:text-[11px] font-bold text-red-400 flex items-center gap-1 whitespace-nowrap shrink-0">
+                  <Warning weight="duotone" className="w-3.5 h-3.5" />
+                  STALL
+                </span>
+              </>
+            )}
+          </div>
+
+          {/* Floating Spatial Force Readout (stacks cleanly below header badge) */}
+          {params.show_pressure_vectors && (
+            <div className="flex flex-col gap-0.5 sm:gap-1 font-mono tabular-nums text-[10px] sm:text-[11px] bg-[#151A1E]/92 px-2 sm:px-3 py-1.5 sm:py-2 rounded-lg border border-slate-700/80">
+              <div className="flex items-center justify-between gap-2.5 sm:gap-3 text-emerald-300">
+                <span>LIFT</span>
+                <span className="font-semibold">{(telemetry.lift_N / 1000).toFixed(1)} kN</span>
+              </div>
+              <div className="flex items-center justify-between gap-2.5 sm:gap-3 text-amber-300">
+                <span>DRAG</span>
+                <span className="font-semibold">{(telemetry.drag_N / 1000).toFixed(1)} kN</span>
+              </div>
+              <div className="flex items-center justify-between gap-2.5 sm:gap-3 text-sky-300">
+                <span>L/D</span>
+                <span className="font-semibold">{telemetry.ldRatio.toFixed(2)}</span>
+              </div>
+            </div>
           )}
         </div>
 
@@ -1315,86 +1539,79 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
         </div>
       </div>
 
-      {/* Bottom Floating Controls Dock */}
-      <div className="absolute bottom-2 left-2 right-2 flex flex-wrap items-center justify-between gap-1.5 pointer-events-none z-10">
-        {/* Camera Presets & Turntable */}
-        <div className="flex items-center gap-0.5 sm:gap-1 bg-[#151A1E]/95 p-0.5 sm:p-1 rounded-lg border border-slate-700/80 pointer-events-auto max-w-full overflow-x-auto">
-          {(['iso', 'side', 'top', 'front', 'chase'] as const).map((p) => (
+      {/* Bottom Floating Controls Dock & Regime-Aware Streamline Caveat */}
+      <div className="absolute bottom-2 left-2 right-2 flex flex-col gap-1.5 pointer-events-none z-10">
+        {showStreamlineCaveat && (
+          <div className="self-start max-w-full sm:max-w-xl px-2.5 py-1 rounded-lg bg-[#151A1E]/92 border border-amber-500/35 text-[10px] sm:text-[10.5px] text-slate-300 leading-snug flex items-start gap-1.5">
+            <Info weight="duotone" className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+            <span>
+              Visual streamlines show attached subsonic potential-flow trajectories; nonlinear leading-edge vortex separation and shock waves are not resolved in 3D.
+            </span>
+          </div>
+        )}
+
+        <div className="flex flex-wrap items-center justify-between gap-1.5">
+          {/* Camera Presets & Turntable */}
+          <div className="flex items-center gap-0.5 sm:gap-1 bg-[#151A1E]/95 p-0.5 sm:p-1 rounded-lg border border-slate-700/80 pointer-events-auto max-w-full overflow-x-auto">
+            {(['iso', 'side', 'top', 'front', 'chase'] as const).map((p) => (
+              <button
+                key={p}
+                onClick={() => setCameraPreset(p)}
+                className={`px-1.5 sm:px-2.5 py-1 rounded-md text-[10px] sm:text-xs font-medium capitalize transition-colors whitespace-nowrap shrink-0 ${
+                  activePreset === p && !isAutoOrbit
+                    ? 'bg-[#1769AA] text-white'
+                    : 'text-slate-300 hover:text-white hover:bg-slate-800/70'
+                }`}
+              >
+                {p}
+              </button>
+            ))}
+
+            <div className="w-px h-3.5 bg-slate-700 mx-0.5 shrink-0" />
+
             <button
-              key={p}
-              onClick={() => setCameraPreset(p)}
-              className={`px-1.5 sm:px-2.5 py-1 rounded-md text-[10px] sm:text-xs font-medium capitalize transition-colors whitespace-nowrap shrink-0 ${
-                activePreset === p && !isAutoOrbit
+              onClick={() => setIsAutoOrbit(!isAutoOrbit)}
+              className={`px-1.5 sm:px-2.5 py-1 rounded-md text-[10px] sm:text-xs font-medium flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                isAutoOrbit
                   ? 'bg-[#1769AA] text-white'
                   : 'text-slate-300 hover:text-white hover:bg-slate-800/70'
               }`}
+              title="Toggle 360 Turntable Orbit"
             >
-              {p}
+              <ArrowsClockwise weight="bold" className={`w-3.5 h-3.5 ${isAutoOrbit ? 'animate-spin' : ''}`} />
+              <span className="hidden sm:inline">Orbit</span>
             </button>
-          ))}
+          </div>
 
-          <div className="w-px h-3.5 bg-slate-700 mx-0.5 shrink-0" />
-
-          <button
-            onClick={() => setIsAutoOrbit(!isAutoOrbit)}
-            className={`px-1.5 sm:px-2.5 py-1 rounded-md text-[10px] sm:text-xs font-medium flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
-              isAutoOrbit
-                ? 'bg-[#1769AA] text-white'
-                : 'text-slate-300 hover:text-white hover:bg-slate-800/70'
-            }`}
-            title="Toggle 360 Turntable Orbit"
-          >
-            <ArrowsClockwise weight="bold" className={`w-3.5 h-3.5 ${isAutoOrbit ? 'animate-spin' : ''}`} />
-            <span className="hidden sm:inline">Orbit</span>
-          </button>
-        </div>
-
-        {/* Shading & Heatmap Overlays */}
-        <div className="flex items-center gap-0.5 sm:gap-1 bg-[#151A1E]/95 p-0.5 sm:p-1 rounded-lg border border-slate-700/80 pointer-events-auto max-w-full overflow-x-auto">
-          {(
-            [
-              { id: 'pbr', label: 'PBR' },
-              { id: 'cfdHeatmap', label: 'CFD Heat' },
-              { id: 'wireframe', label: 'Wire' },
-              { id: 'xray', label: 'X-Ray' },
-            ] as const
-          ).map((s) => (
-            <button
-              key={s.id}
-              onClick={() => {
-                setActiveShading(s.id);
-                if (s.id === 'cfdHeatmap') onParamChange('show_heatmap', true);
-                else if (s.id === 'pbr') onParamChange('show_heatmap', false);
-              }}
-              className={`px-1.5 sm:px-2.5 py-1 rounded-md text-[10px] sm:text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                activeShading === s.id
-                  ? 'bg-[#1769AA] text-white'
-                  : 'text-slate-300 hover:text-white hover:bg-slate-800/70'
-              }`}
-            >
-              {s.label}
-            </button>
-          ))}
+          {/* Shading & Heatmap Overlays */}
+          <div className="flex items-center gap-0.5 sm:gap-1 bg-[#151A1E]/95 p-0.5 sm:p-1 rounded-lg border border-slate-700/80 pointer-events-auto max-w-full overflow-x-auto">
+            {(
+              [
+                { id: 'pbr', label: 'PBR' },
+                { id: 'cfdHeatmap', label: 'CFD Heat' },
+                { id: 'wireframe', label: 'Wire' },
+                { id: 'xray', label: 'X-Ray' },
+              ] as const
+            ).map((s) => (
+              <button
+                key={s.id}
+                onClick={() => {
+                  setActiveShading(s.id);
+                  if (s.id === 'cfdHeatmap') onParamChange('show_heatmap', true);
+                  else if (s.id === 'pbr') onParamChange('show_heatmap', false);
+                }}
+                className={`px-1.5 sm:px-2.5 py-1 rounded-md text-[10px] sm:text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  activeShading === s.id
+                    ? 'bg-[#1769AA] text-white'
+                    : 'text-slate-300 hover:text-white hover:bg-slate-800/70'
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
-
-      {/* Floating Spatial Force Readout */}
-      {params.show_pressure_vectors && (
-        <div className="absolute top-12 sm:top-14 left-2.5 sm:left-3 pointer-events-none z-10 flex flex-col gap-0.5 sm:gap-1 font-mono tabular-nums text-[10px] sm:text-[11px] bg-[#151A1E]/92 px-2 sm:px-3 py-1.5 sm:py-2 rounded-lg border border-slate-700/80">
-          <div className="flex items-center justify-between gap-2.5 sm:gap-3 text-emerald-300">
-            <span>LIFT</span>
-            <span className="font-semibold">{(telemetry.lift_N / 1000).toFixed(1)} kN</span>
-          </div>
-          <div className="flex items-center justify-between gap-2.5 sm:gap-3 text-amber-300">
-            <span>DRAG</span>
-            <span className="font-semibold">{(telemetry.drag_N / 1000).toFixed(1)} kN</span>
-          </div>
-          <div className="flex items-center justify-between gap-2.5 sm:gap-3 text-sky-300">
-            <span>L/D</span>
-            <span className="font-semibold">{telemetry.ldRatio.toFixed(2)}</span>
-          </div>
-        </div>
-      )}
 
       {/* CFD Pressure Heatmap Legend Overlay */}
       {(activeShading === 'cfdHeatmap' || params.show_heatmap) && (

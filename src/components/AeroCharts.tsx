@@ -1,8 +1,22 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import * as echarts from 'echarts';
+import * as d3 from 'd3';
 import { AircraftModelType, AeroTelemetry } from '../types/aerodynamics';
-import { calculateAeroTelemetry, getEffectiveStallAngles } from '../utils/airfoilGenerators';
-import { downloadCurveDataCSV } from '../utils/telemetryExport';
+import {
+  calculateAeroTelemetry,
+  computeSectionCpProfile,
+  getEffectiveStallAngles,
+} from '../utils/airfoilGenerators';
+import {
+  computeBenchmarkDeviation,
+  convert2DBenchmarkToFiniteWing,
+  getBenchmarkCpStations,
+  getNacaBenchmark,
+} from '../data/nacaBenchmarks';
+import {
+  downloadCurveDataCSV,
+  downloadSvgAsPng,
+  downloadSvgElement,
+} from '../utils/telemetryExport';
 import {
   ChartLineUp,
   DownloadSimple,
@@ -32,6 +46,10 @@ interface PolarPoint {
   flowState: string;
 }
 
+type ChartTab = 'lift' | 'dragAlpha' | 'dragPolar' | 'pressure';
+
+const MONO_FONT = '"JetBrains Mono", ui-monospace, monospace';
+
 export const AeroCharts: React.FC<AeroChartsProps> = ({
   modelType,
   currentAoa,
@@ -41,14 +59,21 @@ export const AeroCharts: React.FC<AeroChartsProps> = ({
   telemetry,
   customGlbVersion = 0,
 }) => {
-  const [activeTab, setActiveTab] = useState<'lift' | 'dragPolar' | 'pressure'>('lift');
+  const [activeTab, setActiveTab] = useState<ChartTab>('lift');
+  const [showBenchmarkOverlay, setShowBenchmarkOverlay] = useState(true);
   const [showChartExportMenu, setShowChartExportMenu] = useState(false);
   const [chartSuccessMsg, setChartSuccessMsg] = useState<string | null>(null);
+  const [probeReadout, setProbeReadout] = useState<string | null>(null);
 
   const chartContainerRef = useRef<HTMLDivElement>(null);
-  const chartInstanceRef = useRef<echarts.ECharts | null>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
   const chartMenuRef = useRef<HTMLDivElement>(null);
-  const [chartReadyTick, setChartReadyTick] = useState(0);
+  const [dims, setDims] = useState<{ width: number; height: number }>({
+    width: 372,
+    height: 222,
+  });
+
+  const benchmarkDataset = useMemo(() => getNacaBenchmark(modelType), [modelType]);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -63,6 +88,21 @@ export const AeroCharts: React.FC<AeroChartsProps> = ({
       document.removeEventListener('mousedown', handleClickOutside);
     };
   }, [showChartExportMenu]);
+
+  // Responsive SVG dimensions via ResizeObserver
+  useEffect(() => {
+    const el = chartContainerRef.current;
+    if (!el) return;
+    const sync = () => {
+      const w = Math.max(260, Math.floor(el.clientWidth));
+      const h = Math.max(204, Math.floor(el.clientHeight) || 222);
+      setDims((prev) => (prev.width === w && prev.height === h ? prev : { width: w, height: h }));
+    };
+    sync();
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(sync) : null;
+    ro?.observe(el);
+    return () => ro?.disconnect();
+  }, []);
 
   // High-resolution AoA sweep (-20 deg to +30 deg in 0.5 deg increments)
   const aoaSweep = useMemo<PolarPoint[]>(() => {
@@ -82,69 +122,53 @@ export const AeroCharts: React.FC<AeroChartsProps> = ({
     return pts;
   }, [modelType, airspeedKts, altitudeFt, flapsDeg, customGlbVersion]);
 
-  // Pressure distribution along normalized chord (x/c in [0, 1])
+  // First-principles chordwise pressure distribution along x/c in [0, 1]
   const cpSweep = useMemo(() => {
-    const pts: { xc: number; cpUpper: number; cpLower: number }[] = [];
-    const effectiveCl = Math.max(0.1, telemetry.cl);
-    for (let i = 0; i <= 40; i++) {
-      const xc = i / 40;
-      const rawUpper =
-        -effectiveCl * 1.8 * (Math.pow(1 - xc, 0.45) / Math.sqrt(Math.max(0.04, xc))) + 0.15;
-      const rawLower = effectiveCl * 0.7 * Math.pow(1 - xc, 0.75);
-      pts.push({
-        xc: Number(xc.toFixed(3)),
-        cpUpper: Number(Math.max(-3.5, Math.min(1.0, rawUpper)).toFixed(3)),
-        cpLower: Number(Math.max(-0.5, Math.min(1.0, rawLower)).toFixed(3)),
-      });
-    }
-    return pts;
-  }, [telemetry.cl]);
+    return computeSectionCpProfile(
+      modelType,
+      currentAoa,
+      airspeedKts,
+      altitudeFt,
+      flapsDeg
+    );
+  }, [modelType, currentAoa, airspeedKts, altitudeFt, flapsDeg, customGlbVersion]);
 
-  // Initialize Apache ECharts instance (SVG renderer + ResizeObserver) only when container has non-zero size
+  const benchmarkCp = useMemo(() => {
+    if (!benchmarkDataset || !showBenchmarkOverlay) return null;
+    return getBenchmarkCpStations(benchmarkDataset, currentAoa);
+  }, [benchmarkDataset, showBenchmarkOverlay, currentAoa]);
+
+  const benchmarkDeviation = useMemo(() => {
+    if (!benchmarkDataset || !showBenchmarkOverlay) return null;
+    return computeBenchmarkDeviation(modelType, telemetry, currentAoa, aoaSweep);
+  }, [benchmarkDataset, showBenchmarkOverlay, modelType, telemetry, currentAoa, aoaSweep]);
+
   useEffect(() => {
-    const el = chartContainerRef.current;
-    if (!el) return;
+    setProbeReadout(null);
+  }, [activeTab, modelType]);
 
-    let chart: echarts.ECharts | null = null;
-    let disposed = false;
-
-    const initIfVisible = () => {
-      if (disposed || chart || el.clientWidth <= 0 || el.clientHeight <= 0) return;
-      chart = echarts.init(el, undefined, { renderer: 'svg' });
-      chartInstanceRef.current = chart;
-      setChartReadyTick((t) => t + 1);
-    };
-
-    initIfVisible();
-
-    const resizeObserver =
-      typeof ResizeObserver !== 'undefined'
-        ? new ResizeObserver(() => {
-            if (disposed || el.clientWidth <= 0 || el.clientHeight <= 0) return;
-            if (!chart) {
-              initIfVisible();
-            } else if (!chart.isDisposed()) {
-              chart.resize();
-            }
-          })
-        : null;
-    resizeObserver?.observe(el);
-
-    return () => {
-      disposed = true;
-      resizeObserver?.disconnect();
-      if (chart && !chart.isDisposed()) {
-        chart.dispose();
-      }
-      chart = null;
-      chartInstanceRef.current = null;
-    };
-  }, []);
-
-  // Build & update ECharts option whenever activeTab or telemetry/parameters change
+  // Render D3.js SVG Graph
   useEffect(() => {
-    const chart = chartInstanceRef.current;
-    if (!chart || chart.isDisposed()) return;
+    const svgEl = svgRef.current;
+    if (!svgEl) return;
+
+    const svg = d3.select(svgEl);
+    svg.selectAll('*').remove();
+
+    const { width, height } = dims;
+    svg
+      .attr('viewBox', `0 0 ${width} ${height}`)
+      .attr('width', width)
+      .attr('height', height);
+
+    svg
+      .append('rect')
+      .attr('class', 'export-bg')
+      .attr('x', 0)
+      .attr('y', 0)
+      .attr('width', width)
+      .attr('height', height)
+      .attr('fill', '#F7F9FA');
 
     const { posStallAngle: effectiveStall, negStallAngle } = getEffectiveStallAngles(
       modelType,
@@ -152,552 +176,760 @@ export const AeroCharts: React.FC<AeroChartsProps> = ({
     );
     const negStall = negStallAngle > 0 ? -negStallAngle : 0;
 
-    const commonTooltip = {
-      trigger: 'axis' as const,
-      confine: true,
-      backgroundColor: 'rgba(22, 26, 29, 0.94)',
-      borderColor: '#334155',
-      borderWidth: 1,
-      padding: [8, 10],
-      textStyle: {
-        color: '#F8FAFC',
-        fontSize: 11,
-        fontFamily: '"JetBrains Mono", monospace',
-      },
-      axisPointer: {
-        type: 'cross' as const,
-        lineStyle: { color: '#94A3B8', width: 1, type: 'dashed' as const },
-        crossStyle: { color: '#94A3B8', width: 1, type: 'dashed' as const },
-        label: {
-          backgroundColor: '#1769AA',
-          fontSize: 10,
-          fontFamily: '"JetBrains Mono", monospace',
-        },
-      },
+    const defs = svg.append('defs');
+    const margin = {
+      top: benchmarkDataset && showBenchmarkOverlay ? 28 : 22,
+      right: 16,
+      bottom: 30,
+      left: 44,
+    };
+    const innerW = Math.max(120, width - margin.left - margin.right);
+    const innerH = Math.max(90, height - margin.top - margin.bottom);
+
+    const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+    const clipId = `polar-clip-${activeTab}`;
+    defs
+      .append('clipPath')
+      .attr('id', clipId)
+      .append('rect')
+      .attr('width', innerW)
+      .attr('height', innerH);
+    const plotArea = g.append('g').attr('clip-path', `url(#${clipId})`);
+
+    const drawLegend = (items: Array<{ color: string; label: string; dashed?: boolean }>) => {
+      let lx = width - margin.right;
+      for (let i = items.length - 1; i >= 0; i--) {
+        const it = items[i];
+        const textW = it.label.length * 5.2 + 18;
+        lx -= textW;
+        const itemG = svg.append('g').attr('transform', `translate(${lx}, 9)`);
+        itemG
+          .append('line')
+          .attr('x1', 0)
+          .attr('x2', 11)
+          .attr('y1', 4)
+          .attr('y2', 4)
+          .attr('stroke', it.color)
+          .attr('stroke-width', 2)
+          .attr('stroke-dasharray', it.dashed ? '3 2' : 'none');
+        itemG
+          .append('text')
+          .attr('x', 14)
+          .attr('y', 7)
+          .style('font-family', MONO_FONT)
+          .style('font-size', '8.5px')
+          .attr('fill', '#5C6670')
+          .text(it.label);
+      }
     };
 
-    let option: echarts.EChartsOption;
+    const drawOperatingBadge = (cx: number, cy: number, color: string, labelText: string) => {
+      const clampedX = Math.max(4, Math.min(innerW - 4, cx));
+      const clampedY = Math.max(4, Math.min(innerH - 4, cy));
+      const opG = g.append('g').attr('pointer-events', 'none');
 
+      opG
+        .append('circle')
+        .attr('cx', clampedX)
+        .attr('cy', clampedY)
+        .attr('r', 8)
+        .attr('fill', 'none')
+        .attr('stroke', color)
+        .attr('stroke-width', 1.1)
+        .attr('opacity', 0.45);
+      opG
+        .append('circle')
+        .attr('cx', clampedX)
+        .attr('cy', clampedY)
+        .attr('r', 4.5)
+        .attr('fill', color)
+        .attr('stroke', '#FFFFFF')
+        .attr('stroke-width', 1.8);
+
+      const badgeW = labelText.length * 5.8 + 10;
+      const placeLeft = clampedX > innerW * 0.56;
+      const placeBelow = clampedY < 26;
+      const bx = placeLeft ? Math.max(2, clampedX - badgeW - 8) : Math.min(innerW - badgeW - 2, clampedX + 8);
+      const by = placeBelow ? Math.min(innerH - 18, clampedY + 8) : Math.max(2, clampedY - 22);
+
+      opG
+        .append('rect')
+        .attr('x', bx)
+        .attr('y', by)
+        .attr('width', badgeW)
+        .attr('height', 16)
+        .attr('rx', 3.5)
+        .attr('fill', 'rgba(255,255,255,0.94)')
+        .attr('stroke', color)
+        .attr('stroke-width', 1);
+      opG
+        .append('text')
+        .attr('x', bx + 5)
+        .attr('y', by + 11)
+        .style('font-family', MONO_FONT)
+        .style('font-size', '9px')
+        .style('font-weight', 700)
+        .attr('fill', color)
+        .text(labelText);
+    };
+
+    // =========================================================================
+    // TAB 1: LIFT CURVE (CL - alpha)
+    // =========================================================================
     if (activeTab === 'lift') {
-      const curveData = aoaSweep.map((p) => [p.aoa, p.cl, p.cd, p.ldRatio, p.isStalled ? 1 : 0]);
-      const stallZones: Array<[{ xAxis: number }, { xAxis: number }]> = [];
+      const xScale = d3.scaleLinear().domain([-20, 30]).range([0, innerW]);
+      const minCl = Math.min(-1.4, (d3.min(aoaSweep, (d) => d.cl) ?? -1.2) - 0.2);
+      const maxCl = Math.max(2.2, (d3.max(aoaSweep, (d) => d.cl) ?? 2.0) + 0.25);
+      const yScale = d3.scaleLinear().domain([minCl, maxCl]).nice().range([innerH, 0]);
+
+      // Horizontal & Vertical Gridlines
+      plotArea
+        .selectAll('line.gy')
+        .data(yScale.ticks(5))
+        .join('line')
+        .attr('x1', 0)
+        .attr('x2', innerW)
+        .attr('y1', (d) => yScale(d))
+        .attr('y2', (d) => yScale(d))
+        .attr('stroke', '#E2E8F0')
+        .attr('stroke-dasharray', '3 3');
+
+      plotArea
+        .selectAll('line.gx')
+        .data([-10, 0, 10, 20])
+        .join('line')
+        .attr('x1', (d) => xScale(d))
+        .attr('x2', (d) => xScale(d))
+        .attr('y1', 0)
+        .attr('y2', innerH)
+        .attr('stroke', (d) => (d === 0 ? '#94A3B8' : '#E2E8F0'))
+        .attr('stroke-dasharray', '3 3');
+
+      // Zero Lift Axis
+      plotArea
+        .append('line')
+        .attr('x1', 0)
+        .attr('x2', innerW)
+        .attr('y1', yScale(0))
+        .attr('y2', yScale(0))
+        .attr('stroke', '#94A3B8')
+        .attr('stroke-dasharray', '3 3');
+
+      // Stall Zone Shading
       if (effectiveStall > 0) {
         if (effectiveStall < 30) {
-          stallZones.push([{ xAxis: effectiveStall }, { xAxis: 30 }]);
+          const sx = xScale(effectiveStall);
+          plotArea
+            .append('rect')
+            .attr('x', sx)
+            .attr('y', 0)
+            .attr('width', innerW - sx)
+            .attr('height', innerH)
+            .attr('fill', 'rgba(220, 38, 38, 0.08)');
+          plotArea
+            .append('line')
+            .attr('x1', sx)
+            .attr('x2', sx)
+            .attr('y1', 0)
+            .attr('y2', innerH)
+            .attr('stroke', 'rgba(220, 38, 38, 0.55)')
+            .attr('stroke-dasharray', '4 3');
+          plotArea
+            .append('text')
+            .attr('x', sx + 4)
+            .attr('y', 11)
+            .style('font-family', MONO_FONT)
+            .style('font-size', '8.5px')
+            .style('font-weight', 700)
+            .attr('fill', '#DC2626')
+            .text(`STALL αcrit +${effectiveStall.toFixed(0)}°`);
         }
         if (negStall > -20) {
-          stallZones.push([{ xAxis: -20 }, { xAxis: negStall }]);
+          plotArea
+            .append('rect')
+            .attr('x', 0)
+            .attr('y', 0)
+            .attr('width', xScale(negStall))
+            .attr('height', innerH)
+            .attr('fill', 'rgba(220, 38, 38, 0.08)');
         }
       }
 
-      const opColor = telemetry.isStalled ? '#DC2626' : '#1769AA';
+      // Area Gradient Fill
+      const gradId = 'd3-lift-grad';
+      const grad = defs
+        .append('linearGradient')
+        .attr('id', gradId)
+        .attr('x1', '0')
+        .attr('y1', '0')
+        .attr('x2', '0')
+        .attr('y2', '1');
+      grad.append('stop').attr('offset', '0%').attr('stop-color', 'rgba(23, 105, 170, 0.22)');
+      grad.append('stop').attr('offset', '100%').attr('stop-color', 'rgba(23, 105, 170, 0.01)');
 
-      option = {
-        animationDuration: 300,
-        grid: { left: 42, right: 16, top: 26, bottom: 32 },
-        tooltip: {
-          ...commonTooltip,
-          formatter: (params: unknown) => {
-            const list = Array.isArray(params) ? params : [params];
-            const first = list[0] as { data?: number[] };
-            if (!first?.data) return '';
-            const [aoa, cl, cd, ld, stalled] = first.data;
-            if (cd === undefined) {
-              return `<div style="font-weight:700;color:#38BDF8">Operating Point</div>
-                <div>α: ${currentAoa >= 0 ? '+' : ''}${currentAoa.toFixed(1)}°</div>
-                <div>CL: ${telemetry.cl.toFixed(3)} · L/D: ${telemetry.ldRatio.toFixed(1)}</div>`;
-            }
-            return `
-              <div style="font-weight:700;margin-bottom:3px;color:${stalled ? '#F87171' : '#38BDF8'}">
-                α = ${aoa >= 0 ? '+' : ''}${aoa.toFixed(1)}° ${stalled ? '· STALL' : '· Attached'}
-              </div>
-              <div>CL: <b>${cl.toFixed(3)}</b> · CD: <b>${cd.toFixed(3)}</b></div>
-              <div>L/D: <b>${ld.toFixed(1)}:1</b></div>
-            `;
-          },
-        },
-        xAxis: {
-          type: 'value',
-          min: -20,
-          max: 30,
-          interval: 10,
-          name: 'α (°)',
-          nameLocation: 'end',
-          nameGap: 6,
-          nameTextStyle: { color: '#5C6670', fontSize: 10, fontFamily: '"JetBrains Mono", monospace' },
-          axisLine: { lineStyle: { color: '#CBD5E1' } },
-          axisTick: { show: false },
-          axisLabel: {
-            color: '#5C6670',
-            fontSize: 10,
-            fontFamily: '"JetBrains Mono", monospace',
-            formatter: (v: number) => `${v}°`,
-          },
-          splitLine: { lineStyle: { color: '#E2E8F0', type: 'dashed' } },
-        },
-        yAxis: {
-          type: 'value',
-          min: -1.8,
-          max: 2.6,
-          interval: 1.0,
-          name: 'CL',
-          nameTextStyle: { color: '#5C6670', fontSize: 10, padding: [0, 24, 0, 0], fontFamily: '"JetBrains Mono", monospace' },
-          axisLine: { show: false },
-          axisLabel: {
-            color: '#5C6670',
-            fontSize: 10,
-            fontFamily: '"JetBrains Mono", monospace',
-            formatter: (v: number) => v.toFixed(1),
-          },
-          splitLine: { lineStyle: { color: '#E2E8F0', type: 'dashed' } },
-        },
-        series: [
-          {
-            name: 'CL Polar',
-            type: 'line',
-            smooth: 0.25,
-            showSymbol: false,
-            data: curveData,
-            lineStyle: { color: '#1769AA', width: 2.5 },
-            areaStyle: {
-              color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                { offset: 0, color: 'rgba(23, 105, 170, 0.20)' },
-                { offset: 1, color: 'rgba(23, 105, 170, 0.01)' },
-              ]),
-            },
-            markArea: stallZones.length
-              ? {
-                  silent: true,
-                  itemStyle: { color: 'rgba(220, 38, 38, 0.08)' },
-                  label: {
-                    show: true,
-                    position: 'insideTop',
-                    color: '#DC2626',
-                    fontSize: 9,
-                    fontFamily: '"JetBrains Mono", monospace',
-                  },
-                  data: stallZones.map((zone, idx) => [
-                    { ...zone[0], name: idx === 0 ? 'STALL' : '' },
-                    zone[1],
-                  ]),
-                }
-              : undefined,
-            markLine: {
-              silent: true,
-              symbol: 'none',
-              data: [
-                { yAxis: 0, lineStyle: { color: '#94A3B8', type: 'dashed', width: 1 }, label: { show: false } },
-                { xAxis: 0, lineStyle: { color: '#94A3B8', type: 'dashed', width: 1 }, label: { show: false } },
-                ...(effectiveStall > 0
-                  ? [
-                      {
-                        xAxis: effectiveStall,
-                        lineStyle: { color: 'rgba(220, 38, 38, 0.55)', type: 'dashed' as const, width: 1.2 },
-                        label: {
-                          show: true,
-                          formatter: `αcrit +${effectiveStall.toFixed(0)}°`,
-                          position: 'insideEndTop' as const,
-                          color: '#DC2626',
-                          fontSize: 9,
-                          fontFamily: '"JetBrains Mono", monospace',
-                        },
-                      },
-                      ...(negStall > -20
-                        ? [
-                            {
-                              xAxis: negStall,
-                              lineStyle: { color: 'rgba(220, 38, 38, 0.45)', type: 'dashed' as const, width: 1.1 },
-                              label: {
-                                show: true,
-                                formatter: `${negStall.toFixed(0)}°`,
-                                position: 'insideEndBottom' as const,
-                                color: '#DC2626',
-                                fontSize: 9,
-                                fontFamily: '"JetBrains Mono", monospace',
-                              },
-                            },
-                          ]
-                        : []),
-                    ]
-                  : []),
-              ],
-            },
-          },
-          {
-            name: 'Operating Point',
-            type: 'effectScatter',
-            symbolSize: 10,
-            rippleEffect: { scale: 2.6, brushType: 'stroke' },
-            itemStyle: { color: opColor, borderColor: '#FFFFFF', borderWidth: 2 },
-            data: [[currentAoa, telemetry.cl]],
-            label: {
-              show: true,
-              position: currentAoa > 14 ? 'left' : telemetry.cl > 1.7 ? 'bottom' : 'top',
-              distance: 8,
-              formatter: () =>
-                `α ${currentAoa >= 0 ? '+' : ''}${currentAoa.toFixed(1)}° · CL ${telemetry.cl.toFixed(2)}`,
-              color: opColor,
-              backgroundColor: 'rgba(255,255,255,0.92)',
-              borderColor: opColor,
-              borderWidth: 1,
-              borderRadius: 4,
-              padding: [2, 5],
-              fontSize: 10,
-              fontWeight: 700,
-              fontFamily: '"JetBrains Mono", monospace',
-            },
-          },
-        ],
-      };
-    } else if (activeTab === 'dragPolar') {
-      const polarData = aoaSweep.map((p) => [p.cd, p.cl, p.aoa, p.ldRatio]);
+      const area = d3
+        .area<PolarPoint>()
+        .x((d) => xScale(d.aoa))
+        .y0(yScale(0))
+        .y1((d) => yScale(d.cl))
+        .curve(d3.curveMonotoneX);
+
+      plotArea.append('path').datum(aoaSweep).attr('d', area).attr('fill', `url(#${gradId})`);
+
+      // Sim CL Curve
+      const line = d3
+        .line<PolarPoint>()
+        .x((d) => xScale(d.aoa))
+        .y((d) => yScale(d.cl))
+        .curve(d3.curveMonotoneX);
+
+      plotArea
+        .append('path')
+        .datum(aoaSweep)
+        .attr('d', line)
+        .attr('fill', 'none')
+        .attr('stroke', '#1769AA')
+        .attr('stroke-width', 2.4);
+
+      // Benchmark Overlays
+      if (benchmarkDataset && showBenchmarkOverlay) {
+        const ref3d = benchmarkDataset.polar.map((p) => {
+          const fw = convert2DBenchmarkToFiniteWing(p, telemetry.aspectRatio, telemetry.oswaldEfficiency);
+          return { aoa: fw.aoa, cl: fw.cl3d };
+        });
+        const ref2d = benchmarkDataset.polar.map((p) => ({ aoa: p.aoa, cl: p.cl2d }));
+
+        const refLine = d3
+          .line<{ aoa: number; cl: number }>()
+          .x((d) => xScale(d.aoa))
+          .y((d) => yScale(d.cl))
+          .curve(d3.curveMonotoneX);
+
+        plotArea
+          .append('path')
+          .datum(ref2d)
+          .attr('d', refLine)
+          .attr('fill', 'none')
+          .attr('stroke', '#64748B')
+          .attr('stroke-width', 1.3)
+          .attr('stroke-dasharray', '2 2');
+
+        plotArea
+          .append('path')
+          .datum(ref3d)
+          .attr('d', refLine)
+          .attr('fill', 'none')
+          .attr('stroke', '#059669')
+          .attr('stroke-width', 1.8)
+          .attr('stroke-dasharray', '5 3');
+
+        plotArea
+          .selectAll('circle.naca-pt')
+          .data(ref3d)
+          .join('circle')
+          .attr('cx', (d) => xScale(d.aoa))
+          .attr('cy', (d) => yScale(d.cl))
+          .attr('r', 2.2)
+          .attr('fill', '#059669');
+
+        drawLegend([
+          { color: '#1769AA', label: 'Sim CL' },
+          { color: '#059669', label: 'NACA 3D', dashed: true },
+          { color: '#64748B', label: 'NACA 2D', dashed: true },
+        ]);
+      }
+
+      const opColor = telemetry.isStalled ? '#DC2626' : '#1769AA';
+      drawOperatingBadge(
+        xScale(currentAoa),
+        yScale(telemetry.cl),
+        opColor,
+        `α ${currentAoa >= 0 ? '+' : ''}${currentAoa.toFixed(1)}° · CL ${telemetry.cl.toFixed(2)}`
+      );
+
+      // Axes
+      g.append('g')
+        .attr('transform', `translate(0,${innerH})`)
+        .call(d3.axisBottom(xScale).tickValues([-20, -10, 0, 10, 20, 30]).tickFormat((d) => `${d}°`))
+        .call((ax) => ax.select('.domain').attr('stroke', '#CBD5E1'))
+        .call((ax) => ax.selectAll('text').style('font-family', MONO_FONT).style('font-size', '9.5px').attr('fill', '#5C6670'));
+
+      g.append('g')
+        .call(d3.axisLeft(yScale).ticks(5).tickFormat((d) => Number(d).toFixed(1)))
+        .call((ax) => ax.select('.domain').remove())
+        .call((ax) => ax.selectAll('text').style('font-family', MONO_FONT).style('font-size', '9.5px').attr('fill', '#5C6670'));
+
+      svg
+        .append('text')
+        .attr('x', 8)
+        .attr('y', 14)
+        .style('font-family', MONO_FONT)
+        .style('font-size', '9px')
+        .style('font-weight', 700)
+        .attr('fill', '#5C6670')
+        .text('CL');
+
+      svg
+        .append('text')
+        .attr('x', margin.left + innerW / 2)
+        .attr('y', height - 4)
+        .attr('text-anchor', 'middle')
+        .style('font-family', MONO_FONT)
+        .style('font-size', '9px')
+        .attr('fill', '#5C6670')
+        .text('Angle of Attack α (°)');
+
+      // Hover Crosshair
+      const hoverLine = plotArea.append('line').attr('y1', 0).attr('y2', innerH).attr('stroke', '#64748B').attr('stroke-dasharray', '2 2').attr('opacity', 0);
+      const bisect = d3.bisector<PolarPoint, number>((d) => d.aoa).center;
+      g.append('rect')
+        .attr('width', innerW)
+        .attr('height', innerH)
+        .attr('fill', 'transparent')
+        .style('cursor', 'crosshair')
+        .on('mousemove', (event) => {
+          const [mx] = d3.pointer(event);
+          const idx = bisect(aoaSweep, xScale.invert(mx));
+          const pt = aoaSweep[Math.max(0, Math.min(aoaSweep.length - 1, idx))];
+          if (!pt) return;
+          hoverLine.attr('x1', xScale(pt.aoa)).attr('x2', xScale(pt.aoa)).attr('opacity', 0.85);
+          setProbeReadout(
+            `α ${pt.aoa >= 0 ? '+' : ''}${pt.aoa.toFixed(1)}° · CL ${pt.cl.toFixed(3)} · CD ${pt.cd.toFixed(4)} · L/D ${pt.ldRatio.toFixed(1)}:1 · ${pt.isStalled ? 'STALL' : 'Attached'}`
+          );
+        })
+        .on('mouseleave', () => hoverLine.attr('opacity', 0));
+    }
+
+    // =========================================================================
+    // TAB 2: DRAG CURVE (CD - alpha)
+    // =========================================================================
+    else if (activeTab === 'dragAlpha') {
+      const xScale = d3.scaleLinear().domain([-20, 30]).range([0, innerW]);
+      const maxCdVal = Math.max(
+        0.25,
+        Math.min(1.6, Math.ceil(Math.max(...aoaSweep.map((p) => p.cd), telemetry.cd) * 10) / 10 + 0.05)
+      );
+      const yScale = d3.scaleLinear().domain([0, maxCdVal]).nice().range([innerH, 0]);
+
+      plotArea
+        .selectAll('line.gy')
+        .data(yScale.ticks(4))
+        .join('line')
+        .attr('x1', 0)
+        .attr('x2', innerW)
+        .attr('y1', (d) => yScale(d))
+        .attr('y2', (d) => yScale(d))
+        .attr('stroke', '#E2E8F0')
+        .attr('stroke-dasharray', '3 3');
+
+      if (effectiveStall > 0) {
+        if (effectiveStall < 30) {
+          const sx = xScale(effectiveStall);
+          plotArea.append('rect').attr('x', sx).attr('y', 0).attr('width', innerW - sx).attr('height', innerH).attr('fill', 'rgba(220, 38, 38, 0.08)');
+          plotArea.append('text').attr('x', sx + 4).attr('y', 11).style('font-family', MONO_FONT).style('font-size', '8.5px').style('font-weight', 700).attr('fill', '#DC2626').text('SEP DRAG');
+        }
+        if (negStall > -20) {
+          plotArea.append('rect').attr('x', 0).attr('y', 0).attr('width', xScale(negStall)).attr('height', innerH).attr('fill', 'rgba(220, 38, 38, 0.08)');
+        }
+      }
+
+      const gradId = 'd3-cd-grad';
+      const grad = defs.append('linearGradient').attr('id', gradId).attr('x1', '0').attr('y1', '0').attr('x2', '0').attr('y2', '1');
+      grad.append('stop').attr('offset', '0%').attr('stop-color', 'rgba(217, 119, 6, 0.22)');
+      grad.append('stop').attr('offset', '100%').attr('stop-color', 'rgba(217, 119, 6, 0.01)');
+
+      plotArea
+        .append('path')
+        .datum(aoaSweep)
+        .attr(
+          'd',
+          d3.area<PolarPoint>().x((d) => xScale(d.aoa)).y0(innerH).y1((d) => yScale(Math.min(maxCdVal, d.cd))).curve(d3.curveMonotoneX)
+        )
+        .attr('fill', `url(#${gradId})`);
+
+      plotArea
+        .append('path')
+        .datum(aoaSweep)
+        .attr(
+          'd',
+          d3.line<PolarPoint>().x((d) => xScale(d.aoa)).y((d) => yScale(Math.min(maxCdVal, d.cd))).curve(d3.curveMonotoneX)
+        )
+        .attr('fill', 'none')
+        .attr('stroke', '#D97706')
+        .attr('stroke-width', 2.4);
+
+      if (benchmarkDataset && showBenchmarkOverlay) {
+        const ref3d = benchmarkDataset.polar.map((p) => {
+          const fw = convert2DBenchmarkToFiniteWing(p, telemetry.aspectRatio, telemetry.oswaldEfficiency);
+          return { aoa: fw.aoa, cd: fw.cd3d };
+        });
+        const refLine = d3
+          .line<{ aoa: number; cd: number }>()
+          .x((d) => xScale(d.aoa))
+          .y((d) => yScale(Math.min(maxCdVal, d.cd)))
+          .curve(d3.curveMonotoneX);
+        plotArea
+          .append('path')
+          .datum(ref3d)
+          .attr('d', refLine)
+          .attr('fill', 'none')
+          .attr('stroke', '#059669')
+          .attr('stroke-width', 1.8)
+          .attr('stroke-dasharray', '5 3');
+        drawLegend([
+          { color: '#D97706', label: 'Sim CD' },
+          { color: '#059669', label: 'NACA 3D', dashed: true },
+        ]);
+      }
+
+      const opColor = telemetry.isStalled ? '#DC2626' : '#D97706';
+      drawOperatingBadge(
+        xScale(currentAoa),
+        yScale(Math.min(maxCdVal, telemetry.cd)),
+        opColor,
+        `α ${currentAoa >= 0 ? '+' : ''}${currentAoa.toFixed(1)}° · CD ${telemetry.cd.toFixed(3)}`
+      );
+
+      g.append('g')
+        .attr('transform', `translate(0,${innerH})`)
+        .call(d3.axisBottom(xScale).tickValues([-20, -10, 0, 10, 20, 30]).tickFormat((d) => `${d}°`))
+        .call((ax) => ax.select('.domain').attr('stroke', '#CBD5E1'))
+        .call((ax) => ax.selectAll('text').style('font-family', MONO_FONT).style('font-size', '9.5px').attr('fill', '#5C6670'));
+
+      g.append('g')
+        .call(d3.axisLeft(yScale).ticks(4).tickFormat((d) => Number(d).toFixed(2)))
+        .call((ax) => ax.select('.domain').remove())
+        .call((ax) => ax.selectAll('text').style('font-family', MONO_FONT).style('font-size', '9.5px').attr('fill', '#5C6670'));
+
+      svg.append('text').attr('x', 8).attr('y', 14).style('font-family', MONO_FONT).style('font-size', '9px').style('font-weight', 700).attr('fill', '#5C6670').text('CD');
+      svg.append('text').attr('x', margin.left + innerW / 2).attr('y', height - 4).attr('text-anchor', 'middle').style('font-family', MONO_FONT).style('font-size', '9px').attr('fill', '#5C6670').text('Angle of Attack α (°)');
+
+      const hoverLine = plotArea.append('line').attr('y1', 0).attr('y2', innerH).attr('stroke', '#D97706').attr('stroke-dasharray', '2 2').attr('opacity', 0);
+      const bisect = d3.bisector<PolarPoint, number>((d) => d.aoa).center;
+      g.append('rect')
+        .attr('width', innerW)
+        .attr('height', innerH)
+        .attr('fill', 'transparent')
+        .style('cursor', 'crosshair')
+        .on('mousemove', (event) => {
+          const [mx] = d3.pointer(event);
+          const idx = bisect(aoaSweep, xScale.invert(mx));
+          const pt = aoaSweep[Math.max(0, Math.min(aoaSweep.length - 1, idx))];
+          if (!pt) return;
+          hoverLine.attr('x1', xScale(pt.aoa)).attr('x2', xScale(pt.aoa)).attr('opacity', 0.85);
+          setProbeReadout(`α ${pt.aoa >= 0 ? '+' : ''}${pt.aoa.toFixed(1)}° · CD ${pt.cd.toFixed(4)} · CL ${pt.cl.toFixed(3)} · L/D ${pt.ldRatio.toFixed(1)}:1`);
+        })
+        .on('mouseleave', () => hoverLine.attr('opacity', 0));
+    }
+
+    // =========================================================================
+    // TAB 3: DRAG POLAR (CL vs CD) + (L/D)max TANGENT RAY
+    // =========================================================================
+    else if (activeTab === 'dragPolar') {
       const maxCdVal = Math.max(
         0.5,
         Math.min(1.8, Math.ceil(Math.max(...aoaSweep.map((p) => p.cd), telemetry.cd) * 10) / 10 + 0.05)
       );
+      const minCl = Math.min(-1.2, (d3.min(aoaSweep, (d) => d.cl) ?? -1.2) - 0.15);
+      const maxCl = Math.max(2.2, (d3.max(aoaSweep, (d) => d.cl) ?? 2.2) + 0.2);
 
-      // Find peak L/D point for the maximum efficiency tangent ray
+      const xScale = d3.scaleLinear().domain([0, maxCdVal]).range([0, innerW]);
+      const yScale = d3.scaleLinear().domain([minCl, maxCl]).nice().range([innerH, 0]);
+
+      plotArea
+        .selectAll('line.gy')
+        .data(yScale.ticks(5))
+        .join('line')
+        .attr('x1', 0)
+        .attr('x2', innerW)
+        .attr('y1', (d) => yScale(d))
+        .attr('y2', (d) => yScale(d))
+        .attr('stroke', '#E2E8F0')
+        .attr('stroke-dasharray', '3 3');
+
+      plotArea.append('line').attr('x1', 0).attr('x2', innerW).attr('y1', yScale(0)).attr('y2', yScale(0)).attr('stroke', '#94A3B8').attr('stroke-dasharray', '3 3');
+
+      // Best L/D Tangent Ray
       let bestPt = aoaSweep[0];
       for (const p of aoaSweep) {
         if (p.ldRatio > bestPt.ldRatio) bestPt = p;
       }
-      const rayScale = bestPt.cd > 0.005 ? Math.min(2.2 / Math.max(0.1, bestPt.cl), maxCdVal / bestPt.cd) : 1;
-      const rayEndCd = Number((bestPt.cd * rayScale).toFixed(3));
-      const rayEndCl = Number((bestPt.cl * rayScale).toFixed(3));
-      const opColor = telemetry.isStalled ? '#DC2626' : '#D97706';
+      if (bestPt.ldRatio > 1.5 && bestPt.cd > 0.005) {
+        const rayScale = Math.min(2.1 / Math.max(0.1, bestPt.cl), maxCdVal / bestPt.cd);
+        const endCd = bestPt.cd * rayScale;
+        const endCl = bestPt.cl * rayScale;
+        plotArea
+          .append('line')
+          .attr('x1', xScale(0))
+          .attr('y1', yScale(0))
+          .attr('x2', xScale(endCd))
+          .attr('y2', yScale(endCl))
+          .attr('stroke', '#10B981')
+          .attr('stroke-width', 1.4)
+          .attr('stroke-dasharray', '4 3');
+        plotArea
+          .append('text')
+          .attr('x', Math.min(innerW - 76, xScale(endCd) - 24))
+          .attr('y', Math.max(12, yScale(endCl) - 4))
+          .style('font-family', MONO_FONT)
+          .style('font-size', '8.5px')
+          .style('font-weight', 700)
+          .attr('fill', '#059669')
+          .text(`(L/D)max ${bestPt.ldRatio.toFixed(1)}`);
+      }
 
-      option = {
-        animationDuration: 300,
-        grid: { left: 42, right: 16, top: 26, bottom: 32 },
-        tooltip: {
-          ...commonTooltip,
-          trigger: 'item',
-          formatter: (params: unknown) => {
-            const item = params as { data?: number[] };
-            if (!item?.data) return '';
-            const [cd, cl, aoa, ld] = item.data;
-            if (aoa === undefined) {
-              return `<div style="font-weight:700;color:#FBBF24">Current Operating Point</div>
-                <div>CD: <b>${telemetry.cd.toFixed(3)}</b> · CL: <b>${telemetry.cl.toFixed(3)}</b></div>
-                <div>L/D: <b>${telemetry.ldRatio.toFixed(1)}:1</b></div>`;
-            }
-            return `
-              <div style="font-weight:700;margin-bottom:3px;color:#FBBF24">
-                Drag Polar · α = ${aoa >= 0 ? '+' : ''}${aoa.toFixed(1)}°
-              </div>
-              <div>CD: <b>${cd.toFixed(3)}</b> · CL: <b>${cl.toFixed(3)}</b></div>
-              <div>L/D: <b>${ld.toFixed(1)}:1</b></div>
-            `;
-          },
-        },
-        xAxis: {
-          type: 'value',
-          min: 0,
-          max: maxCdVal,
-          name: 'CD',
-          nameLocation: 'end',
-          nameGap: 6,
-          nameTextStyle: { color: '#5C6670', fontSize: 10, fontFamily: '"JetBrains Mono", monospace' },
-          axisLine: { lineStyle: { color: '#CBD5E1' } },
-          axisTick: { show: false },
-          axisLabel: {
-            color: '#5C6670',
-            fontSize: 10,
-            fontFamily: '"JetBrains Mono", monospace',
-            formatter: (v: number) => v.toFixed(2),
-          },
-          splitLine: { lineStyle: { color: '#E2E8F0', type: 'dashed' } },
-        },
-        yAxis: {
-          type: 'value',
-          min: -1.6,
-          max: 2.5,
-          interval: 1.0,
-          name: 'CL',
-          nameTextStyle: { color: '#5C6670', fontSize: 10, padding: [0, 24, 0, 0], fontFamily: '"JetBrains Mono", monospace' },
-          axisLine: { show: false },
-          axisLabel: {
-            color: '#5C6670',
-            fontSize: 10,
-            fontFamily: '"JetBrains Mono", monospace',
-            formatter: (v: number) => v.toFixed(1),
-          },
-          splitLine: { lineStyle: { color: '#E2E8F0', type: 'dashed' } },
-        },
-        series: [
-          {
-            name: 'Drag Polar',
-            type: 'line',
-            smooth: 0.25,
-            showSymbol: false,
-            data: polarData,
-            lineStyle: { color: '#D97706', width: 2.5 },
-            areaStyle: {
-              color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                { offset: 0, color: 'rgba(217, 119, 6, 0.16)' },
-                { offset: 1, color: 'rgba(217, 119, 6, 0.01)' },
-              ]),
-            },
-            markLine: {
-              silent: true,
-              symbol: 'none',
-              data: [
-                { yAxis: 0, lineStyle: { color: '#94A3B8', type: 'dashed', width: 1 }, label: { show: false } },
-                ...(bestPt.ldRatio > 1.5
-                  ? [
-                      [
-                        { coord: [0, 0] },
-                        {
-                          coord: [rayEndCd, rayEndCl],
-                          lineStyle: { color: '#10B981', type: 'dashed' as const, width: 1.5 },
-                          label: {
-                            show: true,
-                            formatter: `(L/D)max ${bestPt.ldRatio.toFixed(1)}`,
-                            color: '#059669',
-                            fontSize: 9,
-                            fontFamily: '"JetBrains Mono", monospace',
-                          },
-                        },
-                      ] as [{ coord: [number, number] }, { coord: [number, number]; lineStyle: { color: string; type: 'dashed'; width: number }; label: { show: boolean; formatter: string; color: string; fontSize: number; fontFamily: string } }],
-                    ]
-                  : []),
-              ],
-            },
-          },
-          {
-            name: 'Operating Point',
-            type: 'effectScatter',
-            symbolSize: 10,
-            rippleEffect: { scale: 2.6, brushType: 'stroke' },
-            itemStyle: { color: opColor, borderColor: '#FFFFFF', borderWidth: 2 },
-            data: [[Math.min(maxCdVal, telemetry.cd), telemetry.cl]],
-            label: {
-              show: true,
-              position: telemetry.cd > maxCdVal * 0.65 ? 'left' : 'top',
-              distance: 8,
-              formatter: () => `CD ${telemetry.cd.toFixed(3)} · CL ${telemetry.cl.toFixed(2)}`,
-              color: opColor,
-              backgroundColor: 'rgba(255,255,255,0.92)',
-              borderColor: opColor,
-              borderWidth: 1,
-              borderRadius: 4,
-              padding: [2, 5],
-              fontSize: 10,
-              fontWeight: 700,
-              fontFamily: '"JetBrains Mono", monospace',
-            },
-          },
-        ],
-      };
-    } else {
-      option = {
-        animationDuration: 300,
-        grid: { left: 42, right: 16, top: 30, bottom: 32 },
-        legend: {
-          top: 2,
-          right: 8,
-          itemWidth: 12,
-          itemHeight: 3,
-          textStyle: { color: '#5C6670', fontSize: 10, fontFamily: 'sans-serif' },
-          data: ['Upper Suction (-Cp)', 'Lower Compression (+Cp)'],
-        },
-        tooltip: {
-          ...commonTooltip,
-          formatter: (params: unknown) => {
-            const list = Array.isArray(params) ? params : [params];
-            const first = list[0] as { axisValue?: number };
-            if (!first) return '';
-            const xc = Number(first.axisValue ?? 0);
-            const upperVal = (list[0] as { data?: number[] })?.data?.[1] ?? 0;
-            const lowerVal = (list[1] as { data?: number[] })?.data?.[1] ?? 0;
-            const deltaCp = lowerVal - upperVal;
-            return `
-              <div style="font-weight:700;margin-bottom:3px;color:#38BDF8">
-                Chord Station x/c = ${(xc * 100).toFixed(0)}%
-              </div>
-              <div style="color:#60A5FA">Upper Cp: <b>${upperVal.toFixed(2)}</b></div>
-              <div style="color:#FBBF24">Lower Cp: <b>${lowerVal >= 0 ? '+' : ''}${lowerVal.toFixed(2)}</b></div>
-              <div>ΔCp Loading: <b>${deltaCp.toFixed(2)}</b></div>
-            `;
-          },
-        },
-        xAxis: {
-          type: 'value',
-          min: 0,
-          max: 1,
-          interval: 0.25,
-          name: 'x/c',
-          nameLocation: 'end',
-          nameGap: 6,
-          nameTextStyle: { color: '#5C6670', fontSize: 10, fontFamily: '"JetBrains Mono", monospace' },
-          axisLine: { lineStyle: { color: '#CBD5E1' } },
-          axisTick: { show: false },
-          axisLabel: {
-            color: '#5C6670',
-            fontSize: 10,
-            fontFamily: '"JetBrains Mono", monospace',
-            formatter: (v: number) => v.toFixed(2),
-          },
-          splitLine: { lineStyle: { color: '#E2E8F0', type: 'dashed' } },
-        },
-        yAxis: {
-          type: 'value',
-          inverse: true, // Aerospace convention: suction (-Cp) upwards
-          min: -3.5,
-          max: 1.2,
-          interval: 1.5,
-          name: 'Cp',
-          nameTextStyle: { color: '#5C6670', fontSize: 10, padding: [0, 24, 0, 0], fontFamily: '"JetBrains Mono", monospace' },
-          axisLine: { show: false },
-          axisLabel: {
-            color: '#5C6670',
-            fontSize: 10,
-            fontFamily: '"JetBrains Mono", monospace',
-            formatter: (v: number) => (v > 0 ? `+${v.toFixed(1)}` : v.toFixed(1)),
-          },
-          splitLine: { lineStyle: { color: '#E2E8F0', type: 'dashed' } },
-        },
-        series: [
-          {
-            name: 'Upper Suction (-Cp)',
-            type: 'line',
-            smooth: 0.25,
-            showSymbol: false,
-            data: cpSweep.map((p) => [p.xc, p.cpUpper]),
-            lineStyle: { color: '#1769AA', width: 2.5 },
-            areaStyle: {
-              color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                { offset: 0, color: 'rgba(23, 105, 170, 0.20)' },
-                { offset: 1, color: 'rgba(23, 105, 170, 0.02)' },
-              ]),
-            },
-            markLine: {
-              silent: true,
-              symbol: 'none',
-              data: [{ yAxis: 0, lineStyle: { color: '#94A3B8', type: 'dashed', width: 1 }, label: { show: false } }],
-            },
-          },
-          {
-            name: 'Lower Compression (+Cp)',
-            type: 'line',
-            smooth: 0.25,
-            showSymbol: false,
-            data: cpSweep.map((p) => [p.xc, p.cpLower]),
-            lineStyle: { color: '#D97706', width: 2.5 },
-            areaStyle: {
-              color: new echarts.graphic.LinearGradient(0, 1, 0, 0, [
-                { offset: 0, color: 'rgba(217, 119, 6, 0.16)' },
-                { offset: 1, color: 'rgba(217, 119, 6, 0.01)' },
-              ]),
-            },
-          },
-        ],
-      };
+      // Drag Polar Curve
+      plotArea
+        .append('path')
+        .datum(aoaSweep)
+        .attr(
+          'd',
+          d3.line<PolarPoint>().x((d) => xScale(Math.min(maxCdVal, d.cd))).y((d) => yScale(d.cl)).curve(d3.curveCatmullRom.alpha(0.5))
+        )
+        .attr('fill', 'none')
+        .attr('stroke', '#D97706')
+        .attr('stroke-width', 2.4);
+
+      if (benchmarkDataset && showBenchmarkOverlay) {
+        const refPolar = benchmarkDataset.polar.map((p) => {
+          const fw = convert2DBenchmarkToFiniteWing(p, telemetry.aspectRatio, telemetry.oswaldEfficiency);
+          return { cd: fw.cd3d, cl: fw.cl3d };
+        });
+        plotArea
+          .append('path')
+          .datum(refPolar)
+          .attr(
+            'd',
+            d3.line<{ cd: number; cl: number }>().x((d) => xScale(Math.min(maxCdVal, d.cd))).y((d) => yScale(d.cl)).curve(d3.curveMonotoneY)
+          )
+          .attr('fill', 'none')
+          .attr('stroke', '#059669')
+          .attr('stroke-width', 1.8)
+          .attr('stroke-dasharray', '5 3');
+        drawLegend([
+          { color: '#D97706', label: 'Polar' },
+          { color: '#059669', label: 'NACA 3D', dashed: true },
+        ]);
+      }
+
+      const opColor = telemetry.isStalled ? '#DC2626' : '#D97706';
+      drawOperatingBadge(
+        xScale(Math.min(maxCdVal, telemetry.cd)),
+        yScale(telemetry.cl),
+        opColor,
+        `CD ${telemetry.cd.toFixed(3)} · CL ${telemetry.cl.toFixed(2)}`
+      );
+
+      g.append('g')
+        .attr('transform', `translate(0,${innerH})`)
+        .call(d3.axisBottom(xScale).ticks(5).tickFormat((d) => Number(d).toFixed(2)))
+        .call((ax) => ax.select('.domain').attr('stroke', '#CBD5E1'))
+        .call((ax) => ax.selectAll('text').style('font-family', MONO_FONT).style('font-size', '9.5px').attr('fill', '#5C6670'));
+
+      g.append('g')
+        .call(d3.axisLeft(yScale).ticks(5).tickFormat((d) => Number(d).toFixed(1)))
+        .call((ax) => ax.select('.domain').remove())
+        .call((ax) => ax.selectAll('text').style('font-family', MONO_FONT).style('font-size', '9.5px').attr('fill', '#5C6670'));
+
+      svg.append('text').attr('x', 8).attr('y', 14).style('font-family', MONO_FONT).style('font-size', '9px').style('font-weight', 700).attr('fill', '#5C6670').text('CL');
+      svg.append('text').attr('x', margin.left + innerW / 2).attr('y', height - 4).attr('text-anchor', 'middle').style('font-family', MONO_FONT).style('font-size', '9px').attr('fill', '#5C6670').text('Drag Coefficient CD');
+
+      // Delaunay nearest-point probe along polar
+      const delaunay = d3.Delaunay.from(
+        aoaSweep,
+        (d) => xScale(Math.min(maxCdVal, d.cd)),
+        (d) => yScale(d.cl)
+      );
+      const focus = plotArea.append('circle').attr('r', 5.5).attr('fill', 'none').attr('stroke', '#1769AA').attr('stroke-width', 1.6).attr('opacity', 0);
+      g.append('rect')
+        .attr('width', innerW)
+        .attr('height', innerH)
+        .attr('fill', 'transparent')
+        .style('cursor', 'crosshair')
+        .on('mousemove', (event) => {
+          const [mx, my] = d3.pointer(event);
+          const idx = delaunay.find(mx, my);
+          const pt = aoaSweep[idx];
+          if (!pt) return;
+          focus.attr('cx', xScale(Math.min(maxCdVal, pt.cd))).attr('cy', yScale(pt.cl)).attr('opacity', 1);
+          setProbeReadout(`α ${pt.aoa >= 0 ? '+' : ''}${pt.aoa.toFixed(1)}° · CD ${pt.cd.toFixed(4)} · CL ${pt.cl.toFixed(3)} · L/D ${pt.ldRatio.toFixed(1)}:1`);
+        })
+        .on('mouseleave', () => focus.attr('opacity', 0));
     }
 
-    chart.setOption(option, { notMerge: true });
-  }, [activeTab, aoaSweep, cpSweep, modelType, flapsDeg, currentAoa, telemetry, chartReadyTick]);
+    // =========================================================================
+    // TAB 4: CHORDWISE PRESSURE COEFFICIENT Cp(x/c) (INVERTED Y)
+    // =========================================================================
+    else {
+      const xScale = d3.scaleLinear().domain([0, 1]).range([0, innerW]);
+      const minCpRaw = d3.min(cpSweep, (d) => Math.min(d.cpUpper, d.cpLower)) ?? -2.5;
+      const minCp = Math.min(-3.5, Number((minCpRaw - 0.3).toFixed(1)));
+      // Inverted Y-axis: suction (-Cp) at top, compression (+Cp) at bottom
+      const yScale = d3.scaleLinear().domain([minCp, 1.2]).range([0, innerH]);
+
+      plotArea
+        .selectAll('line.gy')
+        .data(yScale.ticks(5))
+        .join('line')
+        .attr('x1', 0)
+        .attr('x2', innerW)
+        .attr('y1', (d) => yScale(d))
+        .attr('y2', (d) => yScale(d))
+        .attr('stroke', '#E2E8F0')
+        .attr('stroke-dasharray', '3 3');
+
+      plotArea.append('line').attr('x1', 0).attr('x2', innerW).attr('y1', yScale(0)).attr('y2', yScale(0)).attr('stroke', '#94A3B8').attr('stroke-dasharray', '3 3');
+
+      // Upper & Lower Area Fills
+      plotArea
+        .append('path')
+        .datum(cpSweep)
+        .attr(
+          'd',
+          d3.area<(typeof cpSweep)[number]>().x((d) => xScale(d.xc)).y0(yScale(0)).y1((d) => yScale(d.cpUpper)).curve(d3.curveMonotoneX)
+        )
+        .attr('fill', 'rgba(23, 105, 170, 0.14)');
+
+      plotArea
+        .append('path')
+        .datum(cpSweep)
+        .attr(
+          'd',
+          d3.area<(typeof cpSweep)[number]>().x((d) => xScale(d.xc)).y0(yScale(0)).y1((d) => yScale(d.cpLower)).curve(d3.curveMonotoneX)
+        )
+        .attr('fill', 'rgba(217, 119, 6, 0.12)');
+
+      // Upper & Lower Curves
+      plotArea
+        .append('path')
+        .datum(cpSweep)
+        .attr(
+          'd',
+          d3.line<(typeof cpSweep)[number]>().x((d) => xScale(d.xc)).y((d) => yScale(d.cpUpper)).curve(d3.curveMonotoneX)
+        )
+        .attr('fill', 'none')
+        .attr('stroke', '#1769AA')
+        .attr('stroke-width', 2.4);
+
+      plotArea
+        .append('path')
+        .datum(cpSweep)
+        .attr(
+          'd',
+          d3.line<(typeof cpSweep)[number]>().x((d) => xScale(d.xc)).y((d) => yScale(d.cpLower)).curve(d3.curveMonotoneX)
+        )
+        .attr('fill', 'none')
+        .attr('stroke', '#D97706')
+        .attr('stroke-width', 2.2);
+
+      if (benchmarkCp) {
+        plotArea
+          .append('path')
+          .datum(benchmarkCp)
+          .attr(
+            'd',
+            d3.line<(typeof benchmarkCp)[number]>().x((d) => xScale(d.xc)).y((d) => yScale(d.cpUpper)).curve(d3.curveMonotoneX)
+          )
+          .attr('fill', 'none')
+          .attr('stroke', '#059669')
+          .attr('stroke-width', 1.6)
+          .attr('stroke-dasharray', '4 3');
+
+        plotArea
+          .append('path')
+          .datum(benchmarkCp)
+          .attr(
+            'd',
+            d3.line<(typeof benchmarkCp)[number]>().x((d) => xScale(d.xc)).y((d) => yScale(d.cpLower)).curve(d3.curveMonotoneX)
+          )
+          .attr('fill', 'none')
+          .attr('stroke', '#64748B')
+          .attr('stroke-width', 1.4)
+          .attr('stroke-dasharray', '2 2');
+
+        drawLegend([
+          { color: '#1769AA', label: 'Upper' },
+          { color: '#D97706', label: 'Lower' },
+          { color: '#059669', label: 'XFOIL U', dashed: true },
+        ]);
+      } else {
+        drawLegend([
+          { color: '#1769AA', label: 'Upper (-Cp)' },
+          { color: '#D97706', label: 'Lower (+Cp)' },
+        ]);
+      }
+
+      g.append('g')
+        .attr('transform', `translate(0,${innerH})`)
+        .call(d3.axisBottom(xScale).tickValues([0, 0.25, 0.5, 0.75, 1]).tickFormat((d) => Number(d).toFixed(2)))
+        .call((ax) => ax.select('.domain').attr('stroke', '#CBD5E1'))
+        .call((ax) => ax.selectAll('text').style('font-family', MONO_FONT).style('font-size', '9.5px').attr('fill', '#5C6670'));
+
+      g.append('g')
+        .call(d3.axisLeft(yScale).ticks(5).tickFormat((d) => (Number(d) > 0 ? `+${Number(d).toFixed(1)}` : Number(d).toFixed(1))))
+        .call((ax) => ax.select('.domain').remove())
+        .call((ax) => ax.selectAll('text').style('font-family', MONO_FONT).style('font-size', '9.5px').attr('fill', '#5C6670'));
+
+      svg.append('text').attr('x', 8).attr('y', 14).style('font-family', MONO_FONT).style('font-size', '9px').style('font-weight', 700).attr('fill', '#5C6670').text('Cp');
+      svg.append('text').attr('x', margin.left + innerW / 2).attr('y', height - 4).attr('text-anchor', 'middle').style('font-family', MONO_FONT).style('font-size', '9px').attr('fill', '#5C6670').text('Chord Position (x/c)');
+
+      const hoverLine = plotArea.append('line').attr('y1', 0).attr('y2', innerH).attr('stroke', '#1769AA').attr('stroke-dasharray', '2 2').attr('opacity', 0);
+      const bisect = d3.bisector<(typeof cpSweep)[number], number>((d) => d.xc).center;
+      g.append('rect')
+        .attr('width', innerW)
+        .attr('height', innerH)
+        .attr('fill', 'transparent')
+        .style('cursor', 'crosshair')
+        .on('mousemove', (event) => {
+          const [mx] = d3.pointer(event);
+          const idx = bisect(cpSweep, xScale.invert(mx));
+          const pt = cpSweep[Math.max(0, Math.min(cpSweep.length - 1, idx))];
+          if (!pt) return;
+          hoverLine.attr('x1', xScale(pt.xc)).attr('x2', xScale(pt.xc)).attr('opacity', 0.85);
+          const dCp = pt.cpLower - pt.cpUpper;
+          setProbeReadout(`x/c ${(pt.xc * 100).toFixed(0)}% · Upper Cp ${pt.cpUpper.toFixed(2)} · Lower Cp ${pt.cpLower >= 0 ? '+' : ''}${pt.cpLower.toFixed(2)} · ΔCp ${dCp.toFixed(2)}`);
+        })
+        .on('mouseleave', () => hoverLine.attr('opacity', 0));
+    }
+  }, [
+    activeTab,
+    dims,
+    aoaSweep,
+    cpSweep,
+    benchmarkDataset,
+    benchmarkCp,
+    showBenchmarkOverlay,
+    modelType,
+    flapsDeg,
+    currentAoa,
+    telemetry,
+  ]);
 
   const getBaseName = () => {
     const tabSuffix =
       activeTab === 'lift'
         ? 'lift_curve_cl_alpha'
-        : activeTab === 'dragPolar'
-        ? 'drag_polar_cl_cd'
-        : 'pressure_dist_cp';
+        : activeTab === 'dragAlpha'
+          ? 'drag_curve_cd_alpha'
+          : activeTab === 'dragPolar'
+            ? 'drag_polar_cl_cd'
+            : 'pressure_dist_cp';
     return `aerolab_${modelType}_${tabSuffix}_aoa${currentAoa >= 0 ? '+' : ''}${currentAoa.toFixed(1)}deg`;
   };
 
-  const getExportableSvgClone = (): { clone: SVGSVGElement; w: number; h: number } | null => {
-    const svgEl = chartContainerRef.current?.querySelector('svg');
-    if (!svgEl) return null;
-    const clone = svgEl.cloneNode(true) as SVGSVGElement;
-    const w = Math.max(440, svgEl.clientWidth || 440);
-    const h = Math.max(210, svgEl.clientHeight || 220);
-    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-    clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
-    clone.setAttribute('viewBox', `0 0 ${w} ${h}`);
-    clone.setAttribute('width', `${w}`);
-    clone.setAttribute('height', `${h}`);
-
-    const bgRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    bgRect.setAttribute('width', '100%');
-    bgRect.setAttribute('height', '100%');
-    bgRect.setAttribute('fill', '#F7F9FA');
-    clone.insertBefore(bgRect, clone.firstChild);
-
-    return { clone, w, h };
-  };
-
   const handleExportSvg = () => {
-    const exported = getExportableSvgClone();
-    if (!exported) return;
-    const serializer = new XMLSerializer();
-    const svgString = serializer.serializeToString(exported.clone);
-    const blob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${getBaseName()}.svg`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-
+    if (!svgRef.current) return;
+    downloadSvgElement(svgRef.current, getBaseName());
     setChartSuccessMsg('SVG Saved');
     setShowChartExportMenu(false);
     setTimeout(() => setChartSuccessMsg(null), 3000);
   };
 
   const handleExportPng = async () => {
-    const exported = getExportableSvgClone();
-    if (!exported) return;
+    if (!svgRef.current) return;
     try {
-      const serializer = new XMLSerializer();
-      const svgString = serializer.serializeToString(exported.clone);
-      const svgBlob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
-      const url = URL.createObjectURL(svgBlob);
-
-      await new Promise<void>((resolve, reject) => {
-        const img = new window.Image();
-        img.onload = () => {
-          const scale = 2;
-          const canvas = document.createElement('canvas');
-          canvas.width = exported.w * scale;
-          canvas.height = exported.h * scale;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) {
-            URL.revokeObjectURL(url);
-            reject(new Error('Canvas context unavailable'));
-            return;
-          }
-          ctx.fillStyle = '#F7F9FA';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          URL.revokeObjectURL(url);
-
-          canvas.toBlob((blob) => {
-            if (!blob) {
-              reject(new Error('PNG export failed'));
-              return;
-            }
-            const dlUrl = URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = dlUrl;
-            link.download = `${getBaseName()}.png`;
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-            URL.revokeObjectURL(dlUrl);
-            resolve();
-          }, 'image/png');
-        };
-        img.onerror = (err) => {
-          URL.revokeObjectURL(url);
-          reject(err);
-        };
-        img.src = url;
-      });
+      await downloadSvgAsPng(svgRef.current, getBaseName(), 2);
       setChartSuccessMsg('PNG Saved');
     } catch (e) {
       console.error(e);
@@ -716,6 +948,13 @@ export const AeroCharts: React.FC<AeroChartsProps> = ({
         label: pt.isStalled ? 'Stalled' : 'Attached',
       }));
       downloadCurveDataCSV(points, 'Angle of Attack (deg)', 'Lift Coefficient (CL)', baseName);
+    } else if (activeTab === 'dragAlpha') {
+      const points = aoaSweep.map((pt) => ({
+        x: pt.aoa,
+        y: pt.cd,
+        label: pt.isStalled ? 'Stalled' : 'Attached',
+      }));
+      downloadCurveDataCSV(points, 'Angle of Attack (deg)', 'Drag Coefficient (CD)', baseName);
     } else if (activeTab === 'dragPolar') {
       const points = aoaSweep.map((pt) => ({
         x: pt.cd,
@@ -749,7 +988,7 @@ export const AeroCharts: React.FC<AeroChartsProps> = ({
               Aerodynamic Polars
             </span>
             {chartSuccessMsg && (
-              <span className="ml-1 px-1.5 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-700 text-[9px] font-mono flex items-center gap-1 shrink-0">
+              <span className="ml-1 text-[10px] font-mono text-emerald-700 flex items-center gap-1 shrink-0">
                 <CheckCircle weight="duotone" className="w-3 h-3 text-emerald-600" />
                 <span>{chartSuccessMsg}</span>
               </span>
@@ -757,13 +996,25 @@ export const AeroCharts: React.FC<AeroChartsProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5 shrink-0">
-            <span className="text-[10px] text-[#1769AA] font-mono tabular-nums font-semibold hidden sm:inline">
-              α: {currentAoa >= 0 ? '+' : ''}{currentAoa.toFixed(1)}°
-            </span>
+            {benchmarkDataset && (
+              <button
+                type="button"
+                onClick={() => setShowBenchmarkOverlay((v) => !v)}
+                className={`px-2 py-0.5 rounded-md border text-[10px] font-mono font-semibold transition-colors cursor-pointer ${
+                  showBenchmarkOverlay
+                    ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                    : 'bg-[var(--bg)] border-[var(--border)] text-[#5C6670] hover:text-[#161A1D]'
+                }`}
+                title="Toggle Abbott & von Doenhoff / XFOIL wind-tunnel benchmark overlay"
+              >
+                {showBenchmarkOverlay ? '● NACA Ref' : '○ NACA Ref'}
+              </button>
+            )}
 
             {/* Export Chart Dropdown Menu */}
             <div className="relative" ref={chartMenuRef}>
               <button
+                type="button"
                 onClick={() => setShowChartExportMenu((prev) => !prev)}
                 className="px-2 py-0.5 rounded-md bg-[var(--bg)] border border-[var(--border)] hover:border-[#1769AA] text-[10px] font-semibold text-[#161A1D] flex items-center gap-1 transition-colors cursor-pointer"
                 title="Export graph as high-res PNG, vector SVG, or raw CSV points"
@@ -771,7 +1022,7 @@ export const AeroCharts: React.FC<AeroChartsProps> = ({
                 aria-haspopup="true"
               >
                 <DownloadSimple weight="bold" className="w-3 h-3 text-[#1769AA]" />
-                <span>Export Graph</span>
+                <span>Export</span>
                 <CaretDown
                   weight="bold"
                   className={`w-2.5 h-2.5 text-[#5C6670] transition-transform duration-200 ${
@@ -789,48 +1040,42 @@ export const AeroCharts: React.FC<AeroChartsProps> = ({
                   </div>
 
                   <button
+                    type="button"
                     onClick={handleExportPng}
                     className="w-full text-left px-2 py-1.5 rounded-lg hover:bg-[var(--bg)] flex items-center gap-2 text-[#161A1D] transition-colors cursor-pointer"
                   >
                     <FilePng weight="duotone" className="w-4 h-4 text-[#1769AA] shrink-0" />
                     <div className="flex flex-col">
                       <span className="text-[11px] font-semibold text-[#161A1D] flex items-center gap-1">
-                        High-Res Image
-                        <span className="text-[9px] font-mono px-1 rounded bg-[var(--accent-light)] text-[#1769AA]">
-                          .png
-                        </span>
+                        High-Res Image <span className="text-[9px] font-mono text-[#1769AA]">.png</span>
                       </span>
                       <span className="text-[9px] text-[#5C6670]">Crisp 2× raster render</span>
                     </div>
                   </button>
 
                   <button
+                    type="button"
                     onClick={handleExportSvg}
                     className="w-full text-left px-2 py-1.5 rounded-lg hover:bg-[var(--bg)] flex items-center gap-2 text-[#161A1D] transition-colors cursor-pointer"
                   >
                     <FileSvg weight="duotone" className="w-4 h-4 text-amber-600 shrink-0" />
                     <div className="flex flex-col">
                       <span className="text-[11px] font-semibold text-[#161A1D] flex items-center gap-1">
-                        Vector Graphic
-                        <span className="text-[9px] font-mono px-1 rounded bg-amber-50 text-amber-700">
-                          .svg
-                        </span>
+                        Vector Graphic <span className="text-[9px] font-mono text-amber-700">.svg</span>
                       </span>
                       <span className="text-[9px] text-[#5C6670]">Lossless scalable vector</span>
                     </div>
                   </button>
 
                   <button
+                    type="button"
                     onClick={handleExportCurveCsv}
                     className="w-full text-left px-2 py-1.5 rounded-lg hover:bg-[var(--bg)] flex items-center gap-2 text-[#161A1D] transition-colors cursor-pointer"
                   >
                     <FileCsv weight="duotone" className="w-4 h-4 text-emerald-600 shrink-0" />
                     <div className="flex flex-col">
                       <span className="text-[11px] font-semibold text-[#161A1D] flex items-center gap-1">
-                        Curve Points
-                        <span className="text-[9px] font-mono px-1 rounded bg-emerald-50 text-emerald-700">
-                          .csv
-                        </span>
+                        Curve Points <span className="text-[9px] font-mono text-emerald-700">.csv</span>
                       </span>
                       <span className="text-[9px] text-[#5C6670]">Raw (x, y) plot coordinates</span>
                     </div>
@@ -841,45 +1086,85 @@ export const AeroCharts: React.FC<AeroChartsProps> = ({
           </div>
         </div>
 
-        {/* Functional Tabs */}
-        <div className="grid grid-cols-3 gap-1 p-1 rounded-lg bg-[var(--bg)] border border-[var(--border)]">
-          <button
-            onClick={() => setActiveTab('lift')}
-            className={`py-1.5 sm:py-1 text-[11px] font-semibold rounded-md text-center transition-colors cursor-pointer ${
-              activeTab === 'lift'
-                ? 'bg-[#1769AA] text-white'
-                : 'text-[#5C6670] hover:text-[#161A1D]'
-            }`}
-          >
-            Lift (CL-α)
-          </button>
-          <button
-            onClick={() => setActiveTab('dragPolar')}
-            className={`py-1.5 sm:py-1 text-[11px] font-semibold rounded-md text-center transition-colors cursor-pointer ${
-              activeTab === 'dragPolar'
-                ? 'bg-[#1769AA] text-white'
-                : 'text-[#5C6670] hover:text-[#161A1D]'
-            }`}
-          >
-            Drag (CL-CD)
-          </button>
-          <button
-            onClick={() => setActiveTab('pressure')}
-            className={`py-1.5 sm:py-1 text-[11px] font-semibold rounded-md text-center transition-colors cursor-pointer ${
-              activeTab === 'pressure'
-                ? 'bg-[#1769AA] text-white'
-                : 'text-[#5C6670] hover:text-[#161A1D]'
-            }`}
-          >
-            Cp Dist
-          </button>
+        {/* Functional Tabs: Lift (CL-α), Drag (CD-α), Polar (CL-CD), Cp (x/c) */}
+        <div className="grid grid-cols-4 gap-1 p-1 rounded-lg bg-[var(--bg)] border border-[var(--border)]">
+          {(
+            [
+              { id: 'lift', label: 'CL–α' },
+              { id: 'dragAlpha', label: 'CD–α' },
+              { id: 'dragPolar', label: 'CL–CD' },
+              { id: 'pressure', label: 'Cp (x/c)' },
+            ] as const
+          ).map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => setActiveTab(t.id)}
+              className={`py-1.5 sm:py-1 text-[10.5px] font-semibold rounded-md text-center transition-colors cursor-pointer ${
+                activeTab === t.id
+                  ? 'bg-[#1769AA] text-white'
+                  : 'text-[#5C6670] hover:text-[#161A1D]'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
       </div>
 
-      {/* Interactive Apache ECharts Canvas */}
-      <div className="w-full h-[215px] sm:h-[230px] bg-[var(--bg)] rounded-xl border border-[var(--border)] p-1.5 relative overflow-hidden">
-        <div ref={chartContainerRef} className="w-full h-full" />
+      {/* Interactive D3.js SVG Canvas */}
+      <div
+        ref={chartContainerRef}
+        className="w-full h-[215px] sm:h-[230px] bg-[#F7F9FA] rounded-xl border border-[var(--border)] overflow-hidden"
+      >
+        <svg ref={svgRef} className="block w-full h-full select-none" />
       </div>
+
+      {/* Live D3 Crosshair Probe */}
+      <div className="px-2.5 py-1 rounded-lg bg-[var(--bg)] border border-[var(--border)] text-[10px] font-mono tabular-nums text-[#5C6670] flex items-center justify-between gap-2">
+        <span className="truncate">
+          {probeReadout ?? `Hover plot to probe exact ${activeTab === 'pressure' ? 'chord Cp(x/c)' : 'polar curve'} values`}
+        </span>
+        <span className="text-[#1769AA] font-semibold shrink-0">D3 · SVG</span>
+      </div>
+
+      {/* Wind-Tunnel Benchmark Validation Readout */}
+      {benchmarkDeviation && (
+        <div className="p-2.5 rounded-lg bg-[var(--bg)] border border-[var(--border)] flex flex-col gap-1 text-[10px] font-mono tabular-nums">
+          <div className="flex items-center justify-between gap-2 text-emerald-800 font-semibold">
+            <span className="truncate">{benchmarkDeviation.reference}</span>
+            <span className="shrink-0">α = {benchmarkDeviation.aoaClampedDeg.toFixed(1)}°</span>
+          </div>
+          <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[#5C6670]">
+            <div className="flex justify-between">
+              <span>ΔCL (vs 3D Ref):</span>
+              <span className="text-[#161A1D] font-semibold">
+                {benchmarkDeviation.deltaClVs3dFinite >= 0 ? '+' : ''}
+                {benchmarkDeviation.deltaClVs3dFinite.toFixed(3)}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span>ΔCD (vs 3D Ref):</span>
+              <span className="text-[#161A1D] font-semibold">
+                {benchmarkDeviation.deltaCdVs3dFinite >= 0 ? '+' : ''}
+                {benchmarkDeviation.deltaCdVs3dFinite.toFixed(4)}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span>Attached RMSE(CL):</span>
+              <span className="text-[#1769AA] font-semibold">
+                {benchmarkDeviation.rmseClAttached.toFixed(3)}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span>Attached RMSE(CD):</span>
+              <span className="text-[#1769AA] font-semibold">
+                {benchmarkDeviation.rmseCdAttached.toFixed(4)}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

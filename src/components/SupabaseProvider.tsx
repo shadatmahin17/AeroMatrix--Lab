@@ -11,6 +11,7 @@ import {
 import type { User as SupabaseAuthUser } from "@supabase/supabase-js";
 import { supabase } from "../utils/supabase.ts";
 import {
+  emitSync,
   ensureUserProfile,
   getLocalAvatar,
   getLocalBanner,
@@ -216,6 +217,7 @@ export function SupabaseProvider({ children }: { children: ReactNode }) {
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
+      void supabase?.realtime.setAuth(session?.access_token ?? null);
       const mapped = toAppUser(session?.user ?? null);
       setUser(mapped);
       setAuthReady(true);
@@ -224,6 +226,7 @@ export function SupabaseProvider({ children }: { children: ReactNode }) {
       } else {
         void ensureUserProfile().catch(() => {});
       }
+      emitSync("glb_models");
     });
 
     const unsubFoils = subscribePublicAirfoils(
