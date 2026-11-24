@@ -1,10 +1,13 @@
 import { jsPDF } from 'jspdf';
-import aerolabLogoDataUrl from '../assets/aerolab-logo.png?inline';
 import { AeroTelemetry, AircraftModelType, SimulationParams } from '../types/aerodynamics';
 import { AIRCRAFT_MODELS, calculateAeroTelemetry } from './airfoilGenerators';
 import { computeBenchmarkDeviation, BenchmarkDeviationMetrics } from '../data/nacaBenchmarks';
 import { CANONICAL_COORDINATE_SYSTEM } from '../simulation/contracts/ScientificContracts';
 import { computeDeterministicHash, type ValidationStatus } from '../simulation/contracts/SimulationMetadata';
+
+declare const __AEROLAB_LOGO_DATA_URL__: string | undefined;
+const aerolabLogoDataUrl =
+  typeof __AEROLAB_LOGO_DATA_URL__ === 'string' ? __AEROLAB_LOGO_DATA_URL__ : '';
 
 export interface EngineeringReportBundle {
   generatedAt: string;

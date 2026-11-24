@@ -5,7 +5,15 @@ import path from 'path';
 import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
+  const logoPath = path.resolve(__dirname, 'public/aerolab-logo.png');
+  const aerolabLogoDataUrl = fs.existsSync(logoPath)
+    ? `data:image/png;base64,${fs.readFileSync(logoPath).toString('base64')}`
+    : '';
+
   return {
+    define: {
+      __AEROLAB_LOGO_DATA_URL__: JSON.stringify(aerolabLogoDataUrl),
+    },
     plugins: [
       react(),
       tailwindcss(),
