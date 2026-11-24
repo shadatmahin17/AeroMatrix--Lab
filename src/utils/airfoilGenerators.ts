@@ -32,6 +32,8 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     supersonicCapable: true,
     glbPath: '/models/f22_raptor.glb',
     hasGlbModel: true,
+    referenceWeight_N: 294_000,
+    nominalTestPoint: { aoaDeg: 5.0, airspeed_kts: 350, altitude_ft: 9843, flapsDeg: 0 },
   },
   airliner: {
     id: 'airliner',
@@ -52,6 +54,8 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     supersonicCapable: false,
     glbPath: '/models/boeing_787.glb',
     hasGlbModel: true,
+    referenceWeight_N: 2_230_000,
+    nominalTestPoint: { aoaDeg: 2.5, airspeed_kts: 490, altitude_ft: 35000, flapsDeg: 0 },
   },
   naca2412: {
     id: 'naca2412',
@@ -74,6 +78,7 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     supersonicCapable: false,
     glbPath: '/models/airfoil.glb',
     hasGlbModel: true,
+    nominalTestPoint: { aoaDeg: 4.0, airspeed_kts: 150, altitude_ft: 0, flapsDeg: 0 },
   },
   naca0012: {
     id: 'naca0012',
@@ -95,6 +100,27 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     supersonicCapable: false,
     glbPath: '/models/airfoil.glb',
     hasGlbModel: true,
+    nominalTestPoint: { aoaDeg: 0.0, airspeed_kts: 150, altitude_ft: 0, flapsDeg: 0 },
+  },
+  validation_wing: {
+    id: 'validation_wing',
+    name: 'Validation Wing: Rectangular AR 6 (NACA 0012)',
+    category: 'Airfoil',
+    description: 'Unswept rectangular Prandtl lifting-line validation wing (b=9.0 m, c=1.5 m, AR=6.0 exact, e=0.95) at Re=3.0×10⁶, M=0.15.',
+    wingspan: 9.0,
+    chord: 1.5,
+    sweepDeg: 0,
+    oswaldEfficiency: 0.95,
+    thicknessRatio: 0.12,
+    camberRatio: 0.0,
+    stallAngle: 15,
+    cl0: 0.0,
+    alphaZeroLift: 0.0,
+    clMax: 1.45,
+    cd0: 0.007,
+    flapCapable: false,
+    supersonicCapable: false,
+    nominalTestPoint: { aoaDeg: 6.0, airspeed_kts: 99, altitude_ft: 2750, flapsDeg: 0 },
   },
   custom_airfoil: {
     id: 'custom_airfoil',
@@ -114,6 +140,7 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     cd0: 0.008,
     flapCapable: true,
     supersonicCapable: false,
+    nominalTestPoint: { aoaDeg: 4.0, airspeed_kts: 150, altitude_ft: 0, flapsDeg: 0 },
   },
   custom_glb: {
     id: 'custom_glb',
@@ -134,6 +161,7 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     flapCapable: false,
     supersonicCapable: false,
     hasGlbModel: true,
+    nominalTestPoint: { aoaDeg: 4.0, airspeed_kts: 250, altitude_ft: 5000, flapsDeg: 0 },
   },
   concorde: {
     id: 'concorde',
@@ -154,6 +182,8 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     supersonicCapable: true,
     glbPath: '/models/concorde_free_with_interior.glb',
     hasGlbModel: true,
+    referenceWeight_N: 1_815_000,
+    nominalTestPoint: { aoaDeg: 3.0, airspeed_kts: 450, altitude_ft: 25000, flapsDeg: 0 },
   },
   cylinder: {
     id: 'cylinder',
@@ -173,6 +203,7 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     cd0: 1.15,
     flapCapable: false,
     supersonicCapable: false,
+    nominalTestPoint: { aoaDeg: 0.0, airspeed_kts: 140, altitude_ft: 1000, flapsDeg: 0 },
   }
 };
 
@@ -299,10 +330,10 @@ export function getAtmosphere(altitude_ft: number) {
 
 /**
  * Solves for ISA altitude (ft) and airspeed (kts) that match a target wind-tunnel
- * Reynolds number (default 3.0×10^6) and Mach number (default 0.15) for NACA 0012 / 2412.
+ * Reynolds number (default 3.0×10^6) and Mach number (default 0.15) for NACA 0012 / 2412 / AR-6 Validation Wing.
  */
 export function computeBenchmarkMatchConditions(
-  modelType: 'naca0012' | 'naca2412',
+  modelType: 'naca0012' | 'naca2412' | 'validation_wing',
   targetRe = 3_000_000,
   targetMach = 0.15
 ): { altitude_ft: number; airspeed_kts: number; actualRe: number; actualMach: number } {
@@ -330,6 +361,46 @@ export function computeBenchmarkMatchConditions(
     airspeed_kts,
     actualRe: Math.round((isaFinal.density_kg_m3 * vFinal * chord) / isaFinal.dynamicViscosity_Pa_s),
     actualMach: Number((vFinal / isaFinal.speedOfSound_ms).toFixed(3)),
+  };
+}
+
+/**
+ * Returns the nominal flight test point (AoA, Airspeed, Altitude, Flaps) for a given aircraft preset,
+ * preventing stale extreme speeds/altitudes from carrying over across model switches.
+ */
+export function getNominalPresetState(
+  modelType: AircraftModelType,
+  customCalibration?: AeroCalibration | null
+): { angle_of_attack: number; airspeed_kts: number; altitude_ft: number; flaps_deg: number } {
+  if (modelType === 'custom_glb' && customCalibration) {
+    const suggestedKts = Math.max(20, Math.min(1200, Math.round(customCalibration.cruiseSpeedMs * 1.94384)));
+    const suggestedAoa = Math.max(
+      customCalibration.aoaMinDeg,
+      Math.min(customCalibration.aoaMaxDeg, customCalibration.stallAngleDeg > 0 ? Math.min(4, customCalibration.aoaMaxDeg) : 0)
+    );
+    return {
+      angle_of_attack: suggestedAoa,
+      airspeed_kts: suggestedKts,
+      altitude_ft: 5000,
+      flaps_deg: 0,
+    };
+  }
+  if (modelType === 'validation_wing') {
+    const match = computeBenchmarkMatchConditions('validation_wing', 3_000_000, 0.15);
+    return {
+      angle_of_attack: 6.0,
+      airspeed_kts: Math.round(match.airspeed_kts),
+      altitude_ft: match.altitude_ft,
+      flaps_deg: 0,
+    };
+  }
+  const config = AIRCRAFT_MODELS[modelType];
+  const nominal = config.nominalTestPoint ?? { aoaDeg: 4.0, airspeed_kts: 150, altitude_ft: 0, flapsDeg: 0 };
+  return {
+    angle_of_attack: nominal.aoaDeg,
+    airspeed_kts: nominal.airspeed_kts,
+    altitude_ft: nominal.altitude_ft,
+    flaps_deg: config.flapCapable ? (nominal.flapsDeg ?? 0) : 0,
   };
 }
 
@@ -510,6 +581,7 @@ export function getBasePolygon(type: AircraftModelType, flapDeg = 0): Point2D[] 
     case 'naca2412':
       return generateNaca4Digit(0.02, 0.4, 0.12, 60, flapDeg);
     case 'naca0012':
+    case 'validation_wing':
       return generateNaca4Digit(0.0, 0.0, 0.12, 60, flapDeg);
     case 'custom_airfoil':
       if (activeCustomCoords.length >= 6) {
@@ -870,7 +942,28 @@ function solveAeroStateSI(
   const ldRatio = cdTotal > 0.0001 ? cl / cdTotal : 0;
 
   const isPureAirfoil =
-    type === 'naca0012' || type === 'naca2412' || type === 'custom_airfoil';
+    type === 'naca0012' ||
+    type === 'naca2412' ||
+    type === 'validation_wing' ||
+    type === 'custom_airfoil';
+
+  const loadFactor_nz = config.referenceWeight_N
+    ? Number((lift_N / config.referenceWeight_N).toFixed(2))
+    : undefined;
+
+  const outOfRangeMetrics: string[] = [];
+  if (mach > 0.7) outOfRangeMetrics.push(`M = ${mach.toFixed(2)} > 0.70`);
+  if (reynolds < 100_000) outOfRangeMetrics.push(`Re = ${Math.round(reynolds).toLocaleString()} < 1e5`);
+  if (isStalled) outOfRangeMetrics.push('Post-Stall Separated AoA');
+  if (type === 'cylinder') outOfRangeMetrics.push('Bluff-Body Vortex Street');
+  const isModelValid = outOfRangeMetrics.length === 0;
+  const modelValidity = {
+    isValid: isModelValid,
+    reason: isModelValid
+      ? 'Within Subsonic Attached VLM Envelope (M ≤ 0.70, Re ≥ 1×10⁵)'
+      : `Out of Subsonic Attached VLM Envelope (${outOfRangeMetrics.join(' · ')})`,
+    outOfRangeMetrics,
+  };
 
   let flowState: AeroTelemetry['flowState'] = 'Laminar';
   if (mach >= 1.2) {
@@ -949,6 +1042,8 @@ function solveAeroStateSI(
       stallMargin: Number(stallMargin.toFixed(1)),
       flowState,
       solverModel: SOLVER_LABEL_3D,
+      loadFactor_nz,
+      modelValidity,
     },
     cpStations: cpResult.stations,
   };

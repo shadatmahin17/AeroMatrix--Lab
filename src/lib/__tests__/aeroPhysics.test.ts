@@ -15,6 +15,7 @@ import {
   AIRCRAFT_MODELS,
   calculateAeroTelemetry,
   computeBenchmarkMatchConditions,
+  getNominalPresetState,
 } from '../../utils/airfoilGenerators';
 import { generateEngineeringPdfBlob } from '../../utils/engineeringReport';
 import type { SimulationParams } from '../../types/aerodynamics';
@@ -246,5 +247,46 @@ describe('Finite-Wing Lifting-Line, Exact Drag Sum, Presets & Flat-Plate Cf', ()
     expect(blob.size).toBeGreaterThan(1500);
     const header = await blob.slice(0, 5).text();
     expect(header).toBe('%PDF-');
+  });
+
+  it('validates Rectangular Validation Wing (AR = 6), F-22 nominal load factor, and modelValidity guardrails', () => {
+    const valModel = AIRCRAFT_MODELS.validation_wing;
+    expect(valModel.wingspan).toBe(9.0);
+    expect(valModel.chord).toBe(1.5);
+    expect(valModel.oswaldEfficiency).toBe(0.95);
+
+    const valNom = getNominalPresetState('validation_wing');
+    const valTel = calculateAeroTelemetry(
+      'validation_wing',
+      valNom.angle_of_attack,
+      valNom.airspeed_kts,
+      valNom.altitude_ft,
+      valNom.flaps_deg
+    );
+    expect(valTel.aspectRatio).toBeCloseTo(6.0, 4);
+    expect(valTel.cdi).toBeCloseTo((valTel.cl * valTel.cl) / (Math.PI * 0.95 * 6.0), 3);
+    expect(valTel.modelValidity?.isValid).toBe(true);
+
+    const f22Nom = getNominalPresetState('f22');
+    const f22Tel = calculateAeroTelemetry(
+      'f22',
+      f22Nom.angle_of_attack,
+      f22Nom.airspeed_kts,
+      f22Nom.altitude_ft,
+      f22Nom.flaps_deg
+    );
+    expect(f22Tel.loadFactor_nz).toBeDefined();
+    expect(f22Tel.loadFactor_nz!).toBeGreaterThan(0.5);
+    expect(f22Tel.loadFactor_nz!).toBeLessThan(3.0);
+    expect(f22Tel.modelValidity?.isValid).toBe(true);
+
+    // Transonic/Supersonic & stalled regimes trigger out-of-envelope modelValidity
+    const concordeFast = calculateAeroTelemetry('concorde', 3, 1050, 45000, 0);
+    expect(concordeFast.mach).toBeGreaterThan(0.7);
+    expect(concordeFast.modelValidity?.isValid).toBe(false);
+
+    const stalledFoil = calculateAeroTelemetry('naca0012', 20, 150, 0, 0);
+    expect(stalledFoil.isStalled).toBe(true);
+    expect(stalledFoil.modelValidity?.isValid).toBe(false);
   });
 });

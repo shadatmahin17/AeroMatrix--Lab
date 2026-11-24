@@ -655,14 +655,21 @@ function createConcordeGeometry(aoaDeg = 0, airspeedKts = 1050): Aircraft3DMeshD
  * High-definition 3D airfoil with authentic camber curvature, leading-edge
  * radius, and knife trailing edge in vibrant aeronautical sapphire/cyan.
  */
-function createAirfoilWingGeometry(camber = 0.02, thickness = 0.12, flapDeg = 0): Aircraft3DMeshData {
+function createAirfoilWingGeometry(
+  camber = 0.02,
+  thickness = 0.12,
+  flapDeg = 0,
+  spanOverride?: number,
+  chordScaleOverride?: number,
+  nameOverride?: string
+): Aircraft3DMeshData {
   const vertices: Vertex3D[] = [];
   const faces: Face3D[] = [];
 
   const numRibs = 8;
-  const span = 8.6;
+  const span = spanOverride ?? 8.6;
   const numPts = 24;
-  const SCALE = 5.8;
+  const SCALE = chordScaleOverride ?? 5.8;
   const P = 0.4; // location of max camber
   const HINGE = 0.7; // flap hinge, fraction of chord (matches the 2D profile)
 
@@ -751,7 +758,11 @@ function createAirfoilWingGeometry(camber = 0.02, thickness = 0.12, flapDeg = 0)
   orientOutward(vertices, rightCap, { x: 0, y: 0, z: 0 });
   faces.push(leftCap, rightCap);
 
-  return orientLiftingSurfaces({ vertices, faces, name: camber > 0 ? 'NACA 2412 Airfoil Wing' : 'NACA 0012 Symmetric Wing' });
+  return orientLiftingSurfaces({
+    vertices,
+    faces,
+    name: nameOverride ?? (camber > 0 ? 'NACA 2412 Airfoil Wing' : 'NACA 0012 Symmetric Wing'),
+  });
 }
 
 /**
@@ -930,6 +941,16 @@ export function getAircraft3DModel(
       return createAirfoilWingGeometry(0.02, 0.12, flapDeg);
     case 'naca0012':
       return createAirfoilWingGeometry(0.0, 0.12, flapDeg);
+    case 'validation_wing':
+      // Exact AR = 6.0 rectangular finite wing scaled cleanly to canonical tunnel span = 10.0, chord = 10.0 / 6.0
+      return createAirfoilWingGeometry(
+        0.0,
+        0.12,
+        0,
+        10.0,
+        10.0 / 6.0,
+        'Validation Wing: Rectangular AR 6 (NACA 0012)'
+      );
     case 'custom_airfoil':
       return createCustomAirfoilWingGeometry(
         getCustom3DAirfoilCoords(),

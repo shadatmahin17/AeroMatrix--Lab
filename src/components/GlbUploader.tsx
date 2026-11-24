@@ -28,6 +28,7 @@ import {
   ArrowsLeftRight,
   ArrowsClockwise,
   ArrowCounterClockwise,
+  ArrowClockwise,
   Cube,
   SpinnerGap,
   CloudCheck,
@@ -35,9 +36,18 @@ import {
   Trash,
   Globe,
 } from '@phosphor-icons/react';
+import {
+  normalizeAircraftGroupToTunnel,
+  optimizeUploadedThreeGroup,
+  type OptimizedGroupStats,
+} from '../utils/aircraftGlbModels';
+import { validateThreeObject } from '../geometry/validation/meshValidator';
+import type { GeometryTransformMetadata, MeshValidationReport } from '../geometry/contracts/GeometryMetadata';
+import { CANONICAL_COORDINATE_SYSTEM } from '../simulation/contracts/ScientificContracts';
+import { computeDeterministicHash } from '../simulation/contracts/SimulationMetadata';
 
 export const MAX_GLB_FILE_BYTES = 50 * 1024 * 1024; // 50 MB
-export const TUNNEL_CUSTOM_GLB_BASE_SCALE = 12.0;
+export const TUNNEL_CUSTOM_GLB_BASE_SCALE = 10.0;
 
 export type GlbUploadPhase =
   | 'idle'
@@ -72,6 +82,9 @@ export interface CustomGlbAsset {
   bounds: BoundingBoxDims; // Normalized unit bounds in original axes
   calibration: AeroCalibration;
   pca?: MeshPcaAnalysis;
+  meshStats?: OptimizedGroupStats;
+  meshValidation?: MeshValidationReport;
+  geometryMetadata?: GeometryTransformMetadata;
   fallbackUsed: boolean;
   fallbackReason?: string;
 }
@@ -80,7 +93,10 @@ interface GlbUploaderProps {
   activeAsset: CustomGlbAsset | null;
   isCustomActive: boolean;
   flipNose: boolean;
+  yawDeg?: number;
+  localAssets?: CustomGlbAsset[];
   onAssetReady: (asset: CustomGlbAsset) => void;
+  onSelectLocalAsset?: (asset: CustomGlbAsset) => void;
   onCloudAssetLinked?: (fileName: string, doc: SharedGlbModelDoc) => void;
   onCalibrationUpdated: (
     calibration: AeroCalibration,
@@ -89,16 +105,19 @@ interface GlbUploaderProps {
     pca?: MeshPcaAnalysis
   ) => void;
   onFlipNose: () => void;
+  onRotateYaw90?: () => void;
   onResetDefault: () => void;
 }
 
 /**
  * Clones the unit-normalized GLB scene, rotates it so upAxis -> +Y and noseAxis -> -X
- * (or +X when flipNose is true), and scales it cleanly into the 3D wind tunnel chamber.
+ * (plus optional 180-deg flipNose and 90-deg incremental yawDeg), and uniformly normalizes
+ * the wrapper to canonical wind-tunnel space (maxDim = 10.0, aerodynamic center at origin).
  */
 export function buildOrientedCustomGlbRoot(
   asset: CustomGlbAsset,
-  flipNose: boolean
+  flipNose: boolean,
+  yawDeg = 0
 ): { root: THREE.Group; orientedBounds: BoundingBoxDims } {
   const wrapper = new THREE.Group();
   wrapper.name = 'Custom_GLB_Wrapper';
@@ -109,8 +128,6 @@ export function buildOrientedCustomGlbRoot(
   clonedUnit.traverse((child) => {
     if ((child as THREE.Mesh).isMesh) {
       const mesh = child as THREE.Mesh;
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
       if (Array.isArray(mesh.material)) {
         mesh.material = mesh.material.map((m) => m.clone());
       } else if (mesh.material) {
@@ -130,23 +147,21 @@ export function buildOrientedCustomGlbRoot(
   const rotMatrix = new THREE.Matrix4().fromArray(matArray);
   orientedUnit.quaternion.setFromRotationMatrix(rotMatrix);
   orientedUnit.add(clonedUnit);
-  orientedUnit.updateMatrixWorld(true);
 
-  const orientedBox = new THREE.Box3().setFromObject(orientedUnit);
-  const orientedSize = new THREE.Vector3();
-  orientedBox.getSize(orientedSize);
+  const yawGroup = new THREE.Group();
+  yawGroup.name = 'Custom_GLB_Yaw_Group';
+  yawGroup.rotation.y = (yawDeg * Math.PI) / 180;
+  yawGroup.add(orientedUnit);
 
-  const scale = TUNNEL_CUSTOM_GLB_BASE_SCALE * asset.calibration.scaleHint;
-  orientedUnit.scale.set(scale, scale, scale);
-  wrapper.add(orientedUnit);
-  wrapper.updateMatrixWorld(true);
+  wrapper.add(yawGroup);
+  const normalized = normalizeAircraftGroupToTunnel(wrapper, TUNNEL_CUSTOM_GLB_BASE_SCALE, 0.35);
 
   return {
     root: wrapper,
     orientedBounds: {
-      x: Number((orientedSize.x || 1).toFixed(3)),
-      y: Number((orientedSize.y || 0.3).toFixed(3)),
-      z: Number((orientedSize.z || 0.6).toFixed(3)),
+      x: Number((normalized.size.x || 1).toFixed(3)),
+      y: Number((normalized.size.y || 0.3).toFixed(3)),
+      z: Number((normalized.size.z || 0.6).toFixed(3)),
     },
   };
 }
@@ -154,6 +169,7 @@ export function buildOrientedCustomGlbRoot(
 export async function parseGlbBuffer(buffer: ArrayBuffer): Promise<{
   unitGroup: THREE.Group;
   bounds: BoundingBoxDims;
+  meshStats: OptimizedGroupStats;
 }> {
   if (buffer.byteLength < 12) {
     throw new Error('File is too small to be a valid .glb model.');
@@ -175,14 +191,14 @@ export async function parseGlbBuffer(buffer: ArrayBuffer): Promise<{
   const rawScene = gltf.scene;
   rawScene.updateMatrixWorld(true);
 
-  let meshCount = 0;
+  const meshStats = optimizeUploadedThreeGroup(rawScene);
+  if (meshStats.meshCount === 0) {
+    throw new Error('No 3D mesh geometry found inside this .glb file.');
+  }
+
   rawScene.traverse((child) => {
     if ((child as THREE.Mesh).isMesh) {
-      meshCount++;
       const mesh = child as THREE.Mesh;
-      if (mesh.geometry && !mesh.geometry.attributes.normal) {
-        mesh.geometry.computeVertexNormals();
-      }
       if (!mesh.material) {
         mesh.material = new THREE.MeshStandardMaterial({
           color: 0x94a3b8,
@@ -192,10 +208,6 @@ export async function parseGlbBuffer(buffer: ArrayBuffer): Promise<{
       }
     }
   });
-
-  if (meshCount === 0) {
-    throw new Error('No 3D mesh geometry found inside this .glb file.');
-  }
 
   const box = new THREE.Box3().setFromObject(rawScene);
   const size = new THREE.Vector3();
@@ -227,12 +239,13 @@ export async function parseGlbBuffer(buffer: ArrayBuffer): Promise<{
     z: Number((size.z * normScale).toFixed(4)),
   };
 
-  return { unitGroup, bounds: normBounds };
+  return { unitGroup, bounds: normBounds, meshStats };
 }
 
 async function parseAndNormalizeGlb(file: File): Promise<{
   unitGroup: THREE.Group;
   bounds: BoundingBoxDims;
+  meshStats: OptimizedGroupStats;
 }> {
   const buffer = await file.arrayBuffer();
   return parseGlbBuffer(buffer);
@@ -240,13 +253,41 @@ async function parseAndNormalizeGlb(file: File): Promise<{
 
 export async function buildCustomGlbAssetFromDoc(doc: SharedGlbModelDoc): Promise<CustomGlbAsset> {
   const buffer = await downloadSharedGlbBuffer(doc);
-  const { unitGroup, bounds } = await parseGlbBuffer(buffer);
+  const { unitGroup, bounds, meshStats } = await parseGlbBuffer(buffer);
   const rawPca = computeMeshPca(unitGroup);
   const calibration = sanitizeCalibration(doc.calibration);
   const pca: MeshPcaAnalysis = {
     ...rawPca,
     corrected180: false,
     note: `PCA + symmetry aligned nose ${calibration.noseAxis}, up ${calibration.upAxis} (elongation ${rawPca.elongationRatio.toFixed(1)}x)`,
+  };
+  const meshValidation = validateThreeObject(unitGroup);
+  const resolvedBounds = doc.bounds || bounds;
+  const maxB = Math.max(resolvedBounds.x, resolvedBounds.y, resolvedBounds.z, 1e-4);
+  const scaleApplied = CANONICAL_COORDINATE_SYSTEM.tunnelReferenceMaxDim / maxB;
+  const geometryMetadata: GeometryTransformMetadata = {
+    fileName: doc.filename,
+    geometryHash: computeDeterministicHash({
+      fileName: doc.filename,
+      bounds: resolvedBounds,
+      tris: meshValidation.triangleCount,
+      noseAxis: calibration.noseAxis,
+      upAxis: calibration.upAxis,
+    }),
+    originalBounds: resolvedBounds,
+    normalizedBounds: {
+      x: Number((resolvedBounds.x * scaleApplied).toFixed(4)),
+      y: Number((resolvedBounds.y * scaleApplied).toFixed(4)),
+      z: Number((resolvedBounds.z * scaleApplied).toFixed(4)),
+    },
+    scaleApplied,
+    aerodynamicCenterOffset: [0, 0, 0],
+    coordinateSystem: CANONICAL_COORDINATE_SYSTEM,
+    estimatedNoseAxis: rawPca.pcaNoseAxis,
+    estimatedUpAxis: calibration.upAxis,
+    pcaConfidence: rawPca.asymmetryConfidence,
+    manualCorrectionApplied: false,
+    validation: meshValidation,
   };
   return {
     cloudId: doc.id,
@@ -256,9 +297,12 @@ export async function buildCustomGlbAssetFromDoc(doc: SharedGlbModelDoc): Promis
     fileName: doc.filename,
     fileSizeBytes: doc.fileSizeBytes || buffer.byteLength,
     unitGroup,
-    bounds: doc.bounds || bounds,
+    bounds: resolvedBounds,
     calibration,
     pca,
+    meshStats,
+    meshValidation,
+    geometryMetadata,
     fallbackUsed: false,
   };
 }
@@ -834,10 +878,14 @@ export const GlbUploader: React.FC<GlbUploaderProps> = ({
   activeAsset,
   isCustomActive,
   flipNose,
+  yawDeg = 0,
+  localAssets = [],
   onAssetReady,
+  onSelectLocalAsset,
   onCloudAssetLinked,
   onCalibrationUpdated,
   onFlipNose,
+  onRotateYaw90,
   onResetDefault,
 }) => {
   const { user, sharedAirfoils, sharedGlbModels, glbCloudError, isSupabaseReady } = useSupabase();
@@ -851,6 +899,8 @@ export const GlbUploader: React.FC<GlbUploaderProps> = ({
   const [cloudSaveError, setCloudSaveError] = useState<string | null>(null);
   const [loadingDocId, setLoadingDocId] = useState<string | null>(null);
   const [deletingDocId, setDeletingDocId] = useState<string | null>(null);
+  const [isDragActive, setIsDragActive] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<string | null>(null);
 
   const isBusy = phase === 'loading' || phase === 'analyzing' || loadingDocId !== null;
 
@@ -865,79 +915,142 @@ export const GlbUploader: React.FC<GlbUploaderProps> = ({
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
+  const handleProcessFiles = async (fileList: FileList | File[]) => {
+    const files = Array.from(fileList);
+    if (files.length === 0) return;
 
     setErrorText(null);
     setCloudSaveError(null);
 
-    if (!file.name.toLowerCase().endsWith('.glb')) {
+    const validFiles = files.filter((f) => f.name.toLowerCase().endsWith('.glb'));
+    if (validFiles.length === 0) {
       setPhase('error');
       setErrorText('Only binary .glb files are supported.');
       return;
     }
 
-    if (file.size > MAX_GLB_FILE_BYTES) {
-      setPhase('error');
-      setErrorText('File exceeds the 50 MB size limit.');
-      return;
+    let loadedCount = 0;
+    for (let idx = 0; idx < validFiles.length; idx++) {
+      const file = validFiles[idx];
+      if (validFiles.length > 1) {
+        setBatchProgress(`Optimizing ${idx + 1}/${validFiles.length}: ${file.name}`);
+      }
+
+      if (file.size > MAX_GLB_FILE_BYTES) {
+        setPhase('error');
+        setErrorText(`"${file.name}" exceeds the 50 MB size limit.`);
+        continue;
+      }
+
+      try {
+        setPhase('loading');
+        const { unitGroup, bounds, meshStats } = await parseAndNormalizeGlb(file);
+
+        setPhase('analyzing');
+        const meshValidation = validateThreeObject(unitGroup);
+        const rawPca = computeMeshPca(unitGroup);
+        const { calibration, pca } = calibrateFromMeshGeometry(unitGroup, bounds, file.name, rawPca);
+        const maxB = Math.max(bounds.x, bounds.y, bounds.z, 1e-4);
+        const scaleApplied = CANONICAL_COORDINATE_SYSTEM.tunnelReferenceMaxDim / maxB;
+        const geometryMetadata: GeometryTransformMetadata = {
+          fileName: file.name,
+          geometryHash: computeDeterministicHash({
+            fileName: file.name,
+            bounds,
+            tris: meshValidation.triangleCount,
+            noseAxis: calibration.noseAxis,
+            upAxis: calibration.upAxis,
+          }),
+          originalBounds: bounds,
+          normalizedBounds: {
+            x: Number((bounds.x * scaleApplied).toFixed(4)),
+            y: Number((bounds.y * scaleApplied).toFixed(4)),
+            z: Number((bounds.z * scaleApplied).toFixed(4)),
+          },
+          scaleApplied,
+          aerodynamicCenterOffset: [0, 0, 0],
+          coordinateSystem: CANONICAL_COORDINATE_SYSTEM,
+          estimatedNoseAxis: pca.pcaNoseAxis,
+          estimatedUpAxis: calibration.upAxis,
+          pcaConfidence: pca.asymmetryConfidence,
+          manualCorrectionApplied: false,
+          validation: meshValidation,
+        };
+
+        const asset: CustomGlbAsset = {
+          fileName: file.name,
+          fileSizeBytes: file.size,
+          unitGroup,
+          bounds,
+          calibration,
+          pca,
+          meshStats,
+          meshValidation,
+          geometryMetadata,
+          fallbackUsed: false,
+        };
+
+        setPhase('ready');
+        onAssetReady(asset);
+        loadedCount++;
+
+        if (isSupabaseReady) {
+          setSavingCloud(true);
+          try {
+            const baseName = file.name.replace(/\.glb$/i, '') || 'Custom 3D Model';
+            const savedDoc = await uploadSharedGlbModel({
+              file,
+              name: baseName,
+              filename: file.name,
+              fileSizeBytes: file.size,
+              calibration,
+              bounds,
+              uploaderName: user?.displayName || 'Community',
+            });
+            onCloudAssetLinked?.(file.name, savedDoc);
+            if (user && !user.uid.startsWith('local:')) {
+              const myFoilCount = sharedAirfoils.filter((a) => a.uploaderUid === user.uid).length;
+              const myGlbCount = sharedGlbModels.filter((m) => m.uploaderUid === user.uid).length + 1;
+              void ensureUserProfile({ totalUploads: myFoilCount + myGlbCount }).catch(() => {});
+            }
+            if (validFiles.length === 1) {
+              notify(`Saved 3D model "${file.name}".`);
+            }
+          } catch (saveErr) {
+            const msg = saveErr instanceof Error ? saveErr.message : 'Could not save 3D model.';
+            setCloudSaveError(msg);
+            notify(`Loaded "${file.name}" locally; cloud save failed.`, 'error');
+          } finally {
+            setSavingCloud(false);
+          }
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : `Failed to load ${file.name}.`;
+        setPhase('error');
+        setErrorText(msg);
+      }
     }
 
-    try {
-      setPhase('loading');
-      const { unitGroup, bounds } = await parseAndNormalizeGlb(file);
+    setBatchProgress(null);
+    if (validFiles.length > 1 && loadedCount > 0) {
+      notify(`Loaded and optimized ${loadedCount} 3D model${loadedCount > 1 ? 's' : ''}.`);
+    }
+  };
 
-      setPhase('analyzing');
-      const rawPca = computeMeshPca(unitGroup);
-      const { calibration, pca } = calibrateFromMeshGeometry(unitGroup, bounds, file.name, rawPca);
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files ? Array.from(e.target.files) : [];
+    e.target.value = '';
+    if (files.length === 0) return;
+    await handleProcessFiles(files);
+  };
 
-      const asset: CustomGlbAsset = {
-        fileName: file.name,
-        fileSizeBytes: file.size,
-        unitGroup,
-        bounds,
-        calibration,
-        pca,
-        fallbackUsed: false,
-      };
-
-      setPhase('ready');
-      onAssetReady(asset);
-
-      if (isSupabaseReady) {
-        setSavingCloud(true);
-        try {
-          const baseName = file.name.replace(/\.glb$/i, '') || 'Custom 3D Model';
-          const savedDoc = await uploadSharedGlbModel({
-            file,
-            name: baseName,
-            filename: file.name,
-            fileSizeBytes: file.size,
-            calibration,
-            bounds,
-            uploaderName: user?.displayName || 'Community',
-          });
-          onCloudAssetLinked?.(file.name, savedDoc);
-          if (user && !user.uid.startsWith('local:')) {
-            const myFoilCount = sharedAirfoils.filter((a) => a.uploaderUid === user.uid).length;
-            const myGlbCount = sharedGlbModels.filter((m) => m.uploaderUid === user.uid).length + 1;
-            void ensureUserProfile({ totalUploads: myFoilCount + myGlbCount }).catch(() => {});
-          }
-          notify(`Saved 3D model "${file.name}".`);
-        } catch (saveErr) {
-          const msg = saveErr instanceof Error ? saveErr.message : 'Could not save 3D model.';
-          setCloudSaveError(msg);
-          notify(`Loaded "${file.name}" locally; cloud save failed.`, 'error');
-        } finally {
-          setSavingCloud(false);
-        }
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to load .glb model.';
-      setPhase('error');
-      setErrorText(msg);
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragActive(false);
+    if (isBusy) return;
+    if (e.dataTransfer?.files?.length) {
+      void handleProcessFiles(e.dataTransfer.files);
     }
   };
 
@@ -1008,14 +1121,15 @@ export const GlbUploader: React.FC<GlbUploaderProps> = ({
   };
 
   const statusText = (() => {
-    if (phase === 'loading') return loadingDocId ? 'Downloading model…' : 'Loading model';
-    if (phase === 'analyzing') return 'Calibrating geometry';
+    if (batchProgress) return batchProgress;
+    if (phase === 'loading') return loadingDocId ? 'Downloading model…' : 'Optimizing & loading mesh…';
+    if (phase === 'analyzing') return 'Calibrating geometry…';
     if (phase === 'error') return errorText || 'Upload failed';
     if (savingCloud) return 'Saving model…';
     if (activeAsset && isCustomActive) {
-      return `Ready (${activeAsset.calibration.modelClass})`;
+      return `Ready (${formatModelClassLabel(activeAsset.calibration.modelClass)})`;
     }
-    return 'Upload any .glb mesh (max 50 MB)';
+    return 'Drop 1+ .glb files or browse (max 50 MB each)';
   })();
 
   const formatBytes = (bytes: number) => {
@@ -1023,15 +1137,37 @@ export const GlbUploader: React.FC<GlbUploaderProps> = ({
     return `${Math.max(1, Math.round(bytes / 1024))} KB`;
   };
 
+  const formatTris = (tris: number) => {
+    if (tris >= 1_000_000) return `${(tris / 1_000_000).toFixed(1)}M`;
+    if (tris >= 1_000) return `${(tris / 1_000).toFixed(1)}k`;
+    return `${tris}`;
+  };
+
   return (
-    <div className="p-3 rounded-xl bg-[var(--bg)] border border-[var(--border)] flex flex-col gap-2.5">
+    <div
+      onDragOver={(e) => {
+        e.preventDefault();
+        if (!isBusy) setIsDragActive(true);
+      }}
+      onDragLeave={(e) => {
+        e.preventDefault();
+        setIsDragActive(false);
+      }}
+      onDrop={handleDrop}
+      className={`p-3 rounded-xl border transition-colors flex flex-col gap-2.5 ${
+        isDragActive
+          ? 'bg-[#1769AA]/10 border-[#1769AA] ring-2 ring-[#1769AA]/25'
+          : 'bg-[var(--bg)] border-[var(--border)]'
+      }`}
+    >
       <input
         ref={inputRef}
         type="file"
         accept=".glb"
+        multiple
         onChange={handleFileChange}
         className="hidden"
-        aria-label="Upload custom .glb 3D model"
+        aria-label="Upload custom .glb 3D models"
       />
 
       <div className="flex items-center justify-between gap-2">
@@ -1041,7 +1177,7 @@ export const GlbUploader: React.FC<GlbUploaderProps> = ({
           </div>
           <div className="min-w-0">
             <div className="text-[11px] font-bold text-[#161A1D] truncate">
-              Custom 3D Model (.glb)
+              Custom 3D Models (.glb)
             </div>
             <div
               className={`text-[10px] font-mono truncate flex items-center gap-1 ${
@@ -1089,9 +1225,26 @@ export const GlbUploader: React.FC<GlbUploaderProps> = ({
               </span>
             </span>
             <span className="shrink-0">
-              Nose {flipNose ? 'Flipped' : activeAsset.calibration.noseAxis} · Up {activeAsset.calibration.upAxis}
+              Nose {flipNose ? 'Flipped' : activeAsset.calibration.noseAxis}
+              {yawDeg ? ` (+${yawDeg}°)` : ''} · Up {activeAsset.calibration.upAxis}
             </span>
           </div>
+
+          {activeAsset.meshStats && (
+            <div className="flex flex-wrap items-center gap-1.5 text-[9.5px] font-mono tabular-nums text-[#5C6670]">
+              <span className="px-1.5 py-0.5 rounded bg-[var(--surface)] border border-[var(--border)]">
+                {activeAsset.meshStats.meshCount} meshes
+              </span>
+              <span className="px-1.5 py-0.5 rounded bg-[var(--surface)] border border-[var(--border)]">
+                {formatTris(activeAsset.meshStats.triangleCount)} tris
+              </span>
+              {activeAsset.meshStats.optimizedTextures > 0 && (
+                <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
+                  {activeAsset.meshStats.optimizedTextures} tex optimized
+                </span>
+              )}
+            </div>
+          )}
 
           {activeAsset.pca && (
             <p className="text-[10px] text-[#5C6670] font-mono leading-snug">
@@ -1099,12 +1252,18 @@ export const GlbUploader: React.FC<GlbUploaderProps> = ({
             </p>
           )}
 
-          <div className="grid grid-cols-2 gap-1.5">
+          {activeAsset.meshValidation && activeAsset.meshValidation.warnings.length > 0 && (
+            <div className="px-2 py-1.5 rounded-lg bg-amber-50 border border-amber-200 text-[9.5px] font-mono text-amber-900 leading-snug">
+              {activeAsset.meshValidation.warnings[0]}
+            </div>
+          )}
+
+          <div className="grid grid-cols-3 gap-1.5">
             <button
               type="button"
               disabled={isBusy}
               onClick={onFlipNose}
-              className={`py-1.5 px-2 rounded-lg text-[10.5px] font-semibold border transition-colors flex items-center justify-center gap-1 cursor-pointer ${
+              className={`py-1.5 px-1.5 rounded-lg text-[10px] font-semibold border transition-colors flex items-center justify-center gap-1 cursor-pointer ${
                 flipNose
                   ? 'bg-[var(--accent-light)] text-[#1769AA] border-[#1769AA]/45'
                   : 'bg-[var(--surface)] text-[#161A1D] border-[var(--border)] hover:border-[#1769AA]'
@@ -1112,18 +1271,35 @@ export const GlbUploader: React.FC<GlbUploaderProps> = ({
               title="Rotate 180 degrees around vertical axis if nose points backwards"
             >
               <ArrowsLeftRight weight="bold" className="w-3.5 h-3.5 shrink-0" />
-              <span className="truncate">Flip nose</span>
+              <span className="truncate">Flip 180°</span>
             </button>
+
+            {onRotateYaw90 && (
+              <button
+                type="button"
+                disabled={isBusy}
+                onClick={onRotateYaw90}
+                className={`py-1.5 px-1.5 rounded-lg text-[10px] font-semibold border transition-colors flex items-center justify-center gap-1 cursor-pointer ${
+                  yawDeg % 360 !== 0
+                    ? 'bg-[var(--accent-light)] text-[#1769AA] border-[#1769AA]/45'
+                    : 'bg-[var(--surface)] text-[#161A1D] border-[var(--border)] hover:border-[#1769AA]'
+                }`}
+                title="Rotate 90 degrees clockwise around vertical axis to align model into freestream"
+              >
+                <ArrowClockwise weight="bold" className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">Yaw +90°</span>
+              </button>
+            )}
 
             <button
               type="button"
               disabled={isBusy}
               onClick={handleReanalyze}
-              className="py-1.5 px-2 rounded-lg text-[10.5px] font-semibold bg-[var(--surface)] text-[#161A1D] border border-[var(--border)] hover:border-[#1769AA] disabled:opacity-60 transition-colors flex items-center justify-center gap-1 cursor-pointer"
+              className="py-1.5 px-1.5 rounded-lg text-[10px] font-semibold bg-[var(--surface)] text-[#161A1D] border border-[var(--border)] hover:border-[#1769AA] disabled:opacity-60 transition-colors flex items-center justify-center gap-1 cursor-pointer"
               title="Re-run local 3D PCA and geometric aerodynamic calibration"
             >
               <ArrowsClockwise weight="bold" className={`w-3.5 h-3.5 shrink-0 ${phase === 'analyzing' ? 'animate-spin' : ''}`} />
-              <span className="truncate">Re-analyze</span>
+              <span className="truncate">Re-fit</span>
             </button>
           </div>
           <button
@@ -1135,6 +1311,49 @@ export const GlbUploader: React.FC<GlbUploaderProps> = ({
             <ArrowCounterClockwise weight="bold" className="w-3.5 h-3.5 shrink-0" />
             <span>Reset to default aircraft</span>
           </button>
+        </div>
+      )}
+
+      {localAssets.length > 1 && onSelectLocalAsset && (
+        <div className="flex flex-col gap-1.5 pt-2 border-t border-[var(--border)]">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[10.5px] font-bold text-[#161A1D]">
+              Session Uploads ({localAssets.length})
+            </span>
+            <span className="text-[9.5px] font-mono text-[#5C6670]">Instant switch</span>
+          </div>
+          <div className="max-h-32 overflow-y-auto custom-scrollbar rounded-lg border border-[var(--border)] bg-[var(--surface)] divide-y divide-[var(--border)]">
+            {localAssets.map((item) => {
+              const isSelected = Boolean(
+                isCustomActive &&
+                  activeAsset?.fileName === item.fileName &&
+                  activeAsset?.fileSizeBytes === item.fileSizeBytes
+              );
+              return (
+                <button
+                  key={`${item.fileName}-${item.fileSizeBytes}`}
+                  type="button"
+                  onClick={() => onSelectLocalAsset(item)}
+                  className={`w-full px-2.5 py-1.5 text-left flex items-center justify-between gap-2 transition-colors cursor-pointer ${
+                    isSelected ? 'bg-[var(--accent-light)]' : 'hover:bg-[var(--bg)]'
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-bold text-[#161A1D] truncate">
+                      {item.fileName}
+                    </div>
+                    <div className="text-[9.5px] font-mono tabular-nums text-[#5C6670] truncate">
+                      {formatModelClassLabel(item.calibration.modelClass)} · {formatBytes(item.fileSizeBytes)}
+                      {item.meshStats ? ` · ${formatTris(item.meshStats.triangleCount)} tris` : ''}
+                    </div>
+                  </div>
+                  {isSelected && (
+                    <span className="text-[9px] font-mono font-bold text-[#1769AA] shrink-0">ACTIVE</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
         </div>
       )}
 

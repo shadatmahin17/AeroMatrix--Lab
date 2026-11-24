@@ -109,25 +109,31 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
   useEffect(() => {
     const num = 850;
     const vibrantColors = ['#38bdf8', '#0ea5e9', '#34d399', '#60a5fa', '#a7f3d0', '#fbbf24'];
+    const frame = FluidDynamics3D.getDynamicEmitterFrame(
+      surfaceField,
+      params.rake_spread ?? 1.0,
+      params.streamline_resolution ?? 1.0
+    );
     const halfSpan = surfaceField?.halfSpan ?? 5.5;
+    const spread = params.rake_spread ?? 1.0;
     const pArr: Particle3D[] = [];
     for (let i = 0; i < num; i++) {
       const roll = Math.random();
-      let y = 0;
+      let y = frame.yMid;
       let z = 0;
-      if (roll < 0.45) {
-        y = -0.85 + Math.random() * 2.1;
-        z = -halfSpan * 0.95 + Math.random() * (halfSpan * 1.9);
-      } else if (roll < 0.78) {
+      if (roll < 0.70) {
+        y = frame.yMid + (Math.random() - 0.5) * Math.max(0.9, frame.modelHeight * 1.1 * spread);
+        z = (Math.random() - 0.5) * 2 * Math.max(1.2, halfSpan * 0.92 * spread);
+      } else if (roll < 0.90) {
         const tipSign = Math.random() > 0.5 ? 1 : -1;
-        z = tipSign * (halfSpan * 0.94 + (Math.random() - 0.5) * 1.1);
-        y = -0.35 + Math.random() * 1.0;
+        z = tipSign * (halfSpan * 0.94 + (Math.random() - 0.5) * 0.9);
+        y = frame.yMid + (Math.random() - 0.5) * Math.max(0.85, frame.modelHeight * 0.65);
       } else {
-        y = -3.4 + Math.random() * 6.8;
-        z = -8.0 + Math.random() * 16.0;
+        y = frame.yMid + (Math.random() - 0.5) * 2 * frame.yHalf;
+        z = (Math.random() - 0.5) * 2 * frame.zHalf;
       }
       pArr.push({
-        x: -20 + Math.random() * 40,
+        x: frame.xSpawn + Math.random() * Math.max(8, frame.xRecycle - frame.xSpawn),
         y,
         z,
         vx: 0.35 + Math.random() * 0.22,
@@ -139,7 +145,7 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
       });
     }
     particlesRef.current = pArr;
-  }, [surfaceField]);
+  }, [surfaceField, params.rake_spread, params.flowDomainVersion]);
 
   // Sync Audio with simulation speed & stall
   useEffect(() => {
@@ -307,7 +313,10 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
       }
     }
 
-    // 4. Update and Render Dynamic 3D Flow Particles (RK2 Vortex + Vertex Flow PIV Streaks)
+    // 4. Update and Render Dynamic 3D Flow Particles (Adaptive RK2 Vortex + Vertex Flow PIV Streaks)
+    const rakeSpread = params.rake_spread ?? 1.0;
+    const streamlineRes = params.streamline_resolution ?? 1.0;
+    const emitterFrame = FluidDynamics3D.getDynamicEmitterFrame(surfaceField, rakeSpread, streamlineRes);
     const fluid3DParams: Fluid3DParams = {
       modelType: params.modelType,
       aoaDeg: params.angle_of_attack,
@@ -320,6 +329,7 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
       cl: telemetry.cl,
       cd: telemetry.cd,
       timeSec: now * 0.001,
+      streamlineResolution: streamlineRes,
       surfaceField,
       calibration: params.modelType === 'custom_glb' ? customGlbCalibration : null,
     };
@@ -329,6 +339,20 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
       const activeCount = Math.min(pList.length, Math.max(200, Math.round(pList.length * Math.min(1, params.smoke_density * 0.85))));
       const dtStep = 0.28;
       const halfSpan = surfaceField?.halfSpan ?? 5.5;
+      const outPos = { x: 0, y: 0, z: 0 };
+      const outVel = {
+        u: 0,
+        v: 0,
+        w: 0,
+        speed: 0,
+        cpIncompressible: 0,
+        pressureCoeff: 0,
+        pressureCoeffClamped: 0,
+        vorticity: 0,
+        isSeparated: false,
+      };
+      const yLim = Math.max(8, emitterFrame.yHalf * 4.2);
+      const zLim = Math.max(13, emitterFrame.zHalf * 1.8);
 
       for (let i = 0; i < activeCount; i++) {
         const p = pList[i];
@@ -336,53 +360,47 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
         const v1 = FluidDynamics3D.getVelocity(p, fluid3DParams);
 
         if (!isPaused) {
-          // RK2 midpoint advection constrained outside solid mesh
-          const mid = FluidDynamics3D.constrainToExterior(
-            {
-              x: p.x + v1.u * dtStep * 0.5,
-              y: p.y + v1.v * dtStep * 0.5,
-              z: p.z + v1.w * dtStep * 0.5,
-            },
+          FluidDynamics3D.stepParticleRK2(
+            p.x,
+            p.y,
+            p.z,
             fluid3DParams,
-            0.09
+            dtStep,
+            emitterFrame.dsMax,
+            outPos,
+            outVel
           );
-          const v2 = FluidDynamics3D.getVelocity(mid, fluid3DParams);
-          p.vx = v2.u;
-          p.vy = v2.v;
-          p.vz = v2.w;
-
-          const nextPos = FluidDynamics3D.constrainToExterior(
-            {
-              x: p.x + p.vx * dtStep,
-              y: p.y + p.vy * dtStep,
-              z: p.z + p.vz * dtStep,
-            },
-            fluid3DParams,
-            0.09
-          );
-          p.x = nextPos.x;
-          p.y = nextPos.y;
-          p.z = nextPos.z;
+          p.x = outPos.x;
+          p.y = outPos.y;
+          p.z = outPos.z;
+          p.vx = outVel.u;
+          p.vy = outVel.v;
+          p.vz = outVel.w;
           p.age += 1;
 
-          if (p.x > 20 || Math.abs(p.y) > 8 || Math.abs(p.z) > 13 || p.age > p.maxAge) {
+          if (
+            p.x > emitterFrame.xRecycle ||
+            Math.abs(p.y - emitterFrame.yMid) > yLim ||
+            Math.abs(p.z) > zLim ||
+            p.age > p.maxAge
+          ) {
             const roll = Math.random();
-            p.x = -20;
-            if (roll < 0.45) {
-              p.y = -0.85 + Math.random() * 2.1;
-              p.z = -halfSpan * 0.95 + Math.random() * (halfSpan * 1.9);
-            } else if (roll < 0.78) {
+            p.x = emitterFrame.xSpawn;
+            if (roll < 0.70) {
+              p.y = emitterFrame.yMid + (Math.random() - 0.5) * Math.max(0.9, emitterFrame.modelHeight * 1.1 * rakeSpread);
+              p.z = (Math.random() - 0.5) * 2 * Math.max(1.2, halfSpan * 0.92 * rakeSpread);
+            } else if (roll < 0.90) {
               const tipSign = Math.random() > 0.5 ? 1 : -1;
-              p.z = tipSign * (halfSpan * 0.94 + (Math.random() - 0.5) * 1.1);
-              p.y = -0.35 + Math.random() * 1.0;
+              p.z = tipSign * (halfSpan * 0.94 + (Math.random() - 0.5) * 0.9);
+              p.y = emitterFrame.yMid + (Math.random() - 0.5) * Math.max(0.85, emitterFrame.modelHeight * 0.65);
             } else {
-              p.y = -3.4 + Math.random() * 6.8;
-              p.z = -8.0 + Math.random() * 16.0;
+              p.y = emitterFrame.yMid + (Math.random() - 0.5) * 2 * emitterFrame.yHalf;
+              p.z = (Math.random() - 0.5) * 2 * emitterFrame.zHalf;
             }
             p.age = 0;
           }
-        } else if (FluidDynamics3D.isInsideSolid(p, fluid3DParams, 0.08)) {
-          const out = FluidDynamics3D.constrainToExterior(p, fluid3DParams, 0.12);
+        } else if (FluidDynamics3D.isInsideSolid(p, fluid3DParams, surfaceField ? surfaceField.dMin * 0.75 : 0.08)) {
+          const out = FluidDynamics3D.constrainToExterior(p, fluid3DParams, surfaceField ? surfaceField.dMin : 0.12);
           p.x = out.x;
           p.y = out.y;
           p.z = out.z;
@@ -666,17 +684,18 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
     // 8. Render Dynamic High-Density 3D Smoke Streamlines (Vortex + Vertex Flow Rake)
     if (params.show_streamlines) {
       const halfSpan = surfaceField?.halfSpan ?? 5.5;
+      const spanSpread = halfSpan * rakeSpread;
 
       const rakeZ = params.modelType === 'cylinder'
-        ? [-2.2, -1.25, -0.55, 0.0, 0.55, 1.25, 2.2]
+        ? [-2.2, -1.25, -0.55, 0.0, 0.55, 1.25, 2.2].map((z) => z * rakeSpread)
         : [
-            -halfSpan * 0.96, -halfSpan * 0.65, -halfSpan * 0.35,
+            -halfSpan * 0.96, -spanSpread * 0.65, -spanSpread * 0.35,
             -0.8, 0.0, 0.8,
-            halfSpan * 0.35, halfSpan * 0.65, halfSpan * 0.96,
+            spanSpread * 0.35, spanSpread * 0.65, halfSpan * 0.96,
           ];
       const rakeY = params.modelType === 'cylinder'
-        ? [-2.0, 0.0, 2.0]
-        : [-0.65, -0.1, 0.45, 1.1];
+        ? [-2.0, 0.0, 2.0].map((y) => y * rakeSpread)
+        : [-0.65, -0.1, 0.45, 1.1].map((dy) => emitterFrame.yMid + dy * rakeSpread);
 
       ctx.save();
       ctx.lineWidth = Math.max(1.2, 1.6 * params.smoke_density);
@@ -685,8 +704,8 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
         const z = rakeZ[rkIdx];
         for (let ryIdx = 0; ryIdx < rakeY.length; ryIdx++) {
           const y = rakeY[ryIdx];
-          const startPt = { x: -20, y, z };
-          const pts = FluidDynamics3D.traceStreamline(startPt, fluid3DParams, 170, 0.22);
+          const startPt = { x: emitterFrame.xSpawn, y, z };
+          const pts = FluidDynamics3D.traceStreamline(startPt, fluid3DParams, 175, 0.22);
 
           if (pts.length > 2) {
             ctx.beginPath();
@@ -932,6 +951,7 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
       const isWingOnly =
         params.modelType === 'naca0012' ||
         params.modelType === 'naca2412' ||
+        params.modelType === 'validation_wing' ||
         params.modelType === 'custom_airfoil';
       const refZ = isWingOnly ? 0 : halfSpan * 0.42;
       const sec = { leX: -3.0, teX: 3.0, quarterChordX: -1.5, chord: 6.0, yMid: 0, thickness: 0.45 };

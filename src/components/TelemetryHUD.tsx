@@ -6,9 +6,12 @@ import {
   ExportDataPayload,
 } from '../utils/telemetryExport';
 import {
+  downloadEngineeringJsonReport,
   downloadEngineeringMarkdownReport,
   downloadEngineeringPdfReport,
 } from '../utils/engineeringReport';
+import { workerClient } from '../simulation/workers/workerClient';
+import type { ExportReportOutput } from '../simulation/contracts/SimulationOutput';
 import {
   Gauge,
   Wind,
@@ -110,6 +113,44 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = ({
       setExportSuccessMsg(null);
     }, 3500);
   };
+
+  const handleExportPdfAsync = async () => {
+    setShowExportMenu(false);
+    try {
+      const res = await workerClient.execute<ExportReportOutput>('export', {
+        type: 'BUILD_REPORT',
+        runId: `pdf-${Date.now().toString(36)}`,
+        input: { modelType, params, format: 'pdf' },
+      });
+      if (res.buffer && res.buffer.byteLength > 0) {
+        const blob = new Blob([res.buffer], { type: res.mimeType });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.setAttribute('download', res.fileName);
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        setTimeout(() => {
+          link.parentNode?.removeChild(link);
+          URL.revokeObjectURL(url);
+        }, 2000);
+      } else {
+        downloadEngineeringPdfReport(modelType, params, telemetry);
+      }
+    } catch {
+      downloadEngineeringPdfReport(modelType, params, telemetry);
+    }
+    setExportSuccessMsg('Engineering Report (.pdf) Saved');
+    setTimeout(() => setExportSuccessMsg(null), 3500);
+  };
+
+  const isModelValid = telemetry.modelValidity?.isValid ?? true;
+  const validityReason = telemetry.modelValidity?.reason ?? 'Within Subsonic Attached VLM Envelope';
+  const loadFactorNz = telemetry.loadFactor_nz;
+  const isOverLoadLimit = loadFactorNz !== undefined && Math.abs(loadFactorNz) > 9.0;
+  const dimmedCardClass = !isModelValid ? 'opacity-60 grayscale-[40%] transition-opacity' : '';
+  const dimmedTitle = !isModelValid ? 'Out of Subsonic Attached VLM Envelope' : undefined;
 
   return (
     <div className="w-full flex flex-col gap-3">
@@ -238,11 +279,30 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = ({
                   <button
                     type="button"
                     onClick={() => {
-                      downloadEngineeringPdfReport(modelType, params, telemetry);
-                      setExportSuccessMsg('Engineering Report (.pdf) Saved');
+                      downloadEngineeringJsonReport(modelType, params, telemetry);
+                      setExportSuccessMsg('Verification Audit (.json) Saved');
                       setShowExportMenu(false);
                       setTimeout(() => setExportSuccessMsg(null), 3500);
                     }}
+                    className="w-full text-left px-2.5 py-2 rounded-lg hover:bg-[var(--bg)] flex items-start gap-2.5 text-[#161A1D] group transition-colors cursor-pointer"
+                  >
+                    <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500/18 to-violet-500/10 ring-1 ring-indigo-500/25 flex items-center justify-center text-indigo-700 shrink-0">
+                      <FileCode weight="duotone" className="w-4 h-4" />
+                    </div>
+                    <div className="flex flex-col">
+                      <span className="text-xs font-semibold text-[#161A1D] flex items-center gap-1.5">
+                        Verification Record
+                        <span className="text-[10px] font-mono text-indigo-700">.json</span>
+                      </span>
+                      <span className="text-[10px] text-[#5C6670] leading-tight">
+                        Reproducible hashes &amp; 3-tier audit bundle
+                      </span>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => void handleExportPdfAsync()}
                     className="w-full text-left px-2.5 py-2 rounded-lg hover:bg-[var(--bg)] flex items-start gap-2.5 text-[#161A1D] group transition-colors cursor-pointer"
                   >
                     <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500/18 to-red-500/10 ring-1 ring-rose-500/25 flex items-center justify-center text-rose-700 shrink-0">
@@ -269,6 +329,27 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = ({
           <span className="sm:hidden">Solver: Reduced-Order Biot–Savart VLM</span>
           <span className="hidden sm:inline">Solver: {telemetry.solverModel}</span>
         </p>
+
+        {/* Model Validity Envelope Status Badge */}
+        {telemetry.modelValidity && (
+          <div
+            className={`mt-1 px-2.5 py-1.5 rounded-lg border text-[10.5px] font-mono flex items-start gap-1.5 leading-snug ${
+              isModelValid
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                : 'bg-amber-50 border-amber-300 text-amber-900'
+            }`}
+          >
+            <span className="font-bold shrink-0">{isModelValid ? '●' : '▲'}</span>
+            <span className="min-w-0">
+              <span className="font-semibold">
+                {isModelValid ? 'Valid VLM Envelope' : 'Out of Subsonic Attached VLM Envelope'}
+              </span>
+              {!isModelValid && (
+                <span className="block text-[10px] opacity-90 mt-0.5">{validityReason}</span>
+              )}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Physical Regime Guardrails (Mach & Knudsen) */}
@@ -310,7 +391,10 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = ({
       {/* 6 Primary Telemetry Metric Cards */}
       <div className="w-full grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 gap-2">
         {/* 1. Lift Coefficient (CL) */}
-        <div className="antigravity-card p-2.5 rounded-xl flex flex-col justify-between">
+        <div
+          className={`antigravity-card p-2.5 rounded-xl flex flex-col justify-between ${dimmedCardClass}`}
+          title={dimmedTitle}
+        >
           <div className="flex items-center justify-between">
             <span className="text-[10px] font-semibold uppercase tracking-wider font-sans text-[#5C6670]">
               Lift Coeff
@@ -325,16 +409,32 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = ({
             </span>
             <span className="text-[11px] font-mono text-[#1769AA] font-bold">CL</span>
           </div>
-          <div className="text-[10px] text-[#5C6670] flex items-center justify-between pt-1.5 border-t border-[var(--border)]">
+          <div className="text-[10px] text-[#5C6670] flex items-center justify-between pt-1.5 border-t border-[var(--border)] gap-1">
             <span>Force:</span>
             <span className="font-mono tabular-nums text-[#1769AA] font-semibold">
               {formatForce(telemetry.lift_N)}
             </span>
           </div>
+          {loadFactorNz !== undefined && (
+            <div className="text-[10px] flex items-center justify-between pt-1 mt-1 border-t border-[var(--border)]/60 gap-1">
+              <span className="text-[#5C6670]">Load n_z:</span>
+              <span
+                className={`font-mono tabular-nums font-semibold ${
+                  isOverLoadLimit ? 'text-red-700 font-bold' : 'text-[#161A1D]'
+                }`}
+              >
+                {isOverLoadLimit ? '▲ ' : ''}
+                {loadFactorNz.toFixed(1)}g{isOverLoadLimit ? ' (>9g)' : ''}
+              </span>
+            </div>
+          )}
         </div>
 
         {/* 2. Drag Coefficient (CD) */}
-        <div className="antigravity-card p-2.5 rounded-xl flex flex-col justify-between">
+        <div
+          className={`antigravity-card p-2.5 rounded-xl flex flex-col justify-between ${dimmedCardClass}`}
+          title={dimmedTitle}
+        >
           <div className="flex items-center justify-between">
             <span className="text-[10px] font-semibold uppercase tracking-wider font-sans text-[#5C6670]">
               Drag Coeff
@@ -358,7 +458,10 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = ({
         </div>
 
         {/* 3. Aerodynamic Efficiency (L/D) */}
-        <div className="antigravity-card p-2.5 rounded-xl flex flex-col justify-between">
+        <div
+          className={`antigravity-card p-2.5 rounded-xl flex flex-col justify-between ${dimmedCardClass}`}
+          title={dimmedTitle}
+        >
           <div className="flex items-center justify-between">
             <span className="text-[10px] font-semibold uppercase tracking-wider font-sans text-[#5C6670]">
               Efficiency
@@ -434,7 +537,8 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = ({
 
         {/* 6. Flow State & Stall Margin */}
         <div
-          className={`antigravity-card p-2.5 rounded-xl flex flex-col justify-between ${
+          title={dimmedTitle}
+          className={`antigravity-card p-2.5 rounded-xl flex flex-col justify-between ${dimmedCardClass} ${
             telemetry.isStalled
               ? '!border-red-300 !bg-red-50'
               : telemetry.stallMargin < 4
@@ -484,7 +588,7 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = ({
       {showPhysicsDetails && (
         <div className="antigravity-glass p-3 sm:p-3.5 rounded-xl flex flex-col gap-3">
           {/* A. Surface Cp Integration (Upper vs Lower Lift) */}
-          <div className="flex flex-col gap-2">
+          <div className={`flex flex-col gap-2 ${dimmedCardClass}`} title={dimmedTitle}>
             <div className="flex items-center justify-between gap-1 border-b border-[var(--border)] pb-1.5">
               <div className="flex items-center gap-1.5 min-w-0">
                 <ArrowUp weight="bold" className="w-3.5 h-3.5 text-[#1769AA] shrink-0" />
@@ -541,7 +645,7 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = ({
           </div>
 
           {/* B. Equivalent & Vortex-Model Circulation, Lifting-Line Downwash */}
-          <div className="pt-2.5 border-t border-[var(--border)] flex flex-col gap-2">
+          <div className={`pt-2.5 border-t border-[var(--border)] flex flex-col gap-2 ${dimmedCardClass}`} title={dimmedTitle}>
             <div className="flex items-center justify-between">
               <span className="text-[11px] font-bold uppercase tracking-wider text-[#161A1D]">
                 Circulation &amp; Finite Wing
@@ -578,7 +682,7 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = ({
           </div>
 
           {/* C. Drag Decomposition: CD = CD0 + CDi + CDsep + CDwave */}
-          <div className="pt-2.5 border-t border-[var(--border)] flex flex-col gap-2">
+          <div className={`pt-2.5 border-t border-[var(--border)] flex flex-col gap-2 ${dimmedCardClass}`} title={dimmedTitle}>
             <div className="flex items-center justify-between">
               <span className="text-[11px] font-bold uppercase tracking-wider text-[#161A1D]">
                 Drag Decomposition

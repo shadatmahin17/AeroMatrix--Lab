@@ -3,6 +3,7 @@ export type AircraftModelType =
   | 'airliner' 
   | 'naca2412' 
   | 'naca0012' 
+  | 'validation_wing'
   | 'custom_airfoil'
   | 'custom_glb'
   | 'concorde' 
@@ -28,6 +29,13 @@ export interface AircraftModelConfig {
   supersonicCapable: boolean;
   glbPath?: string;
   hasGlbModel?: boolean;
+  referenceWeight_N?: number;
+  nominalTestPoint?: {
+    aoaDeg: number;
+    airspeed_kts: number;
+    altitude_ft: number;
+    flapsDeg?: number;
+  };
 }
 
 export type VisualMode = 
@@ -65,6 +73,10 @@ export interface SimulationParams {
   show_separation_annotation?: boolean;
   show_vortex_filaments?: boolean;
   show_downwash_vectors?: boolean;
+  // Flow domain & integration controls
+  rake_spread?: number; // multiplier on smoke & streamline emitter cross-section (0.5..2.0)
+  streamline_resolution?: number; // multiplier on RK2 sub-step resolution (0.5..2.5)
+  flowDomainVersion?: number; // increments when user triggers "Re-fit Flow Domain"
 }
 
 export type CompressibilityRegime =
@@ -163,6 +175,12 @@ export interface AeroTelemetry {
   stallMargin: number; // degrees before stall
   flowState: 'Laminar' | 'Attached Turbulent' | 'Incipient Stall' | 'Deep Stall' | 'Transonic Shock' | 'Supersonic Wave';
   solverModel: string; // Explicit reduced-order model identifier
+  loadFactor_nz?: number; // Normal structural load factor L / W_ref
+  modelValidity?: {
+    isValid: boolean;
+    reason: string;
+    outOfRangeMetrics: string[];
+  };
 }
 
 export interface Point2D {

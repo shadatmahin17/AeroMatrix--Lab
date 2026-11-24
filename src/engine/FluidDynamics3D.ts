@@ -23,8 +23,22 @@ export interface Fluid3DParams {
   cl: number;
   cd: number;
   timeSec?: number;
+  streamlineResolution?: number;
   surfaceField?: AircraftSurfaceField | null;
   calibration?: AeroCalibration | null;
+}
+
+export interface DynamicEmitterFrame {
+  xSpawn: number;
+  xRecycle: number;
+  yMid: number;
+  yHalf: number;
+  zHalf: number;
+  halfLength: number;
+  modelHeight: number;
+  modelSpan: number;
+  chordRef: number;
+  dsMax: number;
 }
 
 export interface Velocity3DResult {
@@ -167,6 +181,52 @@ export function evaluateBiotSavartSegment(params: {
 export class FluidDynamics3D {
   public static readonly SOLVER_MODEL = SOLVER_LABEL_3D;
   public static readonly METADATA = SOLVER_METADATA_3D;
+
+  /**
+   * Computes dynamic smoke & streamline emitter bounds and adaptive sub-step limit
+   * directly from the active normalized AircraftSurfaceField bounding box.
+   */
+  public static getDynamicEmitterFrame(
+    sf?: AircraftSurfaceField | null,
+    rakeSpread = 1.0,
+    streamlineResolution = 1.0
+  ): DynamicEmitterFrame {
+    const spread = Math.max(0.4, Math.min(2.5, rakeSpread));
+    const res = Math.max(0.5, Math.min(3.0, streamlineResolution));
+    const halfLength = sf ? sf.halfLength : 5.0;
+    const modelHeight = sf ? sf.height : 1.8;
+    const modelSpan = sf ? 2 * sf.halfSpan : 10.0;
+    const minX = sf ? sf.minX : -3.5;
+    const maxX = sf ? sf.maxX : 6.5;
+    const yMid = sf ? 0.5 * (sf.minY + sf.maxY) : 0;
+    const chordRef = sf ? sf.meanChord : 2.5;
+
+    return {
+      xSpawn: Math.min(minX - 0.8, -1.4 * halfLength),
+      xRecycle: maxX + 1.8 * halfLength,
+      yMid,
+      yHalf: Math.max(0.75, 0.5 * 1.25 * modelHeight * spread),
+      zHalf: Math.max(1.25, 0.5 * 1.20 * modelSpan * spread),
+      halfLength,
+      modelHeight,
+      modelSpan,
+      chordRef,
+      dsMax: Math.max(0.018, (0.03 * chordRef) / res),
+    };
+  }
+
+  /**
+   * Rejects or validates upstream emitter seeds against `dMin` surface clearance.
+   */
+  public static isValidEmitterSeed(
+    x: number,
+    y: number,
+    z: number,
+    params: Fluid3DParams
+  ): boolean {
+    const clearance = params.surfaceField ? params.surfaceField.dMin : 0.16;
+    return !FluidDynamics3D.isInsideSolid({ x, y, z }, params, clearance);
+  }
 
   /**
    * Returns true if world-space point `p` lies inside or closer than `clearance`
@@ -632,7 +692,7 @@ export class FluidDynamics3D {
       }
 
       const bsMag = Math.hypot(_bsOut.u, _bsOut.v, _bsOut.w);
-      const maxBs = vInf * 1.45;
+      const maxBs = vInf * 1.5;
       if (bsMag > maxBs) {
         const s = maxBs / bsMag;
         u += _bsOut.u * s;
@@ -642,6 +702,53 @@ export class FluidDynamics3D {
         u += _bsOut.u;
         v += _bsOut.v;
         w += _bsOut.w;
+      }
+
+      // --- C2. SLENDER-BODY FUSELAGE & NACELLE RANKINE SOURCE-SINK + RADIAL DOUBLET ---
+      const isPureAirfoil =
+        modelType === 'naca0012' ||
+        modelType === 'naca2412' ||
+        modelType === 'validation_wing' ||
+        modelType === 'custom_airfoil' ||
+        (modelType === 'custom_glb' &&
+          surfaceField !== null &&
+          surfaceField.height / Math.max(0.5, 2 * surfaceField.halfLength) <= 0.08);
+      if (!isPureAirfoil && surfaceField) {
+        const bodyLen = Math.max(1.5, 2 * surfaceField.halfLength);
+        const fineness = Math.min(0.45, surfaceField.height / bodyLen);
+        const noseX = surfaceField.minX + 0.12 * bodyLen;
+        const tailX = surfaceField.maxX - 0.16 * bodyLen;
+        const bodyYMid = 0.5 * (surfaceField.minY + surfaceField.maxY);
+        const qStrength = 0.55 * vInf * fineness * bodyLen * 0.25;
+        const epsSq = Math.max(0.18, 0.22 * surfaceField.height * surfaceField.height);
+
+        const dyB = by - bodyYMid;
+        const rLateralSq = dyB * dyB + bz * bz;
+        // Axisymmetric nose source - tail sink
+        const dNoseX = bx - noseX;
+        const dTailX = bx - tailX;
+        const rNose3 = Math.pow(dNoseX * dNoseX + rLateralSq + epsSq, 1.5);
+        const rTail3 = Math.pow(dTailX * dTailX + rLateralSq + epsSq, 1.5);
+
+        let ubBody = qStrength * (dNoseX / rNose3 - dTailX / rTail3);
+        let vbBody = qStrength * dyB * (1 / rNose3 - 1 / rTail3);
+        let wbBody = qStrength * bz * (1 / rNose3 - 1 / rTail3);
+
+        // Transverse radial doublet over fuselage spine for smooth nose/canopy parting
+        if (bx >= surfaceField.minX - 0.8 && bx <= surfaceField.maxX + 0.6 && rLateralSq < (surfaceField.height * 2.5) ** 2 + 1.0) {
+          const rBody = Math.max(0.28, 0.38 * surfaceField.height);
+          const denomD = Math.pow(rLateralSq + epsSq * 0.85, 2);
+          const doubletK = 0.35 * vInf * rBody * rBody;
+          vbBody += (doubletK * dyB) / Math.max(0.08, denomD);
+          wbBody += (doubletK * bz) / Math.max(0.08, denomD);
+          ubBody -= (0.14 * vInf * fineness) / Math.sqrt(1 + rLateralSq / Math.max(0.2, epsSq));
+        }
+
+        const wuB = ubBody * cosA + vbBody * sinA;
+        const wvB = -ubBody * sinA + vbBody * cosA;
+        u += wuB;
+        v += wvB;
+        w += wbBody;
       }
 
       if (!isStalled && u < vInf * 0.25) {
@@ -738,7 +845,8 @@ export class FluidDynamics3D {
       // --- G. APPROXIMATE 84x48x84 SDF SURFACE BOUNDARY CONSTRAINT ---
       if (surfaceField && surfaceField.sample(bx, by, bz, _surfSample)) {
         const dist = _surfSample.dist;
-        const bHalo = 0.56 + visualViscosity * 0.24;
+        const dMin = surfaceField.dMin;
+        const bHalo = Math.max(dMin + 0.28, 0.56 + visualViscosity * 0.24);
 
         if (dist < bHalo) {
           const wnx = _surfSample.nx * cosA + _surfSample.ny * sinA;
@@ -746,11 +854,13 @@ export class FluidDynamics3D {
           const wnz = _surfSample.nz;
 
           let wBlend = 1.0;
-          if (dist > 0.16) {
-            const t = Math.max(0, Math.min(1, (bHalo - dist) / (bHalo - 0.16)));
+          if (dist > dMin) {
+            const denom = Math.max(0.05, bHalo - dMin);
+            const t = Math.max(0, Math.min(1, (bHalo - dist) / denom));
             wBlend = t * t * (3 - 2 * t);
           }
 
+          // Smooth tangential normal sliding: project out ONLY inward normal velocity
           const vDotN = u * wnx + v * wny + w * wnz;
           if (vDotN < 0) {
             u -= vDotN * wnx * wBlend;
@@ -758,24 +868,28 @@ export class FluidDynamics3D {
             w -= vDotN * wnz * wBlend;
           }
 
-          if (dist < 0.2) {
-            const pen = 0.2 - dist;
-            const cushion = Math.min(2.4 * vInf, (pen / 0.2) * 1.5 * vInf);
+          // Gentle outward normal recovery strictly inside 0.5 * dMin to eliminate grazing penetration
+          const recoveryFloor = 0.5 * dMin;
+          if (dist < recoveryFloor) {
+            const pen = recoveryFloor - dist;
+            const cushion = Math.min(1.6 * vInf, (pen / Math.max(0.05, recoveryFloor)) * 0.95 * vInf);
             u += wnx * cushion;
             v += wny * cushion;
             w += wnz * cushion;
           }
 
-          if (wnx < -0.5) {
+          // Smooth stagnation split near blunt noses
+          if (wnx < -0.55) {
             const tangSpeed = Math.hypot(u, v, w);
-            if (tangSpeed < 0.35 * vInf) {
+            if (tangSpeed < 0.3 * vInf) {
+              const bodyMidY = 0.5 * (surfaceField.minY + surfaceField.maxY);
               const splitDirY =
                 Math.abs(_surfSample.ny) >= 0.02
                   ? (_surfSample.ny >= 0 ? 1 : -1)
-                  : (by >= 0 ? 1 : -1);
-              v += splitDirY * 0.38 * vInf;
+                  : (by >= bodyMidY ? 1 : -1);
+              v += splitDirY * 0.34 * vInf;
               if (Math.abs(_surfSample.ny) < 0.15 && Math.abs(_surfSample.nz) >= 0.05) {
-                w += (_surfSample.nz >= 0 ? 1 : -1) * 0.25 * vInf;
+                w += (_surfSample.nz >= 0 ? 1 : -1) * 0.22 * vInf;
               }
             }
           }
@@ -814,9 +928,85 @@ export class FluidDynamics3D {
   }
 
   /**
+   * Zero-allocation 2-step RK2 (Midpoint) particle advection capped at displacement <= dsMax per sub-step
+   * with smooth SDF tangential sliding and `dMin` exterior recovery.
+   */
+  public static stepParticleRK2(
+    px: number,
+    py: number,
+    pz: number,
+    params: Fluid3DParams,
+    dtTotal: number,
+    dsMax: number,
+    outPos: Vertex3D,
+    outVel: Velocity3DResult
+  ): void {
+    const sf = params.surfaceField;
+    const minClearance = sf ? Math.max(0.08, sf.dMin * 0.65) : 0.12;
+    const aoaRad = (params.aoaDeg * Math.PI) / 180;
+    const sinA = Math.sin(aoaRad);
+    const cosA = Math.cos(aoaRad);
+
+    let cx = px;
+    let cy = py;
+    let cz = pz;
+
+    const v0 = FluidDynamics3D.getVelocity({ x: cx, y: cy, z: cz }, params);
+    const estDisp = Math.max(0.01, v0.speed * dtTotal);
+    const subSteps = Math.max(1, Math.min(8, Math.ceil(estDisp / Math.max(0.018, dsMax))));
+    const subDt = dtTotal / subSteps;
+
+    let lastVel = v0;
+    for (let s = 0; s < subSteps; s++) {
+      const v1 = s === 0 ? v0 : FluidDynamics3D.getVelocity({ x: cx, y: cy, z: cz }, params);
+      const midX = cx + v1.u * (0.5 * subDt);
+      const midY = cy + v1.v * (0.5 * subDt);
+      const midZ = cz + v1.w * (0.5 * subDt);
+
+      const v2 = FluidDynamics3D.getVelocity({ x: midX, y: midY, z: midZ }, params);
+      cx += v2.u * subDt;
+      cy += v2.v * subDt;
+      cz += v2.w * subDt;
+
+      if (params.modelType === 'cylinder') {
+        const constrained = FluidDynamics3D.constrainToExterior({ x: cx, y: cy, z: cz }, params, minClearance);
+        cx = constrained.x;
+        cy = constrained.y;
+        cz = constrained.z;
+      } else if (sf) {
+        const bx = cx * cosA - cy * sinA;
+        const by = cx * sinA + cy * cosA;
+        if (sf.sample(bx, by, cz, _surfSample) && _surfSample.dist < minClearance) {
+          const push = minClearance - _surfSample.dist + 0.01;
+          const nbx = bx + _surfSample.nx * push;
+          const nby = by + _surfSample.ny * push;
+          const nbz = cz + _surfSample.nz * push;
+          cx = nbx * cosA + nby * sinA;
+          cy = -nbx * sinA + nby * cosA;
+          cz = nbz;
+        }
+      }
+
+      lastVel = v2;
+    }
+
+    outPos.x = cx;
+    outPos.y = cy;
+    outPos.z = cz;
+    outVel.u = lastVel.u;
+    outVel.v = lastVel.v;
+    outVel.w = lastVel.w;
+    outVel.speed = lastVel.speed;
+    outVel.cpIncompressible = lastVel.cpIncompressible;
+    outVel.pressureCoeff = lastVel.pressureCoeff;
+    outVel.pressureCoeffClamped = lastVel.pressureCoeffClamped;
+    outVel.vorticity = lastVel.vorticity;
+    outVel.isSeparated = lastVel.isSeparated;
+  }
+
+  /**
    * Numerically integrates a 3D vortex streamline using 2nd-order Runge-Kutta (RK2 / Midpoint Method)
-   * with exterior surface projection and adaptive near-body sub-stepping so streamlines wrap smoothly
-   * around thick blunt leading edges without penetrating the surface or tube radius.
+   * with exterior surface projection and adaptive sub-stepping capped at `dsMax <= 0.03 * c_tunnel / resolution`.
    */
   public static traceStreamline(
     start: Vertex3D,
@@ -831,11 +1021,13 @@ export class FluidDynamics3D {
       vorticity: number;
       isSeparated: boolean;
     })[] = [];
-    const clearance = 0.16;
-    const aoaRad = (params.aoaDeg * Math.PI) / 180;
-    const sinA = Math.sin(aoaRad);
-    const cosA = Math.cos(aoaRad);
     const sf = params.surfaceField;
+    const clearance = sf ? Math.max(0.14, sf.dMin) : 0.16;
+    const frame = FluidDynamics3D.getDynamicEmitterFrame(sf, 1.0, params.streamlineResolution ?? 1.0);
+    const dsMax = frame.dsMax;
+    const xExit = Math.max(22, frame.xRecycle + 4);
+    const yLimit = Math.max(9, frame.yHalf * 4.5);
+    const zLimit = Math.max(14, frame.zHalf * 2.2);
 
     let cur: Vertex3D = FluidDynamics3D.constrainToExterior({ ...start }, params, clearance);
 
@@ -861,56 +1053,30 @@ export class FluidDynamics3D {
       };
     };
 
-    for (let i = 0; i < steps; i++) {
-      if (cur.x > 22 || Math.abs(cur.y) > 9 || Math.abs(cur.z) > 14) break;
+    const subSteps = Math.max(1, Math.min(8, Math.ceil(ds / dsMax)));
+    const subLen = ds / subSteps;
 
-      let nearBody = false;
-      if (sf) {
-        const bx = cur.x * cosA - cur.y * sinA;
-        const by = cur.x * sinA + cur.y * cosA;
-        if (sf.sample(bx, by, cur.z, _surfSample) && _surfSample.dist < 0.85) {
-          nearBody = true;
-        }
+    for (let i = 0; i < steps; i++) {
+      if (cur.x > xExit || Math.abs(cur.y) > yLimit || Math.abs(cur.z) > zLimit) break;
+
+      let firstVel: Velocity3DResult | null = null;
+      for (let sub = 0; sub < subSteps; sub++) {
+        const res = advanceRK2(cur, subLen);
+        if (sub === 0) firstVel = res.vel;
+        cur = res.next;
       }
 
-      if (nearBody) {
-        const subDs = ds * 0.5;
-        const s1 = advanceRK2(cur, subDs);
+      if (firstVel) {
         points.push({
           x: cur.x,
           y: cur.y,
           z: cur.z,
-          speed: s1.vel.speed,
-          pressureCoeff: s1.vel.pressureCoeff,
-          pressureCoeffClamped: s1.vel.pressureCoeffClamped,
-          vorticity: s1.vel.vorticity,
-          isSeparated: s1.vel.isSeparated,
+          speed: firstVel.speed,
+          pressureCoeff: firstVel.pressureCoeff,
+          pressureCoeffClamped: firstVel.pressureCoeffClamped,
+          vorticity: firstVel.vorticity,
+          isSeparated: firstVel.isSeparated,
         });
-        const s2 = advanceRK2(s1.next, subDs);
-        points.push({
-          x: s1.next.x,
-          y: s1.next.y,
-          z: s1.next.z,
-          speed: s2.vel.speed,
-          pressureCoeff: s2.vel.pressureCoeff,
-          pressureCoeffClamped: s2.vel.pressureCoeffClamped,
-          vorticity: s2.vel.vorticity,
-          isSeparated: s2.vel.isSeparated,
-        });
-        cur = s2.next;
-      } else {
-        const step = advanceRK2(cur, ds);
-        points.push({
-          x: cur.x,
-          y: cur.y,
-          z: cur.z,
-          speed: step.vel.speed,
-          pressureCoeff: step.vel.pressureCoeff,
-          pressureCoeffClamped: step.vel.pressureCoeffClamped,
-          vorticity: step.vel.vorticity,
-          isSeparated: step.vel.isSeparated,
-        });
-        cur = step.next;
       }
     }
 

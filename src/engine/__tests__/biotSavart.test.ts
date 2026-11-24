@@ -3,12 +3,16 @@ import { describe, expect, it } from 'vitest';
 import { evaluateBiotSavartSegment, FluidDynamics3D, SOLVER_METADATA_3D } from '../FluidDynamics3D';
 import { AircraftSurfaceField } from '../AircraftSurfaceField';
 import { getAircraft3DModel } from '../../utils/aircraft3DGeometry';
-import { createAeroForceVectorsGroup, updateAeroForceVectors } from '../../utils/aircraftGlbModels';
+import {
+  createAeroForceVectorsGroup,
+  disposeThreeGroupResources,
+  normalizeAircraftGroupToTunnel,
+  optimizeUploadedThreeGroup,
+  updateAeroForceVectors,
+} from '../../utils/aircraftGlbModels';
 
 describe('Biot–Savart Vortex Filament Kernel', () => {
   it('follows the right-hand rule for a spanwise bound vortex segment along +Z', () => {
-    // Filament along Z from (0,0,-1) to (0,0,1) with positive circulation gamma > 0.
-    // Downstream (+X) of the filament: dl = (0,0,2), r1 = (2,0,1) => dl x r1 = (-2*0, 2*2, 0) => +Y (upwash/downwash depending on sign convention).
     const downstream = evaluateBiotSavartSegment({
       point: { x: 2, y: 0, z: 0 },
       start: { x: 0, y: 0, z: -1 },
@@ -30,7 +34,6 @@ describe('Biot–Savart Vortex Filament Kernel', () => {
     expect(downstream.v).toBeGreaterThan(0);
     expect(upstream.v).toBeCloseTo(-downstream.v, 6);
 
-    // Reversing circulation reverses induced velocity direction
     const reversed = evaluateBiotSavartSegment({
       point: { x: 2, y: 0, z: 0 },
       start: { x: 0, y: 0, z: -1 },
@@ -75,7 +78,7 @@ describe('Biot–Savart Vortex Filament Kernel', () => {
 
   it('decays as 1/r^2 in the far field (r >> filament length)', () => {
     const rNear = 20;
-    const rFar = 40; // 2x distance => ~1/4x induced speed
+    const rFar = 40;
     const v1 = evaluateBiotSavartSegment({
       point: { x: rNear, y: 0, z: 0 },
       start: { x: 0, y: 0, z: -1 },
@@ -104,7 +107,6 @@ describe('Biot–Savart Vortex Filament Kernel', () => {
 
   it('keeps SDF watertight inside thick extruded airfoil wings and prevents streamline nose penetration', () => {
     const baseAirfoil = getAircraft3DModel('naca2412', 0, 0, 250, 0);
-    // Scale vertically to mimic thick Airfoil Section 3D CAD geometry with high-aspect span triangles
     const thickAirfoil = {
       ...baseAirfoil,
       vertices: baseAirfoil.vertices.map((v) => ({ x: v.x * 1.4, y: v.y * 2.6, z: v.z * 1.1 })),
@@ -113,7 +115,6 @@ describe('Biot–Savart Vortex Filament Kernel', () => {
     expect(sf).not.toBeNull();
 
     const sample = { dist: 0, nx: 0, ny: 1, nz: 0, inside: false };
-    // Interior core of the thick airfoil near quarter-chord must remain strictly inside (dist < 0)
     expect(sf!.sample(0, 0, 0, sample)).toBe(true);
     expect(sample.dist).toBeLessThan(0);
 
@@ -146,13 +147,11 @@ describe('Biot–Savart Vortex Filament Kernel', () => {
     const dragArrow = group.getObjectByName('dragArrow') as THREE.ArrowHelper;
     const resultantArrow = group.getObjectByName('resultantArrow') as THREE.ArrowHelper;
 
-    // 1. Symmetric NACA 0012 at AoA = 0 (L = 0, D = 200 N)
     updateAeroForceVectors(group, 0, 200, 0, true, { cl: 0, cd: 0.007 });
     expect(liftArrow.visible).toBe(false);
     expect(resultantArrow.visible).toBe(false);
     expect(dragArrow.visible).toBe(true);
 
-    // 2. Positive lift: check proportional growth when force increases
     updateAeroForceVectors(group, 20000, 2000, 5, true, { cl: 0.5, cd: 0.05 });
     expect(liftArrow.visible).toBe(true);
     expect(resultantArrow.visible).toBe(true);
@@ -162,10 +161,132 @@ describe('Biot–Savart Vortex Filament Kernel', () => {
     const highLiftY = liftArrow.cone.position.y;
     expect(highLiftY).toBeGreaterThan(lowLiftY);
 
-    // 3. Negative AoA lift: arrow flips downward (-Y)
     updateAeroForceVectors(group, -40000, 3000, -6, true, { cl: -0.5, cd: 0.04 });
     expect(liftArrow.visible).toBe(true);
     const quatDir = new THREE.Vector3(0, 1, 0).applyQuaternion(liftArrow.quaternion);
     expect(quatDir.y).toBeLessThan(-0.9);
   });
+
+  it('normalizes arbitrary 3D models to maxDim=10.0 with 35% aerodynamic center at origin', () => {
+    const group = new THREE.Group();
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(20, 4, 12),
+      new THREE.MeshStandardMaterial({ color: 0xffffff })
+    );
+    mesh.position.set(14, -3, 7);
+    group.add(mesh);
+
+    const bounds = normalizeAircraftGroupToTunnel(group, 10.0, 0.35);
+    const maxDim = Math.max(bounds.size.x, bounds.size.y, bounds.size.z);
+    expect(maxDim).toBeCloseTo(10.0, 4);
+    expect(bounds.min.x).toBeCloseTo(-3.5, 4);
+    expect(bounds.max.x).toBeCloseTo(6.5, 4);
+    expect(0.5 * (bounds.min.y + bounds.max.y)).toBeCloseTo(0, 4);
+    expect(0.5 * (bounds.min.z + bounds.max.z)).toBeCloseTo(0, 4);
+
+    disposeThreeGroupResources(group, { disposeGeometries: true, disposeMaterials: true });
+  });
+
+  it('optimizes uploaded 3D groups by pruning empty nodes and computing normals/bounds', () => {
+    const scene = new THREE.Group();
+    const emptyNode = new THREE.Group();
+    emptyNode.name = 'EmptyHelper';
+    scene.add(emptyNode);
+
+    const geo = new THREE.BoxGeometry(2, 1, 3);
+    geo.deleteAttribute('normal');
+    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial());
+    scene.add(mesh);
+
+    const stats = optimizeUploadedThreeGroup(scene);
+    expect(stats.meshCount).toBe(1);
+    expect(stats.triangleCount).toBe(12);
+    expect(scene.getObjectByName('EmptyHelper')).toBeUndefined();
+    expect(geo.attributes.normal).toBeDefined();
+    expect(geo.boundingBox).not.toBeNull();
+    expect(geo.boundingSphere).not.toBeNull();
+
+    disposeThreeGroupResources(scene, { disposeGeometries: true, disposeMaterials: true });
+  });
+
+  it('dynamically sizes 84x48x84 SDF grid, exposes dMin = 2*cellSize, and cleanly integrates F-22 RK2 streamlines', () => {
+    const f22Mesh = getAircraft3DModel('f22', 0, 0, 350, 0);
+    const sf = AircraftSurfaceField.fromProceduralMesh(f22Mesh);
+    expect(sf).not.toBeNull();
+    expect(sf!.dMin).toBeCloseTo(2.0 * sf!.cellSize, 6);
+
+    const frame = FluidDynamics3D.getDynamicEmitterFrame(sf, 1.0, 1.0);
+    expect(frame.xSpawn).toBeLessThan(sf!.minX);
+    expect(frame.xRecycle).toBeGreaterThan(sf!.maxX);
+    expect(frame.dsMax).toBeLessThanOrEqual(0.03 * sf!.meanChord + 1e-6);
+
+    const fluidParams = {
+      modelType: 'f22' as const,
+      aoaDeg: 5.0,
+      airspeed_kts: 350,
+      mach: 0.55,
+      altitude_ft: 9843,
+      flapsDeg: 0,
+      viscosity: 0.15,
+      isStalled: false,
+      cl: 0.45,
+      cd: 0.04,
+      surfaceField: sf,
+      streamlineResolution: 1.0,
+    };
+
+    const pts = FluidDynamics3D.traceStreamline(
+      { x: frame.xSpawn, y: 0.05, z: 0.6 },
+      fluidParams,
+      110,
+      0.24
+    );
+    expect(pts.length).toBeGreaterThan(20);
+    for (const pt of pts) {
+      expect(Number.isFinite(pt.x) && Number.isFinite(pt.y) && Number.isFinite(pt.z)).toBe(true);
+      expect(FluidDynamics3D.isInsideSolid(pt, fluidParams, 0.02)).toBe(false);
+    }
+
+    // Verify stepParticleRK2 advances smoothly without NaN
+    const outPos = { x: frame.xSpawn, y: 0.2, z: 1.0 };
+    const outVel = {
+      u: 1,
+      v: 0,
+      w: 0,
+      speed: 1,
+      cpIncompressible: 0,
+      pressureCoeff: 0,
+      pressureCoeffClamped: 0,
+      vorticity: 0,
+      isSeparated: false,
+    };
+    FluidDynamics3D.stepParticleRK2(
+      frame.xSpawn,
+      0.2,
+      1.0,
+      fluidParams,
+      0.05,
+      frame.dsMax,
+      outPos,
+      outVel
+    );
+    expect(outPos.x).toBeGreaterThan(frame.xSpawn);
+    expect(Number.isFinite(outVel.speed)).toBe(true);
+
+    // Verify SDF clear() resets buffer safely so sample() reports empty cleared space
+    sf!.clear();
+    const clearedSample = { dist: -99, nx: 0, ny: 1, nz: 0, inside: true };
+    expect(sf!.sample(0, 0, 0, clearedSample)).toBe(false);
+    expect(
+      sf!.getSpanSection(0, {
+        leX: 0,
+        teX: 0,
+        quarterChordX: 0,
+        chord: 0,
+        yMid: 0,
+        thickness: 0,
+      })
+    ).toBe(false);
+  });
 });
+

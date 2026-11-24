@@ -36,7 +36,11 @@ export class AircraftSurfaceField {
   public readonly minZ: number;
   public readonly maxZ: number;
   public readonly halfSpan: number;
+  public readonly halfLength: number;
+  public readonly height: number;
   public readonly meanChord: number;
+  public readonly cellSize: number;
+  public readonly dMin: number;
 
   private readonly nx = 84;
   private readonly ny = 48;
@@ -79,21 +83,32 @@ export class AircraftSurfaceField {
     this.maxZ = bounds.maxZ;
     this.halfSpan = Math.max(1.0, Math.abs(bounds.minZ), Math.abs(bounds.maxZ));
 
-    const pad = 1.8;
-    this.padMinX = bounds.minX - pad;
-    this.padMinY = bounds.minY - pad;
-    this.padMinZ = bounds.minZ - pad;
-    this.padMaxX = bounds.maxX + pad;
-    this.padMaxY = bounds.maxY + pad;
-    this.padMaxZ = bounds.maxZ + pad;
+    const rawSizeX = Math.max(0.5, bounds.maxX - bounds.minX);
+    const rawSizeY = Math.max(0.25, bounds.maxY - bounds.minY);
+    const rawSizeZ = Math.max(0.5, bounds.maxZ - bounds.minZ);
+    this.halfLength = 0.5 * rawSizeX;
+    this.height = rawSizeY;
 
-    const sizeX = Math.max(2, this.padMaxX - this.padMinX);
-    const sizeY = Math.max(2, this.padMaxY - this.padMinY);
-    const sizeZ = Math.max(2, this.padMaxZ - this.padMinZ);
+    // Size SDF domain dynamically to 1.35 x boundingBox (pad = 0.175 * size per side, with thin-wing Y margin)
+    const padX = Math.max(0.25, 0.175 * rawSizeX);
+    const padY = Math.max(0.45, 0.175 * rawSizeY);
+    const padZ = Math.max(0.25, 0.175 * rawSizeZ);
+    this.padMinX = bounds.minX - padX;
+    this.padMinY = bounds.minY - padY;
+    this.padMinZ = bounds.minZ - padZ;
+    this.padMaxX = bounds.maxX + padX;
+    this.padMaxY = bounds.maxY + padY;
+    this.padMaxZ = bounds.maxZ + padZ;
+
+    const sizeX = Math.max(1.0, this.padMaxX - this.padMinX);
+    const sizeY = Math.max(0.9, this.padMaxY - this.padMinY);
+    const sizeZ = Math.max(1.0, this.padMaxZ - this.padMinZ);
 
     this.dx = sizeX / (this.nx - 1);
     this.dy = sizeY / (this.ny - 1);
     this.dz = sizeZ / (this.nz - 1);
+    this.cellSize = Math.max(this.dx, this.dy, this.dz);
+    this.dMin = 2.0 * this.cellSize;
     this.invDx = (this.nx - 1) / sizeX;
     this.invDy = (this.ny - 1) / sizeY;
     this.invDz = (this.nz - 1) / sizeZ;
@@ -488,10 +503,13 @@ export class AircraftSurfaceField {
 
     if (!isFinite(minX)) return null;
 
-    const estDx = (maxX - minX + 3.6) / 83;
-    const estDy = (maxY - minY + 3.6) / 47;
-    const estDz = (maxZ - minZ + 3.6) / 83;
-    const targetStep = Math.max(0.06, Math.min(estDx, estDy, estDz) * 0.52);
+    const rawSizeX = Math.max(0.5, maxX - minX);
+    const rawSizeY = Math.max(0.25, maxY - minY);
+    const rawSizeZ = Math.max(0.5, maxZ - minZ);
+    const estDx = (rawSizeX + 2 * Math.max(0.25, 0.175 * rawSizeX)) / 83;
+    const estDy = (rawSizeY + 2 * Math.max(0.45, 0.175 * rawSizeY)) / 47;
+    const estDz = (rawSizeZ + 2 * Math.max(0.25, 0.175 * rawSizeZ)) / 83;
+    const targetStep = Math.max(0.05, Math.min(estDx, estDy, estDz) * 0.52);
 
     const maxSamples = 140000;
     const pts = new Float32Array(maxSamples * 3);
@@ -584,6 +602,43 @@ export class AircraftSurfaceField {
   }
 
   /**
+   * Builds an SDF directly from raw packed [x, y, z, ...] surface sample points (Web Worker safe, zero Three.js dependency).
+   */
+  public static fromRawPoints(
+    points: Float32Array,
+    explicitBounds?: { minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number }
+  ): AircraftSurfaceField | null {
+    const pointCount = Math.floor(points.length / 3);
+    if (pointCount <= 0) return null;
+    let bounds = explicitBounds;
+    if (!bounds) {
+      let minX = Infinity, maxX = -Infinity;
+      let minY = Infinity, maxY = -Infinity;
+      let minZ = Infinity, maxZ = -Infinity;
+      for (let i = 0; i < pointCount; i++) {
+        const x = points[i * 3];
+        const y = points[i * 3 + 1];
+        const z = points[i * 3 + 2];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        if (z < minZ) minZ = z;
+        if (z > maxZ) maxZ = z;
+      }
+      bounds = { minX, maxX, minY, maxY, minZ, maxZ };
+    }
+    return new AircraftSurfaceField(points, pointCount, bounds);
+  }
+
+  /**
+   * Returns a copy of the 84x48x84 Float32Array SDF grid suitable for zero-copy Worker transfer.
+   */
+  public exportSdfBuffer(): Float32Array {
+    return new Float32Array(this.sdfGrid);
+  }
+
+  /**
    * Builds a signed surface field directly from procedural Aircraft3DMeshData polygons.
    */
   public static fromProceduralMesh(mesh: Aircraft3DMeshData): AircraftSurfaceField | null {
@@ -602,10 +657,13 @@ export class AircraftSurfaceField {
       if (v.z > maxZ) maxZ = v.z;
     }
 
-    const estDx = (maxX - minX + 3.6) / 83;
-    const estDy = (maxY - minY + 3.6) / 47;
-    const estDz = (maxZ - minZ + 3.6) / 83;
-    const targetStep = Math.max(0.06, Math.min(estDx, estDy, estDz) * 0.52);
+    const rawSizeX = Math.max(0.5, maxX - minX);
+    const rawSizeY = Math.max(0.25, maxY - minY);
+    const rawSizeZ = Math.max(0.5, maxZ - minZ);
+    const estDx = (rawSizeX + 2 * Math.max(0.25, 0.175 * rawSizeX)) / 83;
+    const estDy = (rawSizeY + 2 * Math.max(0.45, 0.175 * rawSizeY)) / 47;
+    const estDz = (rawSizeZ + 2 * Math.max(0.25, 0.175 * rawSizeZ)) / 83;
+    const targetStep = Math.max(0.05, Math.min(estDx, estDy, estDz) * 0.52);
 
     const maxSamples = 140000;
     const pts = new Float32Array(maxSamples * 3);
@@ -777,5 +835,17 @@ export class AircraftSurfaceField {
     out.yMid = this.sliceYMid[sIdx];
     out.thickness = this.sliceThick[sIdx];
     return true;
+  }
+
+  /**
+   * Clears stale SDF buffer values immediately when swapping models.
+   */
+  public clear(): void {
+    this.sdfGrid.fill(1e5);
+    this.sliceLeX.fill(0);
+    this.sliceTeX.fill(0);
+    this.sliceYMid.fill(0);
+    this.sliceThick.fill(0);
+    this.sliceHasGeo.fill(0);
   }
 }

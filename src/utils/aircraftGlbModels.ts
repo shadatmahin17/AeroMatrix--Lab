@@ -71,12 +71,243 @@ export const GLB_MODEL_REGISTRY: Record<string, GlbModelMetadata> = {
   },
 };
 
-// In-memory cache for parsed GLTF scenes
+// In-memory cache for parsed GLTF scenes (stored in normalized tunnel space)
 const gltfCache = new Map<string, THREE.Group>();
 
+// Module-level scratch math helpers (zero per-call / per-frame allocations)
+const _normBox = new THREE.Box3();
+const _normSize = new THREE.Vector3();
+const _hmWindDir = new THREE.Vector3();
+const _hmNormalMatrix = new THREE.Matrix3();
+const _hmWorldNormal = new THREE.Vector3();
+
+export interface NormalizedTunnelBounds {
+  size: THREE.Vector3;
+  min: THREE.Vector3;
+  max: THREE.Vector3;
+  scaleApplied: number;
+}
+
+export interface OptimizedGroupStats {
+  meshCount: number;
+  vertexCount: number;
+  triangleCount: number;
+  optimizedTextures: number;
+}
+
 /**
- * Loads a GLB model with automatic centering, bounding-box normalization,
- * and airflow axis alignment (nose towards -X).
+ * Uniformly scales `root` so its longest bounding-box dimension equals `canonicalMaxDim`
+ * (default 10.0 tunnel units) and translates it so its aerodynamic center
+ * (acLengthFraction of length aft of nose, centered in Y and Z) sits at world origin (0, 0, 0).
+ */
+export function normalizeAircraftGroupToTunnel(
+  root: THREE.Object3D,
+  canonicalMaxDim = 10.0,
+  acLengthFraction = 0.35
+): NormalizedTunnelBounds {
+  root.updateMatrixWorld(true);
+  _normBox.setFromObject(root);
+  _normBox.getSize(_normSize);
+
+  const rawMax = Math.max(_normSize.x, _normSize.y, _normSize.z);
+  const s = rawMax > 1e-6 && Number.isFinite(rawMax) ? canonicalMaxDim / rawMax : 1.0;
+
+  const acX = _normBox.min.x + acLengthFraction * _normSize.x;
+  const acY = 0.5 * (_normBox.min.y + _normBox.max.y);
+  const acZ = 0.5 * (_normBox.min.z + _normBox.max.z);
+
+  root.scale.multiplyScalar(s);
+  root.position.set(
+    (root.position.x - acX) * s,
+    (root.position.y - acY) * s,
+    (root.position.z - acZ) * s
+  );
+  root.updateMatrixWorld(true);
+
+  _normBox.setFromObject(root);
+  const outSize = new THREE.Vector3();
+  _normBox.getSize(outSize);
+
+  return {
+    size: outSize,
+    min: _normBox.min.clone(),
+    max: _normBox.max.clone(),
+    scaleApplied: s,
+  };
+}
+
+/**
+ * Optimizes uploaded or parsed GLTF/Three.js scene graphs for smooth 60 FPS interaction:
+ * - Prunes empty non-mesh helper nodes
+ * - Computes missing vertex normals, bounding boxes, and bounding spheres with frustumCulled = true
+ * - Downscales oversized embedded textures (> 1024px) to protect mobile/WebGL VRAM
+ * - Disables costly shadow passes and freezes static matrices on ultra-high-poly meshes (> 120k tris)
+ */
+export function optimizeUploadedThreeGroup(rawScene: THREE.Object3D): OptimizedGroupStats {
+  let meshCount = 0;
+  let vertexCount = 0;
+  let triangleCount = 0;
+  let optimizedTextures = 0;
+
+  const meshes: THREE.Mesh[] = [];
+  const meshDescendantMap = new WeakSet<THREE.Object3D>();
+  const emptyNodes: THREE.Object3D[] = [];
+
+  rawScene.traverse((child) => {
+    if ((child as THREE.Mesh).isMesh) {
+      const mesh = child as THREE.Mesh;
+      const pos = mesh.geometry?.attributes?.position;
+      if (!pos || pos.count === 0) {
+        emptyNodes.push(mesh);
+        return;
+      }
+      meshCount++;
+      vertexCount += pos.count;
+      const idx = mesh.geometry.index;
+      triangleCount += idx ? Math.floor(idx.count / 3) : Math.floor(pos.count / 3);
+      meshes.push(mesh);
+
+      let p: THREE.Object3D | null = mesh;
+      while (p) {
+        meshDescendantMap.add(p);
+        p = p.parent;
+      }
+    }
+  });
+
+  rawScene.traverse((child) => {
+    if (child !== rawScene && !meshDescendantMap.has(child) && !(child as THREE.Light).isLight) {
+      emptyNodes.push(child);
+    }
+  });
+
+  for (const node of emptyNodes) {
+    node.parent?.remove(node);
+  }
+
+  const processedTextures = new WeakSet<THREE.Texture>();
+  const maybeDownscaleTexture = (tex: THREE.Texture | null | undefined) => {
+    if (!tex || processedTextures.has(tex)) return;
+    processedTextures.add(tex);
+    if (typeof document === 'undefined') return;
+    const img = tex.image as { width?: number; height?: number } | undefined;
+    if (!img || !img.width || !img.height) return;
+    const maxEdge = Math.max(img.width, img.height);
+    if (maxEdge <= 1024) return;
+    try {
+      const scale = 1024 / maxEdge;
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(img as CanvasImageSource, 0, 0, w, h);
+      tex.image = canvas;
+      tex.needsUpdate = true;
+      optimizedTextures++;
+    } catch {
+      // Skip non-canvas-drawable images (e.g. compressed/data textures)
+    }
+  };
+
+  const isHeavyPoly = triangleCount > 120_000;
+
+  for (const mesh of meshes) {
+    const geo = mesh.geometry;
+    if (geo) {
+      if (!geo.attributes.normal) {
+        geo.computeVertexNormals();
+      }
+      if (!geo.boundingBox) geo.computeBoundingBox();
+      if (!geo.boundingSphere) geo.computeBoundingSphere();
+    }
+
+    mesh.frustumCulled = true;
+    if (isHeavyPoly) {
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      mesh.matrixAutoUpdate = false;
+      mesh.updateMatrix();
+    } else {
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+    }
+
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const m of mats) {
+      if (!m) continue;
+      const std = m as THREE.MeshStandardMaterial;
+      maybeDownscaleTexture(std.map);
+      maybeDownscaleTexture(std.normalMap);
+      maybeDownscaleTexture(std.roughnessMap);
+      maybeDownscaleTexture(std.metalnessMap);
+      maybeDownscaleTexture(std.aoMap);
+      maybeDownscaleTexture(std.emissiveMap);
+    }
+  }
+
+  return { meshCount, vertexCount, triangleCount, optimizedTextures };
+}
+
+/**
+ * Safely disposes Three.js materials, cached shading variants, and optionally geometries/textures
+ * inside a group so swapping or removing `.glb` models does not leak WebGL VRAM.
+ */
+export function disposeThreeGroupResources(
+  root: THREE.Object3D | null | undefined,
+  options: { disposeGeometries?: boolean; disposeMaterials?: boolean; disposeTextures?: boolean } = {}
+): void {
+  if (!root) return;
+  const { disposeGeometries = false, disposeMaterials = true, disposeTextures = false } = options;
+
+  const disposeMat = (mat: THREE.Material | null | undefined) => {
+    if (!mat) return;
+    if (disposeTextures) {
+      const std = mat as THREE.MeshStandardMaterial;
+      std.map?.dispose();
+      std.normalMap?.dispose();
+      std.roughnessMap?.dispose();
+      std.metalnessMap?.dispose();
+      std.aoMap?.dispose();
+      std.emissiveMap?.dispose();
+    }
+    mat.dispose();
+  };
+
+  root.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    if (!mesh.isMesh) return;
+
+    if (disposeGeometries && mesh.geometry) {
+      mesh.geometry.dispose();
+    }
+
+    if (disposeMaterials) {
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const m of mats) disposeMat(m);
+      if (mesh.userData.originalMaterial && mesh.userData.originalMaterial !== mesh.material) {
+        const orig = Array.isArray(mesh.userData.originalMaterial)
+          ? mesh.userData.originalMaterial
+          : [mesh.userData.originalMaterial];
+        for (const m of orig) disposeMat(m);
+      }
+      if (mesh.userData.heatmapMaterial) {
+        disposeMat(mesh.userData.heatmapMaterial as THREE.Material);
+        mesh.userData.heatmapMaterial = undefined;
+      }
+      if (mesh.userData.xrayMaterial) {
+        disposeMat(mesh.userData.xrayMaterial as THREE.Material);
+        mesh.userData.xrayMaterial = undefined;
+      }
+    }
+  });
+}
+
+/**
+ * Loads a GLB model with automatic centering, bounding-box normalization (maxDim = 10.0,
+ * aerodynamic center at 35% aft of nose), and airflow axis alignment (nose towards -X).
  */
 export function loadGlbAircraftModel(
   modelType: AircraftModelType,
@@ -89,6 +320,13 @@ export function loadGlbAircraftModel(
       return;
     }
 
+    const cached = gltfCache.get(modelType);
+    if (cached) {
+      if (onProgress) onProgress(100);
+      resolve({ root: cached, metadata: meta });
+      return;
+    }
+
     const loader = new GLTFLoader();
     loader.setMeshoptDecoder(MeshoptDecoder);
 
@@ -96,37 +334,28 @@ export function loadGlbAircraftModel(
       meta.glbPath,
       (gltf) => {
         const rawScene = gltf.scene;
+        optimizeUploadedThreeGroup(rawScene);
 
-        // Clone or prepare root wrapper
         const wrapper = new THREE.Group();
         wrapper.name = `GLB_${modelType}_Wrapper`;
 
-        // Compute natural bounding box
         const box = new THREE.Box3().setFromObject(rawScene);
-        const size = new THREE.Vector3();
-        box.getSize(size);
         const center = new THREE.Vector3();
         box.getCenter(center);
 
-        // Principal length across axes
-        const maxDim = Math.max(size.x, size.y, size.z) || 1;
-        const normalizedScale = (meta.targetLength / maxDim) * meta.scaleMultiplier;
-
-        // Center the raw scene at origin
-        rawScene.position.set(-center.x, -center.y, -center.z);
+        // Center the raw scene at origin before orientation alignment
+        rawScene.position.sub(center);
 
         const innerGroup = new THREE.Group();
         innerGroup.name = `GLB_${modelType}_Inner`;
         innerGroup.add(rawScene);
-        innerGroup.scale.set(normalizedScale, normalizedScale, normalizedScale);
 
-        // Apply metadata rotation to align with wind tunnel (-X)
+        // Apply metadata rotation to align nose cleanly into oncoming wind (-X)
         innerGroup.rotation.set(
           meta.rotationOffset[0],
           meta.rotationOffset[1],
           meta.rotationOffset[2]
         );
-
         innerGroup.position.set(
           meta.positionOffset[0],
           meta.positionOffset[1],
@@ -135,24 +364,20 @@ export function loadGlbAircraftModel(
 
         wrapper.add(innerGroup);
 
-        // Tag every mesh with original materials and vertex data
+        // Normalize uniformly to canonical 10.0 tunnel units with aerodynamic center at 35% length
+        normalizeAircraftGroupToTunnel(wrapper, 10.0, 0.35);
+
+        // Preserve original materials and vertex data references
         wrapper.traverse((child) => {
           if ((child as THREE.Mesh).isMesh) {
             const mesh = child as THREE.Mesh;
-            mesh.castShadow = true;
-            mesh.receiveShadow = true;
-
-            // Preserve original material
             mesh.userData.originalMaterial = mesh.material;
-
-            // Ensure normals are computed
             if (mesh.geometry && !mesh.geometry.attributes.normal) {
               mesh.geometry.computeVertexNormals();
             }
           }
         });
 
-        // Store in cache
         gltfCache.set(modelType, wrapper);
         resolve({ root: wrapper, metadata: meta });
       },
@@ -172,8 +397,7 @@ export function loadGlbAircraftModel(
 /**
  * Applies CFD Pressure Heatmap colors across the 3D GLB model based on
  * surface face normals relative to wind vector and angle of attack.
- *
- * Royal Blue (-2.5 Cp suction peak) -> Cyan -> Emerald (attached) -> Amber -> Crimson (+1.0 Stagnation)
+ * Uses module-level scratch math and direct Float32Array indexing for zero GC overhead.
  */
 export function applyCfdPressureHeatmap(
   root: THREE.Group,
@@ -181,12 +405,11 @@ export function applyCfdPressureHeatmap(
   isStalled: boolean
 ): void {
   const aoaRad = (aoaDeg * Math.PI) / 180;
-  // Wind flows from -X to +X, so freestream relative to aircraft is:
-  // V_freestream = (cos(aoa), -sin(aoa), 0)
-  const windDir = new THREE.Vector3(Math.cos(aoaRad), -Math.sin(aoaRad), 0).normalize();
-
-  const normalMatrix = new THREE.Matrix3();
-  const worldNormal = new THREE.Vector3();
+  // Wind flows from -X to +X, so freestream relative to aircraft is (cos(aoa), -sin(aoa), 0)
+  _hmWindDir.set(Math.cos(aoaRad), -Math.sin(aoaRad), 0).normalize();
+  const wx = _hmWindDir.x;
+  const wy = _hmWindDir.y;
+  const wz = _hmWindDir.z;
 
   root.traverse((child) => {
     if (!(child as THREE.Mesh).isMesh) return;
@@ -194,40 +417,54 @@ export function applyCfdPressureHeatmap(
     const geo = mesh.geometry;
     if (!geo || !geo.attributes.position) return;
 
-    normalMatrix.getNormalMatrix(mesh.matrixWorld);
+    _hmNormalMatrix.getNormalMatrix(mesh.matrixWorld);
+    const m = _hmNormalMatrix.elements;
+    const m00 = m[0], m01 = m[3], m02 = m[6];
+    const m10 = m[1], m11 = m[4], m12 = m[7];
+    const m20 = m[2], m21 = m[5], m22 = m[8];
 
-    // Create or reuse color attribute
     const posCount = geo.attributes.position.count;
-    let colorAttr = geo.attributes.color as THREE.BufferAttribute;
+    let colorAttr = geo.attributes.color as THREE.BufferAttribute | undefined;
     if (!colorAttr || colorAttr.count !== posCount) {
       colorAttr = new THREE.BufferAttribute(new Float32Array(posCount * 3), 3);
       geo.setAttribute('color', colorAttr);
     }
 
+    const colArr = colorAttr.array as Float32Array;
     const normals = geo.attributes.normal;
+    const normArr = normals ? (normals.array as Float32Array) : null;
+    const normStride = normals && 'itemSize' in normals ? normals.itemSize : 3;
 
     for (let i = 0; i < posCount; i++) {
-      if (normals) {
-        worldNormal.set(normals.getX(i), normals.getY(i), normals.getZ(i));
-        worldNormal.applyMatrix3(normalMatrix).normalize();
-      } else {
-        worldNormal.set(0, 1, 0);
+      let nx = 0, ny = 1, nz = 0;
+      if (normArr) {
+        const nIdx = i * normStride;
+        const lnx = normArr[nIdx];
+        const lny = normArr[nIdx + 1];
+        const lnz = normArr[nIdx + 2];
+        _hmWorldNormal.set(
+          m00 * lnx + m01 * lny + m02 * lnz,
+          m10 * lnx + m11 * lny + m12 * lnz,
+          m20 * lnx + m21 * lny + m22 * lnz
+        );
+        const nLen = _hmWorldNormal.length();
+        if (nLen > 1e-6) {
+          nx = _hmWorldNormal.x / nLen;
+          ny = _hmWorldNormal.y / nLen;
+          nz = _hmWorldNormal.z / nLen;
+        }
       }
 
-      // Normal dot wind: positive when facing into wind (ram compression), negative on suction side
-      const dot = -worldNormal.dot(windDir);
+      const dot = -(nx * wx + ny * wy + nz * wz);
 
       let r = 0, g = 0.5, b = 1.0;
 
       if (isStalled) {
-        // Separation turbulent wake: mottled reddish-purple
         r = 0.95;
-        g = 0.15 + (Math.sin(i * 0.3) * 0.1);
+        g = 0.15 + Math.sin(i * 0.3) * 0.1;
         b = 0.25;
       } else if (dot > 0.05) {
-        // Leading edge / stagnation region: Cp > 0 (compression)
         const t = Math.min(1.0, dot * 1.3);
-        // Emerald (0.05) -> Amber (0.5) -> Crimson (1.0)
         if (t < 0.5) {
           r = 0.1 + (t / 0.5) * 0.8;
           g = 0.7 + (t / 0.5) * 0.2;
@@ -238,20 +475,20 @@ export function applyCfdPressureHeatmap(
           b = 0.05;
         }
       } else {
-        // Suction side (upper wing / canopy): Cp < 0
         const suction = Math.min(1.0, Math.abs(dot) * 1.5);
-        // Royal Blue (high suction) -> Electric Cyan -> Emerald
         r = 0.02;
         g = 0.5 + (1.0 - suction) * 0.4;
         b = 0.95;
       }
 
-      colorAttr.setXYZ(i, r, g, b);
+      const cIdx = i * 3;
+      colArr[cIdx] = r;
+      colArr[cIdx + 1] = g;
+      colArr[cIdx + 2] = b;
     }
 
     colorAttr.needsUpdate = true;
 
-    // Apply vertex-colored material for heatmap
     if (!mesh.userData.heatmapMaterial) {
       mesh.userData.heatmapMaterial = new THREE.MeshStandardMaterial({
         vertexColors: true,

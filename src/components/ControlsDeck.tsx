@@ -17,6 +17,7 @@ import {
   Play,
   Pause,
   ArrowCounterClockwise,
+  ArrowsClockwise,
   Flame,
   CompassRose,
   Repeat,
@@ -33,6 +34,7 @@ import {
 interface ControlsDeckProps {
   params: SimulationParams;
   onParamChange: <K extends keyof SimulationParams>(key: K, value: SimulationParams[K]) => void;
+  onSelectModel?: (modelType: AircraftModelType) => void;
   isPaused: boolean;
   onTogglePause: () => void;
   onReset: () => void;
@@ -40,6 +42,8 @@ interface ControlsDeckProps {
   onOpenModelInspector?: () => void;
   onOpen2DLab?: () => void;
   customGlbAsset?: CustomGlbAsset | null;
+  localGlbAssets?: CustomGlbAsset[];
+  onSelectLocalGlbAsset?: (asset: CustomGlbAsset) => void;
   onCustomGlbReady?: (asset: CustomGlbAsset) => void;
   onCustomGlbCloudLinked?: (fileName: string, doc: SharedGlbModelDoc) => void;
   onCustomGlbCalibrationUpdated?: (
@@ -49,23 +53,30 @@ interface ControlsDeckProps {
     pca?: MeshPcaAnalysis
   ) => void;
   onFlipCustomGlbNose?: () => void;
+  onRotateCustomGlbYaw90?: () => void;
   onResetCustomGlbToDefault?: () => void;
+  onRefitFlowDomain?: () => void;
 }
 
 export const ControlsDeck: React.FC<ControlsDeckProps> = ({
   params,
   onParamChange,
+  onSelectModel,
   isPaused,
   onTogglePause,
   onReset,
   onOpenModelInspector,
   onOpen2DLab,
   customGlbAsset = null,
+  localGlbAssets = [],
+  onSelectLocalGlbAsset,
   onCustomGlbReady,
   onCustomGlbCloudLinked,
   onCustomGlbCalibrationUpdated,
   onFlipCustomGlbNose,
+  onRotateCustomGlbYaw90,
   onResetCustomGlbToDefault,
+  onRefitFlowDomain,
 }) => {
   const currentModel = AIRCRAFT_MODELS[params.modelType];
   const [isAutoSweeping, setIsAutoSweeping] = useState(false);
@@ -219,12 +230,27 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
         onParamChange('flaps_deg', 0);
       },
     },
+    {
+      name: 'Validation Wing (AR = 6)',
+      tag: 'Re 3.0×10⁶ · M 0.15',
+      desc: 'Rectangular NACA 0012 Prandtl lifting-line',
+      apply: () => {
+        setIsAutoSweeping(false);
+        const match = computeBenchmarkMatchConditions('validation_wing', 3_000_000, 0.15);
+        onParamChange('modelType', 'validation_wing');
+        onParamChange('angle_of_attack', 6.0);
+        onParamChange('airspeed_kts', Math.round(match.airspeed_kts));
+        onParamChange('altitude_ft', match.altitude_ft);
+        onParamChange('flaps_deg', 0);
+      },
+    },
   ];
 
   const getModelFileSize = (type: AircraftModelType) => {
     if (type === 'airliner') return '3.9 MB';
     if (type === 'concorde') return '755 KB';
-    if (type === 'naca2412') return '11.4 KB';
+    if (type === 'naca2412' || type === 'naca0012') return '11.4 KB';
+    if (type === 'validation_wing') return 'Procedural AR 6';
     return '741 KB';
   };
 
@@ -257,8 +283,13 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
               <button
                 key={type}
                 onClick={() => {
-                  onParamChange('modelType', type);
-                  if (!config.flapCapable) onParamChange('flaps_deg', 0);
+                  setIsAutoSweeping(false);
+                  if (onSelectModel) {
+                    onSelectModel(type);
+                  } else {
+                    onParamChange('modelType', type);
+                    if (!config.flapCapable) onParamChange('flaps_deg', 0);
+                  }
                 }}
                 className={`antigravity-card p-2.5 rounded-xl text-left flex flex-col justify-between transition-all cursor-pointer ${
                   isSelected
@@ -305,29 +336,40 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
               activeAsset={customGlbAsset}
               isCustomActive={params.modelType === 'custom_glb'}
               flipNose={Boolean(params.customGlbFlipNose)}
+              yawDeg={params.customGlbYawDeg ?? 0}
+              localAssets={localGlbAssets}
               onAssetReady={onCustomGlbReady}
+              onSelectLocalAsset={onSelectLocalGlbAsset}
               onCloudAssetLinked={onCustomGlbCloudLinked}
               onCalibrationUpdated={onCustomGlbCalibrationUpdated}
               onFlipNose={onFlipCustomGlbNose}
+              onRotateYaw90={onRotateCustomGlbYaw90}
               onResetDefault={onResetCustomGlbToDefault}
             />
           )}
 
-        {/* Wind-Tunnel Benchmark Mode shortcut when NACA 0012 or NACA 2412 is active */}
-        {(params.modelType === 'naca0012' || params.modelType === 'naca2412') && (
+        {/* Wind-Tunnel Benchmark Mode shortcut when NACA 0012, NACA 2412, or AR 6 Validation Wing is active */}
+        {(params.modelType === 'naca0012' ||
+          params.modelType === 'naca2412' ||
+          params.modelType === 'validation_wing') && (
           <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center justify-between gap-2">
             <div className="min-w-0">
               <div className="text-[11px] font-bold text-emerald-900 truncate">
                 Wind-Tunnel Benchmark Mode
               </div>
               <p className="text-[10px] font-mono text-emerald-800 truncate">
-                Re = 3.0×10⁶ · M = 0.15 (NACA TR-824)
+                Re = 3.0×10⁶ · M = 0.15 ({params.modelType === 'validation_wing' ? 'Prandtl AR 6' : 'NACA TR-824'})
               </p>
             </div>
             <button
               type="button"
               onClick={() => {
-                const targetModel = params.modelType === 'naca0012' ? 'naca0012' : 'naca2412';
+                const targetModel =
+                  params.modelType === 'naca0012'
+                    ? 'naca0012'
+                    : params.modelType === 'validation_wing'
+                    ? 'validation_wing'
+                    : 'naca2412';
                 const match = computeBenchmarkMatchConditions(targetModel, 3_000_000, 0.15);
                 setIsAutoSweeping(false);
                 onParamChange('airspeed_kts', Math.round(match.airspeed_kts));
@@ -717,7 +759,7 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
           })}
         </div>
 
-        {/* Smoke density & viscosity sliders */}
+        {/* Smoke density, viscosity & dynamic flow-domain sliders */}
         <div className="flex flex-col gap-3 pt-2.5 border-t border-[var(--border)]">
           <PrecisionSlider
             id="viscosity-slider"
@@ -741,6 +783,46 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
             displayValue={`${params.smoke_density.toFixed(1)}x`}
             onChange={(val) => onParamChange('smoke_density', val)}
           />
+
+          <PrecisionSlider
+            id="rake-spread-slider"
+            label="Smoke Rake Spread"
+            subLabel="(Y/Z Frame)"
+            min={0.5}
+            max={2.0}
+            step={0.1}
+            value={params.rake_spread ?? 1.0}
+            displayValue={`${(params.rake_spread ?? 1.0).toFixed(1)}x`}
+            onChange={(val) => onParamChange('rake_spread', val)}
+          />
+
+          <PrecisionSlider
+            id="streamline-res-slider"
+            label="Streamline Resolution"
+            subLabel="(RK2 Δs)"
+            min={0.5}
+            max={2.5}
+            step={0.1}
+            value={params.streamline_resolution ?? 1.0}
+            displayValue={`${(params.streamline_resolution ?? 1.0).toFixed(1)}x`}
+            onChange={(val) => onParamChange('streamline_resolution', val)}
+          />
+
+          <button
+            type="button"
+            onClick={() => {
+              if (onRefitFlowDomain) {
+                onRefitFlowDomain();
+              } else {
+                onParamChange('flowDomainVersion', (params.flowDomainVersion ?? 0) + 1);
+              }
+            }}
+            className="w-full py-2 px-3 rounded-xl bg-[var(--bg)] hover:bg-[var(--accent-light)] text-[#1769AA] border border-[#1769AA]/30 hover:border-[#1769AA] text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+            title="Re-compute normalized bounding box, 84×48×84 SDF collision grid, Biot–Savart wingtip span, and upstream emitter rake"
+          >
+            <ArrowsClockwise weight="bold" className="w-3.5 h-3.5" />
+            <span>Re-fit Flow Domain</span>
+          </button>
         </div>
       </div>
 

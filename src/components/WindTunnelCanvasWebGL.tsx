@@ -13,6 +13,8 @@ import {
   applyWireframeShading,
   createAeroForceVectorsGroup,
   updateAeroForceVectors,
+  normalizeAircraftGroupToTunnel,
+  disposeThreeGroupResources,
 } from '../utils/aircraftGlbModels';
 import { FluidDynamics3D, Fluid3DParams } from '../engine/FluidDynamics3D';
 import { AircraftSurfaceField } from '../engine/AircraftSurfaceField';
@@ -42,6 +44,42 @@ interface WindTunnelCanvasWebGLProps {
 
 interface TracedCurveData {
   points: (Vertex3D & { speed: number; pressureCoeff: number; pressureCoeffClamped: number; vorticity: number; isSeparated: boolean })[];
+}
+
+// Module-level scratch objects to keep 60fps particle animation strictly zero-allocation
+const _pOutPos: Vertex3D = { x: 0, y: 0, z: 0 };
+const _pOutVel = {
+  u: 0,
+  v: 0,
+  w: 0,
+  speed: 0,
+  cpIncompressible: 0,
+  pressureCoeff: 0,
+  pressureCoeffClamped: 0,
+  vorticity: 0,
+  isSeparated: false,
+};
+const _pTailRaw: Vertex3D = { x: 0, y: 0, z: 0 };
+
+function applyCachedXrayMaterial(root: THREE.Group): void {
+  root.traverse((child) => {
+    if ((child as THREE.Mesh).isMesh) {
+      const mesh = child as THREE.Mesh;
+      if (!mesh.userData.originalMaterial) {
+        mesh.userData.originalMaterial = mesh.material;
+      }
+      if (!mesh.userData.xrayMaterial) {
+        mesh.userData.xrayMaterial = new THREE.MeshPhysicalMaterial({
+          color: 0x38bdf8,
+          transparent: true,
+          opacity: 0.35,
+          roughness: 0.15,
+          metalness: 0.75,
+        });
+      }
+      mesh.material = mesh.userData.xrayMaterial as THREE.Material;
+    }
+  });
 }
 
 export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
@@ -79,7 +117,9 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
   // Model & Simulation Roots
   const aircraftGroupRef = useRef<THREE.Group | null>(null);
   const glbRootRef = useRef<THREE.Group | null>(null);
-  const proceduralMeshRef = useRef<THREE.Mesh | null>(null);
+  const isGlbCustomRef = useRef<boolean>(false);
+  const proceduralMeshRef = useRef<THREE.Group | null>(null);
+  const spawnParticleRef = useRef<((idx: number, isInitial?: boolean) => void) | null>(null);
   const streamlinesGroupRef = useRef<THREE.Group | null>(null);
   const quiverGroupRef = useRef<THREE.Group | null>(null);
   const tracedCurvesRef = useRef<TracedCurveData[]>([]);
@@ -247,33 +287,60 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     const streakColors = new Float32Array(particleCount * 6);
 
     const spawnParticle = (idx: number, isInitial = false) => {
-      const roll = Math.random();
-      let y = 0;
-      let z = 0;
+      const currentParams = paramsRef.current;
+      const currentTelemetry = telemetryRef.current;
       const sf = surfaceFieldRef.current;
-      const activeSpan = sf ? sf.halfSpan : 6.8;
-      const yMin = sf ? sf.minY - 0.5 : -0.85;
-      const yMax = sf ? sf.maxY + 0.5 : 1.25;
-      const yHeight = Math.max(1.4, yMax - yMin);
-      const yMid = 0.5 * (yMin + yMax);
+      const frame = FluidDynamics3D.getDynamicEmitterFrame(
+        sf,
+        currentParams.rake_spread ?? 1.0,
+        currentParams.streamline_resolution ?? 1.0
+      );
+      const fluidCheckParams: Fluid3DParams = {
+        modelType: currentParams.modelType,
+        aoaDeg: currentParams.angle_of_attack,
+        airspeed_kts: currentParams.airspeed_kts,
+        mach: currentTelemetry.mach,
+        altitude_ft: currentParams.altitude_ft,
+        flapsDeg: currentParams.flaps_deg,
+        viscosity: currentParams.viscosity,
+        isStalled: currentTelemetry.isStalled,
+        cl: currentTelemetry.cl,
+        cd: currentTelemetry.cd,
+        surfaceField: sf,
+        calibration: activeCalibrationRef.current,
+      };
 
-      if (roll < 0.45) {
-        y = yMin + Math.random() * yHeight;
-        z = -activeSpan * 0.95 + Math.random() * (activeSpan * 1.9);
-      } else if (roll < 0.78) {
-        // Wingtip / lateral vortex roll-up seeding
-        const tipSign = Math.random() > 0.5 ? 1 : -1;
-        z = tipSign * (activeSpan * 0.94 + (Math.random() - 0.5) * 1.1);
-        y = yMid + (Math.random() - 0.5) * Math.max(1.0, yHeight * 0.55);
-      } else if (roll < 0.92) {
-        y = yMin + Math.random() * yHeight;
-        z = -1.2 + Math.random() * 2.4;
-      } else {
-        y = -3.4 + Math.random() * 6.8;
-        z = -8.5 + Math.random() * 17.0;
+      const activeSpan = sf ? sf.halfSpan : frame.zHalf;
+      let x = frame.xSpawn;
+      let y = frame.yMid;
+      let z = 0;
+
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const roll = Math.random();
+        if (roll < 0.70) {
+          // Concentrate 70% of seeds near wing/fuselage stagnation band
+          y = frame.yMid + (Math.random() - 0.5) * Math.max(0.9, frame.modelHeight * 1.1 * (currentParams.rake_spread ?? 1.0));
+          z = (Math.random() - 0.5) * 2 * Math.max(1.2, activeSpan * 0.92 * (currentParams.rake_spread ?? 1.0));
+        } else if (roll < 0.90) {
+          // Wingtip vortex roll-up seeding
+          const tipSign = Math.random() > 0.5 ? 1 : -1;
+          z = tipSign * (activeSpan * 0.94 + (Math.random() - 0.5) * 0.9);
+          y = frame.yMid + (Math.random() - 0.5) * Math.max(0.85, frame.modelHeight * 0.65);
+        } else {
+          // Outer tunnel flow framing
+          y = frame.yMid + (Math.random() - 0.5) * 2 * frame.yHalf;
+          z = (Math.random() - 0.5) * 2 * frame.zHalf;
+        }
+
+        x = isInitial
+          ? frame.xSpawn + Math.random() * Math.max(8, frame.xRecycle - frame.xSpawn)
+          : frame.xSpawn;
+
+        if (FluidDynamics3D.isValidEmitterSeed(x, y, z, fluidCheckParams)) {
+          break;
+        }
       }
 
-      const x = isInitial ? -21 + Math.random() * 42 : -21;
       pPositions[idx * 3] = x;
       pPositions[idx * 3 + 1] = y;
       pPositions[idx * 3 + 2] = z;
@@ -293,6 +360,7 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
       streakColors[idx * 6 + 4] = 0.78;
       streakColors[idx * 6 + 5] = 0.98;
     };
+    spawnParticleRef.current = spawnParticle;
 
     for (let i = 0; i < particleCount; i++) {
       spawnParticle(i, true);
@@ -408,11 +476,12 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
         cl: currentTelemetry.cl,
         cd: currentTelemetry.cd,
         timeSec: now * 0.001,
+        streamlineResolution: currentParams.streamline_resolution ?? 1.0,
         surfaceField: surfaceFieldRef.current,
         calibration: activeCalibrationRef.current,
       };
 
-      // A. Update PIV Velocity-Aligned Streaks via RK2 Midpoint Integration
+      // A. Update PIV Velocity-Aligned Streaks via adaptive RK2 Midpoint Sub-Stepping
       if (particlePositionsRef.current && particleStreaksRef.current) {
         particleStreaksRef.current.visible = currentParams.show_particles;
         if (currentParams.show_particles) {
@@ -427,62 +496,48 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
           const mat = particleStreaksRef.current.material as THREE.LineBasicMaterial;
           mat.opacity = Math.min(0.95, 0.45 + currentParams.smoke_density * 0.32);
 
+          const frame = FluidDynamics3D.getDynamicEmitterFrame(
+            surfaceFieldRef.current,
+            currentParams.rake_spread ?? 1.0,
+            currentParams.streamline_resolution ?? 1.0
+          );
           const stepScale = dt * 15.0;
+          const yRecycleLimit = Math.max(8.5, frame.yHalf * 4.5);
+          const zRecycleLimit = Math.max(14.5, frame.zHalf * 1.9);
 
           for (let i = 0; i < activeCount; i++) {
             const px = pos[i * 3];
             const py = pos[i * 3 + 1];
             const pz = pos[i * 3 + 2];
 
-            const v1 = FluidDynamics3D.getVelocity({ x: px, y: py, z: pz }, fluid3DParams);
-            let nx = px;
-            let ny = py;
-            let nz = pz;
-
             if (!currentPaused) {
-              // RK2 midpoint evaluation constrained outside solid mesh
-              const mid = FluidDynamics3D.constrainToExterior(
-                {
-                  x: px + v1.u * stepScale * 0.5,
-                  y: py + v1.v * stepScale * 0.5,
-                  z: pz + v1.w * stepScale * 0.5,
-                },
+              FluidDynamics3D.stepParticleRK2(
+                px,
+                py,
+                pz,
                 fluid3DParams,
-                0.09
-              );
-              const v2 = FluidDynamics3D.getVelocity(mid, fluid3DParams);
-
-              const advected = FluidDynamics3D.constrainToExterior(
-                {
-                  x: px + v2.u * stepScale,
-                  y: py + v2.v * stepScale,
-                  z: pz + v2.w * stepScale,
-                },
-                fluid3DParams,
-                0.09
+                stepScale,
+                frame.dsMax,
+                _pOutPos,
+                _pOutVel
               );
 
-              nx = advected.x;
-              ny = advected.y;
-              nz = advected.z;
+              const nx = _pOutPos.x;
+              const ny = _pOutPos.y;
+              const nz = _pOutPos.z;
 
               pos[i * 3] = nx;
               pos[i * 3 + 1] = ny;
               pos[i * 3 + 2] = nz;
 
-              const speed = v2.speed || 1;
+              const speed = _pOutVel.speed || 1;
               const streakLen = Math.min(1.25, 0.24 + speed * 0.34);
               const invS = streakLen / speed;
 
-              const tail = FluidDynamics3D.constrainToExterior(
-                {
-                  x: nx - v2.u * invS,
-                  y: ny - v2.v * invS,
-                  z: nz - v2.w * invS,
-                },
-                fluid3DParams,
-                0.07
-              );
+              _pTailRaw.x = nx - _pOutVel.u * invS;
+              _pTailRaw.y = ny - _pOutVel.v * invS;
+              _pTailRaw.z = nz - _pOutVel.w * invS;
+              const tail = FluidDynamics3D.constrainToExterior(_pTailRaw, fluid3DParams, 0.07);
 
               // Tail -> Head aligned with real velocity vector
               streakArr[i * 6] = tail.x;
@@ -494,13 +549,13 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
 
               // Color by real flow physics: Separation / Suction / Vorticity / Compression
               let hr = 0.22, hg = 0.74, hb = 0.97;
-              if (v2.isSeparated || (currentTelemetry.isStalled && nx > -1.0 && ny > -0.5)) {
+              if (_pOutVel.isSeparated || (currentTelemetry.isStalled && nx > -1.0 && ny > -0.5)) {
                 hr = 0.96; hg = 0.28; hb = 0.28; // Separated turbulent wake
-              } else if (v2.vorticity > 0.35) {
+              } else if (_pOutVel.vorticity > 0.35) {
                 hr = 0.35; hg = 0.92; hb = 1.0; // Intense Biot-Savart vortex swirl
-              } else if (v2.pressureCoeffClamped < -0.55) {
+              } else if (_pOutVel.pressureCoeffClamped < -0.55) {
                 hr = 0.09; hg = 0.58; hb = 0.92; // Bernoulli suction peak
-              } else if (v2.pressureCoeffClamped > 0.25) {
+              } else if (_pOutVel.pressureCoeffClamped > 0.25) {
                 hr = 0.98; hg = 0.72; hb = 0.16; // Stagnation / compression
               } else {
                 hr = 0.20; hg = 0.83; hb = 0.60; // Laminar freestream
@@ -515,7 +570,11 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
               colArr[i * 6 + 5] = hb;
             }
 
-            if (pos[i * 3] > 22 || Math.abs(pos[i * 3 + 1]) > 8.5 || Math.abs(pos[i * 3 + 2]) > 14.5) {
+            if (
+              pos[i * 3] > frame.xRecycle ||
+              Math.abs(pos[i * 3 + 1] - frame.yMid) > yRecycleLimit ||
+              Math.abs(pos[i * 3 + 2]) > zRecycleLimit
+            ) {
               spawnParticle(i, false);
             }
           }
@@ -627,13 +686,31 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
 
     if (glbRootRef.current) {
       aircraftGroup.remove(glbRootRef.current);
+      if (isGlbCustomRef.current) {
+        disposeThreeGroupResources(glbRootRef.current, {
+          disposeGeometries: false,
+          disposeMaterials: true,
+          disposeTextures: false,
+        });
+      } else {
+        restoreOriginalGlbMaterials(glbRootRef.current);
+      }
       glbRootRef.current = null;
+      isGlbCustomRef.current = false;
     }
     if (proceduralMeshRef.current) {
       aircraftGroup.remove(proceduralMeshRef.current);
+      disposeThreeGroupResources(proceduralMeshRef.current, {
+        disposeGeometries: true,
+        disposeMaterials: true,
+        disposeTextures: false,
+      });
       proceduralMeshRef.current = null;
     }
-    surfaceFieldRef.current = null;
+    if (surfaceFieldRef.current) {
+      surfaceFieldRef.current.clear();
+      surfaceFieldRef.current = null;
+    }
 
     setModelLoading(true);
     setLoadProgress(0);
@@ -646,28 +723,26 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
         restoreOriginalGlbMaterials(root);
         applyWireframeShading(root, true);
       } else if (activeShading === 'xray') {
-        root.traverse((child) => {
-          if ((child as THREE.Mesh).isMesh) {
-            (child as THREE.Mesh).material = new THREE.MeshPhysicalMaterial({
-              color: 0x38bdf8,
-              transparent: true,
-              opacity: 0.35,
-              roughness: 0.15,
-              metalness: 0.75,
-            });
-          }
-        });
+        applyCachedXrayMaterial(root);
+      } else {
+        restoreOriginalGlbMaterials(root);
+        applyWireframeShading(root, false);
       }
     };
 
     const customAsset = customGlbAssetRef.current;
 
     if (params.modelType === 'custom_glb' && customAsset) {
-      const { root } = buildOrientedCustomGlbRoot(customAsset, Boolean(params.customGlbFlipNose));
+      const { root } = buildOrientedCustomGlbRoot(
+        customAsset,
+        Boolean(params.customGlbFlipNose),
+        params.customGlbYawDeg ?? 0
+      );
       root.updateMatrixWorld(true);
       surfaceFieldRef.current = AircraftSurfaceField.fromThreeGroup(root);
 
       glbRootRef.current = root;
+      isGlbCustomRef.current = true;
       aircraftGroup.add(root);
 
       setSurfaceVersion((v) => v + 1);
@@ -692,6 +767,7 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
           surfaceFieldRef.current = AircraftSurfaceField.fromThreeGroup(root);
 
           glbRootRef.current = root;
+          isGlbCustomRef.current = false;
           aircraftGroupRef.current.add(root);
 
           setSurfaceVersion((v) => v + 1);
@@ -744,10 +820,21 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
       });
 
       const procMesh = new THREE.Mesh(geom, mat);
-      proceduralMeshRef.current = procMesh;
-      aircraftGroup.add(procMesh);
+      const procGroup = new THREE.Group();
+      procGroup.name = `Procedural_${params.modelType}`;
+      procGroup.add(procMesh);
 
-      surfaceFieldRef.current = AircraftSurfaceField.fromProceduralMesh(meshData);
+      // Keep cylinder matching analytical CYLINDER_RADIUS; normalize all other procedural meshes to 10.0 units
+      if (params.modelType !== 'cylinder') {
+        normalizeAircraftGroupToTunnel(procGroup, 10.0, 0.35);
+      } else {
+        procGroup.updateMatrixWorld(true);
+      }
+
+      proceduralMeshRef.current = procGroup;
+      aircraftGroup.add(procGroup);
+
+      surfaceFieldRef.current = AircraftSurfaceField.fromThreeGroup(procGroup);
       setSurfaceVersion((v) => v + 1);
       setModelLoading(false);
     }
@@ -760,9 +847,26 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     params.customAirfoilVersion,
     params.customGlbVersion,
     params.customGlbFlipNose,
+    params.customGlbYawDeg,
+    params.flowDomainVersion,
     customGlbAsset,
     webglUnavailable,
   ]);
+
+  // Re-frame particle emitter domain whenever model SDF, rake spread, or flow domain updates
+  useEffect(() => {
+    const pPositions = particlePositionsRef.current;
+    const pStreaks = particleStreaksRef.current;
+    const spawner = spawnParticleRef.current;
+    if (!pPositions || !pStreaks || !spawner) return;
+
+    const count = pPositions.length / 3;
+    for (let i = 0; i < count; i++) {
+      spawner(i, true);
+    }
+    const posAttr = pStreaks.geometry.attributes.position as THREE.BufferAttribute;
+    posAttr.needsUpdate = true;
+  }, [surfaceVersion, params.rake_spread, params.flowDomainVersion]);
 
   // Evict any particles trapped inside newly loaded or re-pitched solid geometry
   useEffect(() => {
@@ -770,6 +874,8 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     const pStreaks = particleStreaksRef.current;
     if (!pPositions || !pStreaks) return;
 
+    const sf = surfaceFieldRef.current;
+    const minClearance = sf ? Math.max(0.1, sf.dMin * 0.75) : 0.12;
     const fluid3DParams: Fluid3DParams = {
       modelType: params.modelType,
       aoaDeg: params.angle_of_attack,
@@ -781,7 +887,7 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
       isStalled: telemetry.isStalled,
       cl: telemetry.cl,
       cd: telemetry.cd,
-      surfaceField: surfaceFieldRef.current,
+      surfaceField: sf,
       calibration: activeCalibrationRef.current,
     };
 
@@ -796,8 +902,8 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
         y: pPositions[i * 3 + 1],
         z: pPositions[i * 3 + 2],
       };
-      if (FluidDynamics3D.isInsideSolid(pt, fluid3DParams, 0.08)) {
-        const out = FluidDynamics3D.constrainToExterior(pt, fluid3DParams, 0.12);
+      if (FluidDynamics3D.isInsideSolid(pt, fluid3DParams, minClearance)) {
+        const out = FluidDynamics3D.constrainToExterior(pt, fluid3DParams, minClearance + 0.04);
         pPositions[i * 3] = out.x;
         pPositions[i * 3 + 1] = out.y;
         pPositions[i * 3 + 2] = out.z;
@@ -833,18 +939,7 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
       restoreOriginalGlbMaterials(root);
       applyWireframeShading(root, true);
     } else if (activeShading === 'xray') {
-      root.traverse((child) => {
-        if ((child as THREE.Mesh).isMesh) {
-          const mesh = child as THREE.Mesh;
-          mesh.material = new THREE.MeshPhysicalMaterial({
-            color: 0x38bdf8,
-            transparent: true,
-            opacity: 0.35,
-            roughness: 0.15,
-            metalness: 0.75,
-          });
-        }
-      });
+      applyCachedXrayMaterial(root);
     } else {
       restoreOriginalGlbMaterials(root);
       applyWireframeShading(root, false);
@@ -924,6 +1019,7 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     const isWingOnly =
       params.modelType === 'naca0012' ||
       params.modelType === 'naca2412' ||
+      params.modelType === 'validation_wing' ||
       params.modelType === 'custom_airfoil';
     const refZ = isWingOnly ? 0 : halfSpan * 0.42;
     const sec = { leX: -3.0, teX: 3.0, quarterChordX: -1.5, chord: 6.0, yMid: 0, thickness: 0.45 };
@@ -1090,7 +1186,11 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     if (!params.show_streamlines) return;
 
     const sf = surfaceFieldRef.current;
-    const halfSpan = sf ? sf.halfSpan : (params.modelType === 'airliner' ? 9.0 : params.modelType === 'concorde' ? 4.8 : 6.8);
+    const rakeSpread = params.rake_spread ?? 1.0;
+    const streamlineRes = params.streamline_resolution ?? 1.0;
+    const frame = FluidDynamics3D.getDynamicEmitterFrame(sf, rakeSpread, streamlineRes);
+    const halfSpan = sf ? sf.halfSpan : frame.zHalf;
+    const spanSpread = halfSpan * rakeSpread;
 
     interface RakeFilament {
       y: number;
@@ -1103,21 +1203,22 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     if (params.modelType === 'cylinder') {
       [-2.4, -1.2, 0.0, 1.2, 2.4].forEach((y) => {
         [-2.2, -1.25, -0.55, 0.0, 0.55, 1.25, 2.2].forEach((z) =>
-          filaments.push({ y, z, type: 'wing' })
+          filaments.push({ y: y * rakeSpread, z: z * rakeSpread, type: 'wing' })
         );
       });
     } else if (
       params.modelType === 'naca2412' ||
       params.modelType === 'naca0012' ||
+      params.modelType === 'validation_wing' ||
       params.modelType === 'custom_airfoil'
     ) {
-      [-0.9, -0.35, 0.05, 0.45, 1.0].forEach((y) => {
-        [-halfSpan * 0.75, -halfSpan * 0.35, 0.0, halfSpan * 0.35, halfSpan * 0.75].forEach((z) =>
-          filaments.push({ y, z, type: 'wing' })
+      [-0.85, -0.35, 0.05, 0.45, 0.9].forEach((y) => {
+        [-spanSpread * 0.78, -spanSpread * 0.38, 0.0, spanSpread * 0.38, spanSpread * 0.78].forEach((z) =>
+          filaments.push({ y: frame.yMid + y * rakeSpread, z, type: 'wing' })
         );
       });
       [-halfSpan * 0.98, halfSpan * 0.98].forEach((z) => {
-        [-0.1, 0.2].forEach((y) => filaments.push({ y, z, type: 'vortex' }));
+        [-0.1, 0.2].forEach((y) => filaments.push({ y: frame.yMid + y, z, type: 'vortex' }));
       });
     } else if (params.modelType === 'custom_glb' && sf) {
       const customCal = activeCalibrationRef.current;
@@ -1127,14 +1228,14 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
         customCal?.modelClass === 'rocket' ||
         (customCal?.stallAngleDeg ?? 16) <= 0;
 
-      const ySpan = Math.max(0.8, sf.maxY - sf.minY);
-      const yMid = 0.5 * (sf.minY + sf.maxY);
+      const ySpan = Math.max(0.8, sf.height);
+      const yMid = frame.yMid;
       const bodyZ = Math.min(0.85, halfSpan * 0.42);
       const bodyYs = [
-        sf.minY + ySpan * 0.18,
+        yMid - ySpan * 0.36 * rakeSpread,
         yMid,
-        sf.maxY - ySpan * 0.12,
-        sf.maxY + 0.35,
+        yMid + ySpan * 0.36 * rakeSpread,
+        sf.maxY + 0.35 * rakeSpread,
       ];
       [-bodyZ, 0, bodyZ].forEach((z) => {
         bodyYs.forEach((y) => filaments.push({ y, z, type: 'fuselage' }));
@@ -1142,9 +1243,11 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
 
       const secScratch = { leX: 0, teX: 0, quarterChordX: 0, chord: 1, yMid: 0, thickness: 0.3 };
       [-0.82, -0.56, -0.3, 0.3, 0.56, 0.82].forEach((frac) => {
-        const z = frac * halfSpan;
+        const z = frac * spanSpread;
         const secY = sf.getSpanSection(z, secScratch) ? secScratch.yMid : yMid;
-        [-0.45, 0.0, 0.45].forEach((dy) => filaments.push({ y: secY + dy, z, type: 'wing' }));
+        [-0.45 * rakeSpread, 0.0, 0.45 * rakeSpread].forEach((dy) =>
+          filaments.push({ y: secY + dy, z, type: 'wing' })
+        );
       });
 
       if (!isNonLifting) {
@@ -1154,24 +1257,32 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
         });
       }
     } else {
-      // Fuselage / canopy rake
+      const yMid = frame.yMid;
+      const bodyH = Math.max(0.8, frame.modelHeight * 0.48 * rakeSpread);
+      // Fuselage / canopy stagnation band (70% focus around airframe)
       [-0.8, 0.0, 0.8].forEach((z) => {
-        [-0.35, 0.35, 1.15].forEach((y) => filaments.push({ y, z, type: 'fuselage' }));
+        [-bodyH * 0.8, 0.0, bodyH * 0.9].forEach((dy) =>
+          filaments.push({ y: yMid + dy, z, type: 'fuselage' })
+        );
       });
       // Main spanwise wing rake adapted to real vertex span
       [-0.78, -0.52, -0.28, 0.28, 0.52, 0.78].forEach((frac) => {
-        const z = frac * halfSpan;
-        [-0.55, 0.05, 0.65].forEach((y) => filaments.push({ y, z, type: 'wing' }));
+        const z = frac * spanSpread;
+        [-0.55 * rakeSpread, 0.05, 0.65 * rakeSpread].forEach((dy) =>
+          filaments.push({ y: yMid + dy, z, type: 'wing' })
+        );
       });
       // Wingtip vortex filaments seeded right at actual span tips
       [-halfSpan * 0.98, -halfSpan * 0.93, halfSpan * 0.93, halfSpan * 0.98].forEach((z) => {
-        [-0.12, 0.18].forEach((y) => filaments.push({ y, z, type: 'vortex' }));
+        [-0.12, 0.18].forEach((dy) => filaments.push({ y: yMid + dy, z, type: 'vortex' }));
       });
       // Engine streams
       if (params.modelType === 'airliner') {
-        [-3.6, 3.6].forEach((z) => filaments.push({ y: -1.35, z, type: 'engine' }));
+        [-halfSpan * 0.38, halfSpan * 0.38].forEach((z) =>
+          filaments.push({ y: yMid - frame.modelHeight * 0.22, z, type: 'engine' })
+        );
       } else if (params.modelType === 'f22') {
-        [-0.67, 0.67].forEach((z) => filaments.push({ y: -0.38, z, type: 'engine' }));
+        [-0.67, 0.67].forEach((z) => filaments.push({ y: yMid - 0.25, z, type: 'engine' }));
       }
     }
 
@@ -1187,17 +1298,30 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
       cl: telemetry.cl,
       cd: telemetry.cd,
       timeSec: performance.now() * 0.001,
+      streamlineResolution: streamlineRes,
       surfaceField: sf,
       calibration: activeCalibrationRef.current,
     };
 
     const densityScale = Math.max(0.4, Math.min(1.6, params.smoke_density));
-    const tubularSegments = 96;
+    const tubularSegments = Math.min(160, Math.max(84, Math.round(96 * streamlineRes)));
     const radialSegments = 6;
     const collectedCurves: TracedCurveData[] = [];
+    const totalPathSpan = Math.max(30, frame.xRecycle - frame.xSpawn + 2);
+    const traceDs = 0.22;
+    const traceSteps = Math.max(150, Math.min(260, Math.ceil(totalPathSpan / traceDs)));
 
     filaments.forEach((fil) => {
-      const pts3D = FluidDynamics3D.traceStreamline({ x: -20, y: fil.y, z: fil.z }, fluid3DParams, 175, 0.21);
+      let seedY = fil.y;
+      if (!FluidDynamics3D.isValidEmitterSeed(frame.xSpawn, seedY, fil.z, fluid3DParams)) {
+        seedY += fil.y >= frame.yMid ? 0.35 : -0.35;
+      }
+      const pts3D = FluidDynamics3D.traceStreamline(
+        { x: frame.xSpawn, y: seedY, z: fil.z },
+        fluid3DParams,
+        traceSteps,
+        traceDs
+      );
       if (pts3D.length < 6) return;
 
       collectedCurves.push({ points: pts3D });
@@ -1217,7 +1341,7 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
         const pt = pts3D[sampleIdx];
 
         let r = 0.2, g = 0.82, b = 0.6;
-        if (pt.isSeparated || (telemetry.isStalled && fil.y > 0 && pt.x > -1)) {
+        if (pt.isSeparated || (telemetry.isStalled && fil.y > frame.yMid && pt.x > -1)) {
           r = 0.94; g = 0.27; b = 0.27; // Turbulent stall separation
         } else if (fil.type === 'engine') {
           r = 0.98; g = 0.55; b = 0.18; // Jet exhaust
@@ -1258,6 +1382,9 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     params.flaps_deg,
     params.viscosity,
     params.smoke_density,
+    params.rake_spread,
+    params.streamline_resolution,
+    params.flowDomainVersion,
     telemetry.cl,
     telemetry.mach,
     telemetry.isStalled,

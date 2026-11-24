@@ -40,13 +40,15 @@ import {
 } from 'lucide-react';
 
 // 3D CFD Workstation Modules
-import { SimulationParams } from './types/aerodynamics';
+import { AircraftModelType, SimulationParams } from './types/aerodynamics';
 import {
   AIRCRAFT_MODELS,
   calculateAeroTelemetry,
+  getNominalPresetState,
   setCustom3DAirfoilConfig,
   setCustom3DGlbConfig,
 } from './utils/airfoilGenerators';
+import { disposeThreeGroupResources } from './utils/aircraftGlbModels';
 import {
   AeroCalibration,
   BoundingBoxDims,
@@ -97,15 +99,28 @@ import type {
   TunnelStats,
 } from './types/airfoil.ts';
 
+// Unified Architecture Orchestrator, Stores & Repository
+import { simulationManager } from './simulation/core/SimulationManager.ts';
+import { createSimulationRepository } from './data/repositories/SimulationRepository.ts';
+import { supabase } from './utils/supabase.ts';
+import { useAircraftStore } from './state/useAircraftStore.ts';
+import { useEnvironmentStore } from './state/useEnvironmentStore.ts';
+import { useResultsStore } from './state/useResultsStore.ts';
+import { useWorkspaceStore } from './state/useWorkspaceStore.ts';
+import { useSimulationStore } from './state/useSimulationStore.ts';
+import type { LbmDiagnosticsReport, SiPhysicsOutput } from './simulation/contracts/SimulationOutput.ts';
+
 type LabMode = '3d' | '2d';
 type PaneTab = 'controls' | 'tunnel' | 'results';
 
+const INITIAL_F22_NOMINAL = getNominalPresetState('f22');
+
 const INITIAL_3D_PARAMS: SimulationParams = {
   modelType: 'f22',
-  angle_of_attack: 6.0,
-  airspeed_kts: 380,
-  altitude_ft: 5000,
-  flaps_deg: 0,
+  angle_of_attack: INITIAL_F22_NOMINAL.angle_of_attack,
+  airspeed_kts: INITIAL_F22_NOMINAL.airspeed_kts,
+  altitude_ft: INITIAL_F22_NOMINAL.altitude_ft,
+  flaps_deg: INITIAL_F22_NOMINAL.flaps_deg,
   viscosity: 0.35,
   smoke_density: 0.8,
   show_streamlines: true,
@@ -120,11 +135,15 @@ const INITIAL_3D_PARAMS: SimulationParams = {
   customAirfoilVersion: 0,
   customGlbVersion: 0,
   customGlbFlipNose: false,
+  customGlbYawDeg: 0,
   show_stagnation_annotation: false,
   show_transition_annotation: false,
   show_separation_annotation: false,
   show_vortex_filaments: false,
   show_downwash_vectors: false,
+  rake_spread: 1.0,
+  streamline_resolution: 1.0,
+  flowDomainVersion: 0,
 };
 
 const FIELD_MODES: Array<[string, string]> = [
@@ -233,6 +252,7 @@ function UnifiedWorkstation({
   }));
   const [isPaused3D, setIsPaused3D] = useState<boolean>(false);
   const [customGlbAsset, setCustomGlbAsset] = useState<CustomGlbAsset | null>(null);
+  const [sessionGlbAssets, setSessionGlbAssets] = useState<CustomGlbAsset[]>([]);
 
   // 2D LBM Airfoil state
   const canvas2DRef = useRef<HTMLCanvasElement>(null);
@@ -312,9 +332,48 @@ function UnifiedWorkstation({
       renderEngine: webglSupported ? 'webgl' : 'canvas',
       customGlbVersion: prev.customGlbVersion,
       customGlbFlipNose: false,
+      customGlbYawDeg: 0,
+      rake_spread: 1.0,
+      streamline_resolution: 1.0,
+      flowDomainVersion: (prev.flowDomainVersion ?? 0) + 1,
     }));
     setIsPaused3D(false);
   }, [webglSupported]);
+
+  const handleSelectModel3D = useCallback(
+    (modelType: AircraftModelType) => {
+      const nominal = getNominalPresetState(
+        modelType,
+        modelType === 'custom_glb' ? customGlbAsset?.calibration ?? null : null
+      );
+      setParams3D((prev) => ({
+        ...prev,
+        modelType,
+        angle_of_attack: nominal.angle_of_attack,
+        airspeed_kts: nominal.airspeed_kts,
+        altitude_ft: nominal.altitude_ft,
+        flaps_deg: nominal.flaps_deg,
+        customGlbYawDeg: modelType === 'custom_glb' ? (prev.customGlbYawDeg ?? 0) : 0,
+        flowDomainVersion: (prev.flowDomainVersion ?? 0) + 1,
+      }));
+    },
+    [customGlbAsset]
+  );
+
+  const handleRotateCustomGlbYaw90 = useCallback(() => {
+    setParams3D((prev) => ({
+      ...prev,
+      customGlbYawDeg: ((prev.customGlbYawDeg ?? 0) + 90) % 360,
+      flowDomainVersion: (prev.flowDomainVersion ?? 0) + 1,
+    }));
+  }, []);
+
+  const handleRefitFlowDomain = useCallback(() => {
+    setParams3D((prev) => ({
+      ...prev,
+      flowDomainVersion: (prev.flowDomainVersion ?? 0) + 1,
+    }));
+  }, []);
 
   const computeOrientedBounds = useCallback(
     (bounds: BoundingBoxDims, cal: AeroCalibration): BoundingBoxDims => {
@@ -333,26 +392,49 @@ function UnifiedWorkstation({
       const orientedBounds = computeOrientedBounds(asset.bounds, cal);
       setCustom3DGlbConfig(asset.fileName, cal, orientedBounds);
       setCustomGlbAsset(asset);
+      setSessionGlbAssets((prev) => {
+        const filtered = prev.filter(
+          (a) => !(a.fileName === asset.fileName && a.fileSizeBytes === asset.fileSizeBytes)
+        );
+        const next = [asset, ...filtered];
+        if (next.length > 12) {
+          const evicted = next.slice(12);
+          for (const old of evicted) {
+            disposeThreeGroupResources(old.unitGroup, {
+              disposeGeometries: true,
+              disposeMaterials: true,
+              disposeTextures: true,
+            });
+          }
+          return next.slice(0, 12);
+        }
+        return next;
+      });
 
-      const suggestedKts = Math.max(20, Math.min(1200, Math.round(cal.cruiseSpeedMs * 1.94384)));
-      const suggestedAoa = Math.max(
-        cal.aoaMinDeg,
-        Math.min(cal.aoaMaxDeg, cal.stallAngleDeg > 0 ? Math.min(4, cal.aoaMaxDeg) : 0)
-      );
+      const nominal = getNominalPresetState('custom_glb', cal);
       const suggestedVisc = Math.max(0.01, Math.min(0.4, Number((cal.viscosity * 0.4).toFixed(2))));
 
       setParams3D((prev) => ({
         ...prev,
         modelType: 'custom_glb',
-        angle_of_attack: suggestedAoa,
-        airspeed_kts: suggestedKts,
+        angle_of_attack: nominal.angle_of_attack,
+        airspeed_kts: nominal.airspeed_kts,
         flaps_deg: 0,
         viscosity: suggestedVisc,
         customGlbFlipNose: false,
+        customGlbYawDeg: 0,
         customGlbVersion: (prev.customGlbVersion || 0) + 1,
+        flowDomainVersion: (prev.flowDomainVersion ?? 0) + 1,
       }));
     },
     [computeOrientedBounds]
+  );
+
+  const handleSelectLocalGlbAsset = useCallback(
+    (asset: CustomGlbAsset) => {
+      handleCustomGlbReady(asset);
+    },
+    [handleCustomGlbReady]
   );
 
   useEffect(() => {
@@ -451,6 +533,7 @@ function UnifiedWorkstation({
     setParams3D((prev) => ({
       ...prev,
       customGlbFlipNose: !prev.customGlbFlipNose,
+      flowDomainVersion: (prev.flowDomainVersion ?? 0) + 1,
     }));
   }, []);
 
@@ -460,7 +543,11 @@ function UnifiedWorkstation({
       ...INITIAL_3D_PARAMS,
       renderEngine: prev.renderEngine ?? (webglSupported ? 'webgl' : 'canvas'),
       customGlbFlipNose: false,
+      customGlbYawDeg: 0,
+      rake_spread: 1.0,
+      streamline_resolution: 1.0,
       customGlbVersion: (prev.customGlbVersion || 0) + 1,
+      flowDomainVersion: (prev.flowDomainVersion ?? 0) + 1,
     }));
   }, [webglSupported]);
 
@@ -669,6 +756,135 @@ function UnifiedWorkstation({
   ]);
 
   const currentModel3D = AIRCRAFT_MODELS[params3D.modelType];
+
+  // Configure repository adapter & subscribe orchestrator events into Zustand state
+  useEffect(() => {
+    simulationManager.setRepository(createSimulationRepository(supabase));
+    return simulationManager.subscribe((event) => {
+      const simStore = useSimulationStore.getState();
+      if (event.type === 'started') simStore.setRunning(event.runId, event.engineId);
+      else if (event.type === 'progress') simStore.setProgress(event.progress, event.stage);
+      else if (event.type === 'completed') simStore.setCompleted(event.metadata);
+      else if (event.type === 'failed') simStore.setFailed(event.error);
+      else if (event.type === 'cancelled') simStore.setCancelled();
+    });
+  }, []);
+
+  // Keep domain Zustand stores synchronized & dispatch off-thread polar/diagnostics workers
+  useEffect(() => {
+    useWorkspaceStore.getState().setLabMode(labMode);
+    useWorkspaceStore.getState().setMobileTab(mobileTab);
+    useWorkspaceStore.getState().setSidebars(showLeftSidebar, showRightSidebar);
+    useAircraftStore.getState().setModelType(params3D.modelType);
+    useAircraftStore.getState().setCustomGlbAsset(customGlbAsset);
+    useAircraftStore
+      .getState()
+      .setOrientationOverrides(Boolean(params3D.customGlbFlipNose), params3D.customGlbYawDeg ?? 0);
+    useEnvironmentStore.getState().setFlightInputs({
+      angleOfAttackDeg: params3D.angle_of_attack,
+      airspeedKts: params3D.airspeed_kts,
+      altitudeFt: params3D.altitude_ft,
+      flapsDeg: params3D.flaps_deg,
+      chord_m: currentModel3D?.chord ?? 2.0,
+    });
+    useResultsStore.getState().setTelemetry3D(telemetry3D);
+
+    let active = true;
+    const geometryHash = customGlbAsset?.geometryMetadata?.geometryHash ?? `preset:${params3D.modelType}`;
+    void simulationManager
+      .execute<
+        {
+          modelType: SimulationParams['modelType'];
+          angleOfAttackDeg: number;
+          airspeedKts: number;
+          altitudeFt: number;
+          flapsDeg: number;
+          includePolarSweep: boolean;
+        },
+        SiPhysicsOutput
+      >(
+        'si-physics',
+        {
+          modelType: params3D.modelType,
+          angleOfAttackDeg: params3D.angle_of_attack,
+          airspeedKts: params3D.airspeed_kts,
+          altitudeFt: params3D.altitude_ft,
+          flapsDeg: params3D.flaps_deg,
+          includePolarSweep: true,
+        },
+        {
+          geometryHash,
+          supersedePreviousForEngine: true,
+          modelName: currentModel3D?.name ?? params3D.modelType,
+        }
+      )
+      .then((res) => {
+        if (active) {
+          useResultsStore.getState().setTelemetry3D(res.result.telemetry, res.result.polarSweep);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      active = false;
+    };
+  }, [
+    labMode,
+    mobileTab,
+    showLeftSidebar,
+    showRightSidebar,
+    params3D.modelType,
+    params3D.angle_of_attack,
+    params3D.airspeed_kts,
+    params3D.altitude_ft,
+    params3D.flaps_deg,
+    params3D.customGlbFlipNose,
+    params3D.customGlbYawDeg,
+    customGlbAsset,
+    currentModel3D,
+    telemetry3D,
+  ]);
+
+  // Run 2D LBM Mach/BGK stability diagnostics via tunnel2d Web Worker when in 2D mode
+  useEffect(() => {
+    if (labMode !== '2d') return;
+    let active = true;
+    void simulationManager
+      .execute<
+        {
+          airfoilName: string;
+          coords: Coord2D[];
+          alphaDeg: number;
+          u0: number;
+          observedCl?: number | null;
+          observedCd?: number | null;
+          observedSeparationPct?: number;
+        },
+        LbmDiagnosticsReport
+      >(
+        'lbm-2d',
+        {
+          airfoilName: airfoil.name,
+          coords: activeCoords,
+          alphaDeg: alpha2D,
+          u0: u0Scaled / 1000,
+          observedCl: stats2D.cl,
+          observedCd: stats2D.cd,
+          observedSeparationPct: stats2D.separationPct,
+        },
+        { supersedePreviousForEngine: true }
+      )
+      .then((res) => {
+        if (active) {
+          useResultsStore.getState().setLbmDiagnostics2D(res.result);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      active = false;
+    };
+  }, [labMode, airfoil.name, activeCoords, alpha2D, u0Scaled, stats2D.cl, stats2D.cd, stats2D.separationPct]);
 
   // Sync visual engineering annotations into the 2D D2Q9 LBM canvas when in 2D mode
   useEffect(() => {
@@ -1032,6 +1248,7 @@ function UnifiedWorkstation({
             <ControlsDeck
               params={params3D}
               onParamChange={handleParam3DChange}
+              onSelectModel={handleSelectModel3D}
               isPaused={isPaused3D}
               onTogglePause={() => setIsPaused3D((prev) => !prev)}
               onReset={handleReset3D}
@@ -1039,11 +1256,15 @@ function UnifiedWorkstation({
               onOpenModelInspector={() => setIsModelViewerOpen(true)}
               onOpen2DLab={handleOpen2DFrom3D}
               customGlbAsset={customGlbAsset}
+              localGlbAssets={sessionGlbAssets}
+              onSelectLocalGlbAsset={handleSelectLocalGlbAsset}
               onCustomGlbReady={handleCustomGlbReady}
               onCustomGlbCloudLinked={handleCustomGlbCloudLinked}
               onCustomGlbCalibrationUpdated={handleCustomGlbCalibrationUpdated}
               onFlipCustomGlbNose={handleFlipCustomGlbNose}
+              onRotateCustomGlbYaw90={handleRotateCustomGlbYaw90}
               onResetCustomGlbToDefault={handleResetCustomGlbToDefault}
+              onRefitFlowDomain={handleRefitFlowDomain}
             />
           ) : (
             <form onSubmit={(e) => e.preventDefault()} className="flex flex-col gap-3">
@@ -1748,9 +1969,9 @@ function UnifiedWorkstation({
         isOpen={isModelViewerOpen}
         onClose={() => setIsModelViewerOpen(false)}
         activeModelType={params3D.modelType}
-        onSelectModel={(modelType) => handleParam3DChange('modelType', modelType)}
+        onSelectModel={handleSelectModel3D}
         onApplyToWindTunnel={(modelType) => {
-          handleParam3DChange('modelType', modelType);
+          handleSelectModel3D(modelType);
           setLabMode('3d');
         }}
       />
