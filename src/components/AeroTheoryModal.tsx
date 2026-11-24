@@ -18,6 +18,7 @@ import {
   downloadEngineeringJsonReport,
   downloadEngineeringMarkdownReport,
   downloadEngineeringPdfReport,
+  ensurePdfFontsLoaded,
 } from '../utils/engineeringReport';
 
 interface AeroTheoryModalProps {
@@ -302,8 +303,11 @@ export const AeroTheoryModal: React.FC<AeroTheoryModalProps> = ({
             <button
               type="button"
               onClick={() => {
-                downloadEngineeringPdfReport(params.modelType, params, telemetry);
-                flashMsg('PDF Saved');
+                void (async () => {
+                  await ensurePdfFontsLoaded();
+                  downloadEngineeringPdfReport(params.modelType, params, telemetry);
+                  flashMsg('PDF Saved');
+                })();
               }}
               className="px-2 py-2 rounded-lg bg-[#1769AA] hover:bg-[#145a92] text-white text-[11px] font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
             >

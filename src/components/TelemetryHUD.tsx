@@ -9,6 +9,7 @@ import {
   downloadEngineeringJsonReport,
   downloadEngineeringMarkdownReport,
   downloadEngineeringPdfReport,
+  ensurePdfFontsLoaded,
 } from '../utils/engineeringReport';
 import { workerClient } from '../simulation/workers/workerClient';
 import type { ExportReportOutput } from '../simulation/contracts/SimulationOutput';
@@ -136,9 +137,11 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = ({
           URL.revokeObjectURL(url);
         }, 2000);
       } else {
+        await ensurePdfFontsLoaded();
         downloadEngineeringPdfReport(modelType, params, telemetry);
       }
     } catch {
+      await ensurePdfFontsLoaded();
       downloadEngineeringPdfReport(modelType, params, telemetry);
     }
     setExportSuccessMsg('Engineering Report (.pdf) Saved');

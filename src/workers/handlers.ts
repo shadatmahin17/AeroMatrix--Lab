@@ -29,6 +29,7 @@ import { validateRawTriangleSoup } from '../geometry/validation/meshValidator';
 import { evaluateLbmDiagnostics, rasterizeLbmSolidMask } from '../lib/lbm/lbmDiagnostics';
 import {
   buildEngineeringReportBundle,
+  ensurePdfFontsLoaded,
   formatEngineeringReportMarkdown,
   generateEngineeringPdfBlob,
 } from '../utils/engineeringReport';
@@ -324,6 +325,7 @@ export async function runExportReportTaskAsync(
     input.params.flaps_deg
   );
   onProgress?.(0.7, 'Rendering A4 verification PDF');
+  await ensurePdfFontsLoaded();
   const { blob, fileName } = generateEngineeringPdfBlob(input.modelType, input.params, telemetry);
   const buffer = await blob.arrayBuffer();
   onProgress?.(1.0, 'Complete');

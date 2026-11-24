@@ -1,14 +1,18 @@
 import { Point2D, PolygonSurfacePoint, AircraftModelType, AircraftModelConfig, AeroTelemetry, ChordwiseCpStation } from '../types/aerodynamics';
 import { AeroCalibration, BoundingBoxDims, DEFAULT_CALIBRATION, formatModelClassLabel } from '../lib/calibration';
 import {
+  alphaSweep,
+  type AlphaSweepResult,
   computeChordwiseCpAndLift,
   computeDimensionlessAndGuardrails,
   computeFiniteWingAerodynamics,
   computeFlatPlateSkinFriction,
+  computeHelmboldLiftCurveSlopeRad,
   computeISA,
   computeSeparationOnset,
   computeTotalDrag,
   ISA_CONSTANTS,
+  PRESET_PLANFORMS,
   SOLVER_LABEL_3D,
 } from '../lib/aeroPhysics';
 
@@ -18,18 +22,20 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     name: 'F-22 Raptor (Fighter)',
     category: 'Fighter',
     description: 'Stealth air dominance fighter with chined forebody, razor-thin diamond wing section, and vortex lift at high AoA.',
-    wingspan: 13.56,
-    chord: 4.8,
-    sweepDeg: 42,
-    oswaldEfficiency: 0.76,
-    thicknessRatio: 0.055,
-    camberRatio: 0.01,
-    stallAngle: 22,
-    cl0: 0.12,
-    clMax: 1.85,
-    cd0: 0.019,
-    flapCapable: false,
-    supersonicCapable: true,
+    wingspan: PRESET_PLANFORMS.f22.wingspan_m,
+    wingArea_m2: PRESET_PLANFORMS.f22.wingArea_m2, // Published F-22 reference planform area (78.04 m^2)
+    chord: PRESET_PLANFORMS.f22.wingArea_m2 / PRESET_PLANFORMS.f22.wingspan_m, // Mean geometric chord c_bar = S / b (5.76 m)
+    sweepDeg: PRESET_PLANFORMS.f22.sweepDeg, // Assumed sweep Lambda at max-thickness line (30 deg)
+    oswaldEfficiency: PRESET_PLANFORMS.f22.oswaldEfficiency,
+    thicknessRatio: PRESET_PLANFORMS.f22.thicknessRatio,
+    camberRatio: PRESET_PLANFORMS.f22.camberRatio,
+    stallAngle: PRESET_PLANFORMS.f22.stallAngleDeg,
+    cl0: PRESET_PLANFORMS.f22.cl0,
+    alphaZeroLift: PRESET_PLANFORMS.f22.alphaZeroLiftDeg,
+    clMax: PRESET_PLANFORMS.f22.clMax,
+    cd0: PRESET_PLANFORMS.f22.cd0,
+    flapCapable: PRESET_PLANFORMS.f22.flapCapable,
+    supersonicCapable: PRESET_PLANFORMS.f22.supersonicCapable,
     glbPath: '/models/f22_raptor.glb',
     hasGlbModel: true,
     referenceWeight_N: 294_000,
@@ -40,18 +46,20 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     name: 'Boeing 787 (Transport)',
     category: 'Commercial',
     description: 'Transonic widebody airliner with supercritical high-lift cambered wing section and underslung high-bypass turbofan.',
-    wingspan: 60.1,
-    chord: 6.5,
-    sweepDeg: 32,
-    oswaldEfficiency: 0.85,
-    thicknessRatio: 0.11,
-    camberRatio: 0.024,
-    stallAngle: 15,
-    cl0: 0.38,
-    clMax: 2.25,
-    cd0: 0.024,
-    flapCapable: true,
-    supersonicCapable: false,
+    wingspan: PRESET_PLANFORMS.airliner.wingspan_m,
+    wingArea_m2: PRESET_PLANFORMS.airliner.wingArea_m2, // Placeholder: published Boeing 787-8 reference wing area
+    chord: PRESET_PLANFORMS.airliner.wingArea_m2 / PRESET_PLANFORMS.airliner.wingspan_m, // c_bar = S / b
+    sweepDeg: PRESET_PLANFORMS.airliner.sweepDeg, // Placeholder: max-thickness line sweep
+    oswaldEfficiency: PRESET_PLANFORMS.airliner.oswaldEfficiency,
+    thicknessRatio: PRESET_PLANFORMS.airliner.thicknessRatio,
+    camberRatio: PRESET_PLANFORMS.airliner.camberRatio,
+    stallAngle: PRESET_PLANFORMS.airliner.stallAngleDeg,
+    cl0: PRESET_PLANFORMS.airliner.cl0,
+    alphaZeroLift: PRESET_PLANFORMS.airliner.alphaZeroLiftDeg,
+    clMax: PRESET_PLANFORMS.airliner.clMax,
+    cd0: PRESET_PLANFORMS.airliner.cd0,
+    flapCapable: PRESET_PLANFORMS.airliner.flapCapable,
+    supersonicCapable: PRESET_PLANFORMS.airliner.supersonicCapable,
     glbPath: '/models/boeing_787.glb',
     hasGlbModel: true,
     referenceWeight_N: 2_230_000,
@@ -62,20 +70,20 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     name: 'Airfoil Section (NACA 2412)',
     category: 'Airfoil',
     description: 'Classic cambered aviation airfoil (Cessna 172). 2% max camber at 40% chord with 12% thickness. Positive lift at 0° AoA.',
-    wingspan: 11.0,
-    chord: 1.6,
-    sweepDeg: 0,
-    oswaldEfficiency: 0.82,
-    thicknessRatio: 0.12,
-    camberRatio: 0.02,
-    stallAngle: 16,
-    // 2D section Cl0 ≈ 0.25 with α_{L=0} = -2.1°; 3D finite-wing CL(0) scales with CLα(AR, M) around α_{L=0}
-    cl0: 0.25,
-    alphaZeroLift: -2.1,
-    clMax: 1.62,
-    cd0: 0.008,
-    flapCapable: true,
-    supersonicCapable: false,
+    wingspan: PRESET_PLANFORMS.naca2412.wingspan_m,
+    wingArea_m2: PRESET_PLANFORMS.naca2412.wingArea_m2, // Placeholder: rectangular test wing (11.0 * 1.6 m^2)
+    chord: PRESET_PLANFORMS.naca2412.wingArea_m2 / PRESET_PLANFORMS.naca2412.wingspan_m,
+    sweepDeg: PRESET_PLANFORMS.naca2412.sweepDeg, // Unswept rectangular section
+    oswaldEfficiency: PRESET_PLANFORMS.naca2412.oswaldEfficiency,
+    thicknessRatio: PRESET_PLANFORMS.naca2412.thicknessRatio,
+    camberRatio: PRESET_PLANFORMS.naca2412.camberRatio,
+    stallAngle: PRESET_PLANFORMS.naca2412.stallAngleDeg,
+    cl0: PRESET_PLANFORMS.naca2412.cl0,
+    alphaZeroLift: PRESET_PLANFORMS.naca2412.alphaZeroLiftDeg,
+    clMax: PRESET_PLANFORMS.naca2412.clMax,
+    cd0: PRESET_PLANFORMS.naca2412.cd0,
+    flapCapable: PRESET_PLANFORMS.naca2412.flapCapable,
+    supersonicCapable: PRESET_PLANFORMS.naca2412.supersonicCapable,
     glbPath: '/models/airfoil.glb',
     hasGlbModel: true,
     nominalTestPoint: { aoaDeg: 4.0, airspeed_kts: 150, altitude_ft: 0, flapsDeg: 0 },
@@ -85,19 +93,20 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     name: 'NACA 0012 (Symmetric)',
     category: 'Airfoil',
     description: 'Zero camber symmetrical airfoil used on aerobatic aircraft and helicopter rotor blades. 0 lift at 0° AoA.',
-    wingspan: 10.0,
-    chord: 1.5,
-    sweepDeg: 0,
-    oswaldEfficiency: 0.82,
-    thicknessRatio: 0.12,
-    camberRatio: 0.0,
-    stallAngle: 15,
-    cl0: 0.0,
-    alphaZeroLift: 0.0,
-    clMax: 1.45,
-    cd0: 0.007,
-    flapCapable: true,
-    supersonicCapable: false,
+    wingspan: PRESET_PLANFORMS.naca0012.wingspan_m,
+    wingArea_m2: PRESET_PLANFORMS.naca0012.wingArea_m2, // Placeholder: rectangular test wing (10.0 * 1.5 m^2)
+    chord: PRESET_PLANFORMS.naca0012.wingArea_m2 / PRESET_PLANFORMS.naca0012.wingspan_m,
+    sweepDeg: PRESET_PLANFORMS.naca0012.sweepDeg, // Unswept rectangular section
+    oswaldEfficiency: PRESET_PLANFORMS.naca0012.oswaldEfficiency,
+    thicknessRatio: PRESET_PLANFORMS.naca0012.thicknessRatio,
+    camberRatio: PRESET_PLANFORMS.naca0012.camberRatio,
+    stallAngle: PRESET_PLANFORMS.naca0012.stallAngleDeg,
+    cl0: PRESET_PLANFORMS.naca0012.cl0,
+    alphaZeroLift: PRESET_PLANFORMS.naca0012.alphaZeroLiftDeg,
+    clMax: PRESET_PLANFORMS.naca0012.clMax,
+    cd0: PRESET_PLANFORMS.naca0012.cd0,
+    flapCapable: PRESET_PLANFORMS.naca0012.flapCapable,
+    supersonicCapable: PRESET_PLANFORMS.naca0012.supersonicCapable,
     glbPath: '/models/airfoil.glb',
     hasGlbModel: true,
     nominalTestPoint: { aoaDeg: 0.0, airspeed_kts: 150, altitude_ft: 0, flapsDeg: 0 },
@@ -107,19 +116,20 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     name: 'Validation Wing: Rectangular AR 6 (NACA 0012)',
     category: 'Airfoil',
     description: 'Unswept rectangular Prandtl lifting-line validation wing (b=9.0 m, c=1.5 m, AR=6.0 exact, e=0.95) at Re=3.0×10⁶, M=0.15.',
-    wingspan: 9.0,
-    chord: 1.5,
-    sweepDeg: 0,
-    oswaldEfficiency: 0.95,
-    thicknessRatio: 0.12,
-    camberRatio: 0.0,
-    stallAngle: 15,
-    cl0: 0.0,
-    alphaZeroLift: 0.0,
-    clMax: 1.45,
-    cd0: 0.007,
-    flapCapable: false,
-    supersonicCapable: false,
+    wingspan: PRESET_PLANFORMS.validation_wing.wingspan_m,
+    wingArea_m2: PRESET_PLANFORMS.validation_wing.wingArea_m2, // Exact rectangular AR = 6.0 planform
+    chord: PRESET_PLANFORMS.validation_wing.wingArea_m2 / PRESET_PLANFORMS.validation_wing.wingspan_m,
+    sweepDeg: PRESET_PLANFORMS.validation_wing.sweepDeg, // Unswept rectangular wing
+    oswaldEfficiency: PRESET_PLANFORMS.validation_wing.oswaldEfficiency,
+    thicknessRatio: PRESET_PLANFORMS.validation_wing.thicknessRatio,
+    camberRatio: PRESET_PLANFORMS.validation_wing.camberRatio,
+    stallAngle: PRESET_PLANFORMS.validation_wing.stallAngleDeg,
+    cl0: PRESET_PLANFORMS.validation_wing.cl0,
+    alphaZeroLift: PRESET_PLANFORMS.validation_wing.alphaZeroLiftDeg,
+    clMax: PRESET_PLANFORMS.validation_wing.clMax,
+    cd0: PRESET_PLANFORMS.validation_wing.cd0,
+    flapCapable: PRESET_PLANFORMS.validation_wing.flapCapable,
+    supersonicCapable: PRESET_PLANFORMS.validation_wing.supersonicCapable,
     nominalTestPoint: { aoaDeg: 6.0, airspeed_kts: 99, altitude_ft: 2750, flapsDeg: 0 },
   },
   custom_airfoil: {
@@ -127,19 +137,20 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     name: '2D Lab Airfoil (Custom Wing)',
     category: 'Airfoil',
     description: 'Extruded 3D finite wing built directly from your active 2D Airfoil Lab geometry, .dat upload, or Bézier shape edits.',
-    wingspan: 10.5,
-    chord: 1.55,
-    sweepDeg: 0,
-    oswaldEfficiency: 0.82,
-    thicknessRatio: 0.12,
-    camberRatio: 0.015,
-    stallAngle: 15.5,
-    cl0: 0.0,
-    alphaZeroLift: 0.0,
-    clMax: 1.5,
-    cd0: 0.008,
-    flapCapable: true,
-    supersonicCapable: false,
+    wingspan: PRESET_PLANFORMS.custom_airfoil.wingspan_m,
+    wingArea_m2: PRESET_PLANFORMS.custom_airfoil.wingArea_m2, // Placeholder: extruded rectangular wing
+    chord: PRESET_PLANFORMS.custom_airfoil.wingArea_m2 / PRESET_PLANFORMS.custom_airfoil.wingspan_m,
+    sweepDeg: PRESET_PLANFORMS.custom_airfoil.sweepDeg,
+    oswaldEfficiency: PRESET_PLANFORMS.custom_airfoil.oswaldEfficiency,
+    thicknessRatio: PRESET_PLANFORMS.custom_airfoil.thicknessRatio,
+    camberRatio: PRESET_PLANFORMS.custom_airfoil.camberRatio,
+    stallAngle: PRESET_PLANFORMS.custom_airfoil.stallAngleDeg,
+    cl0: PRESET_PLANFORMS.custom_airfoil.cl0,
+    alphaZeroLift: PRESET_PLANFORMS.custom_airfoil.alphaZeroLiftDeg,
+    clMax: PRESET_PLANFORMS.custom_airfoil.clMax,
+    cd0: PRESET_PLANFORMS.custom_airfoil.cd0,
+    flapCapable: PRESET_PLANFORMS.custom_airfoil.flapCapable,
+    supersonicCapable: PRESET_PLANFORMS.custom_airfoil.supersonicCapable,
     nominalTestPoint: { aoaDeg: 4.0, airspeed_kts: 150, altitude_ft: 0, flapsDeg: 0 },
   },
   custom_glb: {
@@ -147,19 +158,20 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     name: 'Custom .glb Model',
     category: 'Commercial',
     description: 'User-uploaded 3D GLB mesh analyzed and calibrated locally via 3D PCA and geometric surface analysis.',
-    wingspan: 14.0,
-    chord: 4.0,
-    sweepDeg: 18,
-    oswaldEfficiency: 0.80,
-    thicknessRatio: 0.10,
-    camberRatio: 0.015,
-    stallAngle: 16,
-    cl0: 0.15,
-    alphaZeroLift: -1.8,
-    clMax: 1.65,
-    cd0: 0.028,
-    flapCapable: false,
-    supersonicCapable: false,
+    wingspan: PRESET_PLANFORMS.custom_glb.wingspan_m,
+    wingArea_m2: PRESET_PLANFORMS.custom_glb.wingArea_m2, // Placeholder prior to user .glb upload
+    chord: PRESET_PLANFORMS.custom_glb.wingArea_m2 / PRESET_PLANFORMS.custom_glb.wingspan_m,
+    sweepDeg: PRESET_PLANFORMS.custom_glb.sweepDeg, // Placeholder prior to user .glb calibration
+    oswaldEfficiency: PRESET_PLANFORMS.custom_glb.oswaldEfficiency,
+    thicknessRatio: PRESET_PLANFORMS.custom_glb.thicknessRatio,
+    camberRatio: PRESET_PLANFORMS.custom_glb.camberRatio,
+    stallAngle: PRESET_PLANFORMS.custom_glb.stallAngleDeg,
+    cl0: PRESET_PLANFORMS.custom_glb.cl0,
+    alphaZeroLift: PRESET_PLANFORMS.custom_glb.alphaZeroLiftDeg,
+    clMax: PRESET_PLANFORMS.custom_glb.clMax,
+    cd0: PRESET_PLANFORMS.custom_glb.cd0,
+    flapCapable: PRESET_PLANFORMS.custom_glb.flapCapable,
+    supersonicCapable: PRESET_PLANFORMS.custom_glb.supersonicCapable,
     hasGlbModel: true,
     nominalTestPoint: { aoaDeg: 4.0, airspeed_kts: 250, altitude_ft: 5000, flapsDeg: 0 },
   },
@@ -168,18 +180,20 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     name: 'Concorde (SST Cruiser)',
     category: 'Supersonic',
     description: 'Slender ogival delta wing optimized for Mach 2.04 cruise. Sharp leading edge producing sharp Mach shockwaves.',
-    wingspan: 25.6,
-    chord: 9.2,
-    sweepDeg: 55,
-    oswaldEfficiency: 0.62,
-    thicknessRatio: 0.035,
-    camberRatio: 0.008,
-    stallAngle: 19,
-    cl0: 0.05,
-    clMax: 1.40,
-    cd0: 0.015,
-    flapCapable: false,
-    supersonicCapable: true,
+    wingspan: PRESET_PLANFORMS.concorde.wingspan_m,
+    wingArea_m2: PRESET_PLANFORMS.concorde.wingArea_m2, // Placeholder: published Concorde ogival delta area
+    chord: PRESET_PLANFORMS.concorde.wingArea_m2 / PRESET_PLANFORMS.concorde.wingspan_m,
+    sweepDeg: PRESET_PLANFORMS.concorde.sweepDeg, // Placeholder: effective delta max-thickness sweep
+    oswaldEfficiency: PRESET_PLANFORMS.concorde.oswaldEfficiency,
+    thicknessRatio: PRESET_PLANFORMS.concorde.thicknessRatio,
+    camberRatio: PRESET_PLANFORMS.concorde.camberRatio,
+    stallAngle: PRESET_PLANFORMS.concorde.stallAngleDeg,
+    cl0: PRESET_PLANFORMS.concorde.cl0,
+    alphaZeroLift: PRESET_PLANFORMS.concorde.alphaZeroLiftDeg,
+    clMax: PRESET_PLANFORMS.concorde.clMax,
+    cd0: PRESET_PLANFORMS.concorde.cd0,
+    flapCapable: PRESET_PLANFORMS.concorde.flapCapable,
+    supersonicCapable: PRESET_PLANFORMS.concorde.supersonicCapable,
     glbPath: '/models/concorde_free_with_interior.glb',
     hasGlbModel: true,
     referenceWeight_N: 1_815_000,
@@ -190,19 +204,20 @@ export const AIRCRAFT_MODELS: Record<AircraftModelType, AircraftModelConfig> = {
     name: 'Circular Cylinder (Bluff Body)',
     category: 'Bluff Body',
     description: 'Classic fluid dynamics baseline object showcasing symmetric boundary layer separation and von Kármán vortex streets.',
-    wingspan: 5.0,
-    chord: 2.0,
-    sweepDeg: 0,
-    oswaldEfficiency: 0.70,
-    thicknessRatio: 0.44,
-    camberRatio: 0.0,
-    stallAngle: 0,
-    cl0: 0.0,
-    alphaZeroLift: 0.0,
-    clMax: 0.2,
-    cd0: 1.15,
-    flapCapable: false,
-    supersonicCapable: false,
+    wingspan: PRESET_PLANFORMS.cylinder.wingspan_m,
+    wingArea_m2: PRESET_PLANFORMS.cylinder.wingArea_m2, // Placeholder: projected cylinder area (b * D)
+    chord: PRESET_PLANFORMS.cylinder.wingArea_m2 / PRESET_PLANFORMS.cylinder.wingspan_m,
+    sweepDeg: PRESET_PLANFORMS.cylinder.sweepDeg,
+    oswaldEfficiency: PRESET_PLANFORMS.cylinder.oswaldEfficiency,
+    thicknessRatio: PRESET_PLANFORMS.cylinder.thicknessRatio,
+    camberRatio: PRESET_PLANFORMS.cylinder.camberRatio,
+    stallAngle: PRESET_PLANFORMS.cylinder.stallAngleDeg,
+    cl0: PRESET_PLANFORMS.cylinder.cl0,
+    alphaZeroLift: PRESET_PLANFORMS.cylinder.alphaZeroLiftDeg,
+    clMax: PRESET_PLANFORMS.cylinder.clMax,
+    cd0: PRESET_PLANFORMS.cylinder.cd0,
+    flapCapable: PRESET_PLANFORMS.cylinder.flapCapable,
+    supersonicCapable: PRESET_PLANFORMS.cylinder.supersonicCapable,
     nominalTestPoint: { aoaDeg: 0.0, airspeed_kts: 140, altitude_ft: 1000, flapsDeg: 0 },
   }
 };
@@ -294,7 +309,10 @@ export function setCustom3DGlbConfig(
   AIRCRAFT_MODELS.custom_glb.category = category;
   AIRCRAFT_MODELS.custom_glb.description = `Uploaded 3D .glb calibrated as ${classLabel}. Nose aligned to -X, Oswald e=${calibration.oswaldEfficiency.toFixed(2)}, CLα=${calibration.liftSlope.toFixed(2)} rad⁻¹.`;
   AIRCRAFT_MODELS.custom_glb.wingspan = Number(refSpan.toFixed(2));
-  AIRCRAFT_MODELS.custom_glb.chord = Number(refChord.toFixed(2));
+  AIRCRAFT_MODELS.custom_glb.wingArea_m2 = Number((refSpan * refChord).toFixed(2));
+  AIRCRAFT_MODELS.custom_glb.chord = Number(
+    (AIRCRAFT_MODELS.custom_glb.wingArea_m2 / AIRCRAFT_MODELS.custom_glb.wingspan).toFixed(3)
+  );
   AIRCRAFT_MODELS.custom_glb.sweepDeg = calibration.modelClass === 'delta_fighter' ? 48 : calibration.modelClass === 'airliner' ? 30 : 12;
   AIRCRAFT_MODELS.custom_glb.oswaldEfficiency = calibration.oswaldEfficiency;
   AIRCRAFT_MODELS.custom_glb.thicknessRatio =
@@ -727,53 +745,21 @@ export function getEffectiveStallAngles(
 
 /**
  * Finite-wing lift curve slope CLα (per degree) incorporating aspect ratio,
- * quarter-chord sweep, and compressibility (Helmbold + Prandtl-Glauert subsonic,
- * smooth transonic blend, and Ackeret finite-wing supersonic theory).
+ * max-thickness sweep Lambda, compressibility beta = sqrt(1 - M^2), and eta = 0.95.
  */
 export function calculateFiniteWingLiftSlopePerDeg(
   aspectRatio: number,
   sweepDeg: number,
   mach: number
 ): number {
-  const ar = Math.max(1.5, aspectRatio);
-  const tanSweep = Math.tan((sweepDeg * Math.PI) / 180);
-
-  const helmboldSubsonicRad = (m: number) => {
-    const beta = Math.sqrt(Math.max(0.1, 1 - m * m));
-    const sweepTerm = 1 + (tanSweep * tanSweep) / (beta * beta);
-    return (
-      (2 * Math.PI * ar) /
-      (2 + Math.sqrt(4 + ar * ar * beta * beta * sweepTerm))
-    );
-  };
-
-  const ackeretSupersonicRad = (m: number) => {
-    const betaSup = Math.sqrt(Math.max(0.05, m * m - 1));
-    const arBeta = ar * betaSup;
-    const tipFactor = arBeta >= 1 ? 1 - 1 / (2 * arBeta) : 0.5 * arBeta;
-    return (4 / betaSup) * Math.max(0.25, tipFactor);
-  };
-
-  let slopePerRad: number;
-  if (mach <= 0.82) {
-    slopePerRad = helmboldSubsonicRad(mach);
-  } else if (mach >= 1.2) {
-    slopePerRad = ackeretSupersonicRad(mach);
-  } else {
-    const t = (mach - 0.82) / (1.2 - 0.82);
-    const w = 0.5 - 0.5 * Math.cos(Math.PI * t);
-    slopePerRad =
-      (1 - w) * helmboldSubsonicRad(0.82) + w * ackeretSupersonicRad(1.2);
-  }
-
-  return slopePerRad * (Math.PI / 180);
+  return computeHelmboldLiftCurveSlopeRad(aspectRatio, sweepDeg, mach, 0.95) * (Math.PI / 180);
 }
 
 /**
  * Internal SI aerodynamic solver returning telemetry + chordwise Cp stations.
  * All internal variables are strictly SI (m, s, kg, Pa, K, rad).
  */
-function solveAeroStateSI(
+export function solveAeroStateSI(
   type: AircraftModelType,
   aoaDeg: number,
   airspeedMs: number,
@@ -784,13 +770,17 @@ function solveAeroStateSI(
   const clampedAltM = Math.max(0, Math.min(ISA_CONSTANTS.MAX_ALTITUDE_M, altitudeM));
   const safeAirspeedMs = Math.max(0.1, airspeedMs);
 
+  const wingArea_m2 = config.wingArea_m2;
+  const meanChord_m = wingArea_m2 / config.wingspan;
+  const aspectRatio = (config.wingspan * config.wingspan) / Math.max(1e-4, wingArea_m2);
+
   const isa = computeISA(clampedAltM);
   const dim = computeDimensionlessAndGuardrails({
     density_kg_m3: isa.density_kg_m3,
     dynamicViscosity_Pa_s: isa.dynamicViscosity_Pa_s,
     speedOfSound_ms: isa.speedOfSound_ms,
     velocity_ms: safeAirspeedMs,
-    chord_m: config.chord,
+    chord_m: meanChord_m,
   });
 
   const mach = dim.mach;
@@ -798,12 +788,10 @@ function solveAeroStateSI(
   const dynP = dim.dynamicPressure_Pa;
   const reynolds = dim.reynolds;
 
-  const wingArea_m2 = config.wingspan * config.chord;
-  const aspectRatio = (config.wingspan * config.wingspan) / Math.max(1e-4, wingArea_m2);
   const customCal = type === 'custom_glb' ? activeCustomGlbCalibration : null;
   const oswaldEfficiency = Math.max(
     0.1,
-    Math.min(1.0, customCal ? customCal.oswaldEfficiency : (config.oswaldEfficiency ?? 0.82))
+    Math.min(1.0, customCal ? customCal.oswaldEfficiency : config.oswaldEfficiency)
   );
 
   // Flap lift & profile drag increments
@@ -833,6 +821,7 @@ function solveAeroStateSI(
   });
 
   let cl = 0;
+  let clAlphaPerRad = 0;
   // Strictly use the exact preset cd0 defined in AIRCRAFT_MODELS (+ flap drag increment when flaps deflected)
   const cd0 = config.cd0 + flapDragBonus;
   let cdSep = 0;
@@ -842,10 +831,10 @@ function solveAeroStateSI(
     cl = 0.05 * Math.sin((aoaDeg * Math.PI) / 180);
     cdSep = 0.1 * Math.sin(Math.abs(aoaDeg * 0.1));
   } else {
-    const sweepDeg = config.sweepDeg ?? 0;
-    const liftSlopePerDeg = customCal
-      ? (customCal.liftSlope * Math.PI) / 180
-      : calculateFiniteWingLiftSlopePerDeg(aspectRatio, sweepDeg, mach);
+    clAlphaPerRad = customCal
+      ? customCal.liftSlope
+      : computeHelmboldLiftCurveSlopeRad(aspectRatio, config.sweepDeg, mach, 0.95);
+    const liftSlopePerDeg = clAlphaPerRad * (Math.PI / 180);
 
     // 2D thin-airfoil incompressible slope ~ 2*pi rad^-1 = 0.10966 / deg
     const thinAirfoilSlopePerDeg = (2 * Math.PI * Math.PI) / 180;
@@ -856,7 +845,7 @@ function solveAeroStateSI(
       liftSlopePerDeg * (aoa - alphaZeroLift) + flapLiftBonus;
 
     const clMaxEff = config.clMax + flapLiftBonus;
-    const isSymmetric = config.cl0 === 0 && effectiveFlap === 0;
+    const isSymmetric = config.cl0 === 0 && (config.alphaZeroLift ?? 0) === 0 && effectiveFlap === 0;
     const clMinEff = isSymmetric ? -config.clMax : -config.clMax * 0.85 + flapLiftBonus * 0.5;
 
     if (sep.xSeparationUpper >= 0.999) {
@@ -881,9 +870,9 @@ function solveAeroStateSI(
         ? Math.min(0.98, Math.pow(sep.separationIntensity, 1.65) * 0.72 * wakeGain)
         : 0;
 
-    // Empirical transonic / Ackeret supersonic wave drag
+    // Empirical transonic / Ackeret supersonic wave drag (0 below M = 0.7)
     const mCrit = config.supersonicCapable ? 0.92 : 0.78;
-    if (mach > mCrit) {
+    if (mach > 0.7 && mach > mCrit) {
       if (mach <= 1.05) {
         cdWave = 0.04 * Math.pow((mach - mCrit) / (1.05 - mCrit), 2);
       } else {
@@ -895,26 +884,19 @@ function solveAeroStateSI(
   // Pure SI finite-wing lifting-line metrics (alpha_i, downwash epsilon = 2*alpha_i, CDi, Gamma_eq, Gamma_0, Lift)
   const finiteWing = computeFiniteWingAerodynamics({
     wingspan_m: config.wingspan,
-    chord_m: config.chord,
+    wingArea_m2,
     oswaldEfficiency,
     cl,
     velocity_ms: safeAirspeedMs,
     density_kg_m3: rho,
   });
 
-  // Exact rounded drag components so runtime telemetry & exported reports match 100%
-  const cd0Out = Number(cd0.toFixed(4));
-  const cdiOut = Number(finiteWing.cdi.toFixed(4));
-  const cdSepOut = Number(cdSep.toFixed(4));
-  const cdWaveOut = Number(cdWave.toFixed(4));
-  const cdTotal = Number(
-    computeTotalDrag({
-      cd0: cd0Out,
-      cdi: cdiOut,
-      cdSep: cdSepOut,
-      cdWave: cdWaveOut,
-    }).toFixed(4)
-  );
+  const cdTotalRaw = computeTotalDrag({
+    cd0,
+    cdi: finiteWing.cdi,
+    cdSep,
+    cdWave,
+  });
 
   // Surrogate surface Cp & empirical boundary-layer reference estimates
   const cpResult = computeChordwiseCpAndLift({
@@ -922,7 +904,7 @@ function solveAeroStateSI(
     aoaDeg,
     mach,
     reynolds,
-    thicknessRatio: config.thicknessRatio ?? 0.12,
+    thicknessRatio: config.thicknessRatio,
     camberRatio: config.camberRatio ?? 0.015,
     flapsDeg: effectiveFlap,
     xSeparationUpper: sep.xSeparationUpper,
@@ -933,13 +915,13 @@ function solveAeroStateSI(
 
   const flatPlateRef = computeFlatPlateSkinFriction(Math.max(1e3, reynolds));
 
-  // Consistency check values (never presented as independent RANS verification)
+  // Consistency check values (full float64 precision)
   const kuttaLift_N = rho * safeAirspeedMs * finiteWing.equivalentCirculation_m2_s * config.wingspan;
-  const pressureLiftCheck_N = dynP * wingArea_m2 * (cpResult.clUpper + cpResult.clLower);
+  const pressureLiftCheckRaw_N = dynP * wingArea_m2 * cpResult.clIntegratedRaw;
 
   const lift_N = finiteWing.lift_N;
-  const drag_N = cdTotal * dynP * wingArea_m2;
-  const ldRatio = cdTotal > 0.0001 ? cl / cdTotal : 0;
+  const drag_N = cdTotalRaw * dynP * wingArea_m2;
+  const ldRatioRaw = cdTotalRaw > 1e-8 ? cl / cdTotalRaw : 0;
 
   const isPureAirfoil =
     type === 'naca0012' ||
@@ -983,8 +965,8 @@ function solveAeroStateSI(
   return {
     telemetry: {
       cl: Number(cl.toFixed(3)),
-      cd: cdTotal,
-      ldRatio: Number(ldRatio.toFixed(2)),
+      cd: Number(cdTotalRaw.toFixed(4)),
+      ldRatio: Number(ldRatioRaw.toFixed(2)),
       lift_N: Math.round(lift_N),
       drag_N: Math.round(drag_N),
       reynolds: Math.round(reynolds),
@@ -1001,7 +983,7 @@ function solveAeroStateSI(
       pressure_Pa: Math.round(isa.pressure_Pa),
       dynamic_viscosity_Pa_s: isa.dynamicViscosity_Pa_s,
       speed_of_sound_ms: Number(isa.speedOfSound_ms.toFixed(2)),
-      prandtlGlauertFactor: Number(dim.prandtlGlauertFactor.toFixed(4)),
+      prandtlGlauertFactor: Number(dim.prandtlGlauertFactor.toFixed(3)),
       compressibilityRegime: dim.compressibilityRegime,
       continuumValid: dim.continuumValid,
       regimeWarnings: dim.regimeWarnings,
@@ -1016,23 +998,27 @@ function solveAeroStateSI(
       ellipticRootCirculation_m2_s: Number(finiteWing.ellipticRootCirculation_m2_s.toFixed(2)),
       boundCirculation_m2_s: Number(finiteWing.equivalentCirculation_m2_s.toFixed(2)),
       kuttaLift_N: Math.round(kuttaLift_N),
-      pressureLiftCheck_N: Math.round(pressureLiftCheck_N),
+      pressureLiftCheck_N: Math.round(pressureLiftCheckRaw_N),
 
+      wingArea_m2,
+      meanChord_m: Number(meanChord_m.toFixed(4)),
+      sweepDeg: config.sweepDeg,
+      liftCurveSlope_per_rad: Number(clAlphaPerRad.toFixed(4)),
       aspectRatio: Number(finiteWing.aspectRatio.toFixed(2)),
       oswaldEfficiency: Number(oswaldEfficiency.toFixed(3)),
       inducedAlpha_deg: Number(finiteWing.inducedAlpha_deg.toFixed(2)),
       downwashAngle_deg: Number(finiteWing.downwashAngle_deg.toFixed(2)),
 
-      cd0: cd0Out,
-      cdi: cdiOut,
-      cdSep: cdSepOut,
-      cdWave: cdWaveOut,
+      cd0: Number(cd0.toFixed(4)),
+      cdi: Number(finiteWing.cdi.toFixed(4)),
+      cdSep: Number(cdSep.toFixed(4)),
+      cdWave: Number(cdWave.toFixed(4)),
 
       xTransitionUpper: cpResult.xTransitionUpper,
       xTransitionLower: cpResult.xTransitionLower,
       xSeparationUpper: cpResult.separationXc,
       stagnationXc: cpResult.stagnationXc,
-      skinFrictionDrag_cdf: cpResult.skinFrictionDrag_cdf,
+      skinFrictionDrag_cdf: Number(flatPlateRef.turbulentWingCdf.toFixed(5)),
       laminarFlatPlateCfMean: Number(flatPlateRef.laminarMeanCf.toFixed(5)),
       turbulentFlatPlateCfMean: Number(flatPlateRef.turbulentMeanCf.toFixed(5)),
       maxAdversePressureGrad: cpResult.maxAdversePressureGrad,
@@ -1044,6 +1030,36 @@ function solveAeroStateSI(
       solverModel: SOLVER_LABEL_3D,
       loadFactor_nz,
       modelValidity,
+      rawSI: {
+        temperature_K: isa.temperature_K,
+        pressure_Pa: isa.pressure_Pa,
+        density_kg_m3: rho,
+        dynamicViscosity_Pa_s: isa.dynamicViscosity_Pa_s,
+        speedOfSound_ms: isa.speedOfSound_ms,
+        velocity_ms: safeAirspeedMs,
+        dynamicPressure_Pa: dynP,
+        reynolds,
+        mach,
+        knudsen: dim.knudsen,
+        prandtlGlauertFactor: dim.prandtlGlauertFactor,
+        wingArea_m2,
+        meanChord_m,
+        aspectRatio: finiteWing.aspectRatio,
+        clAlpha_per_rad: clAlphaPerRad,
+        cl,
+        cd0,
+        cdi: finiteWing.cdi,
+        cdSep,
+        cdWave,
+        cdTotal: cdTotalRaw,
+        inducedAlpha_rad: finiteWing.inducedAlpha_rad,
+        downwashAngle_rad: finiteWing.downwashAngle_rad,
+        lift_N,
+        drag_N,
+        ldRatio: ldRatioRaw,
+        pressureLiftCheck_N: pressureLiftCheckRaw_N,
+        cpIntegratedCl: cpResult.clIntegratedRaw,
+      },
     },
     cpStations: cpResult.stations,
   };
@@ -1086,4 +1102,42 @@ export function computeSectionCpProfile(
     altitudeFt * ISA_CONSTANTS.FT_TO_M,
     flapDeg
   ).cpStations;
+}
+
+/**
+ * Evaluates a 0..15 deg alpha sweep (0.2 deg step) using the active preset or custom model planform.
+ */
+export function computeModelAlphaSweep(
+  type: AircraftModelType,
+  airspeedMs: number,
+  altitudeM: number,
+  flapDeg = 0
+): AlphaSweepResult {
+  const cfg = AIRCRAFT_MODELS[type];
+  const customCal = type === 'custom_glb' ? activeCustomGlbCalibration : null;
+  return alphaSweep({
+    modelType: type,
+    planform: {
+      wingspan_m: cfg.wingspan,
+      wingArea_m2: cfg.wingArea_m2,
+      sweepDeg: cfg.sweepDeg,
+      oswaldEfficiency: customCal ? customCal.oswaldEfficiency : cfg.oswaldEfficiency,
+      cd0: cfg.cd0,
+      thicknessRatio: cfg.thicknessRatio,
+      camberRatio: cfg.camberRatio ?? 0.015,
+      stallAngleDeg: cfg.stallAngle,
+      cl0: cfg.cl0,
+      alphaZeroLiftDeg: cfg.alphaZeroLift ?? 0,
+      clMax: cfg.clMax,
+      flapCapable: cfg.flapCapable,
+      supersonicCapable: cfg.supersonicCapable,
+    },
+    velocity_ms: airspeedMs,
+    altitude_m: altitudeM,
+    flapsDeg: flapDeg,
+    alphaMinDeg: 0,
+    alphaMaxDeg: 15,
+    stepDeg: 0.2,
+    customLiftSlopeRad: customCal ? customCal.liftSlope : undefined,
+  });
 }

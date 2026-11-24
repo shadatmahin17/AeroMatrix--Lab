@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  alphaSweep,
   applyPrandtlGlauertCp,
   clampCpForColorMap,
   computeDimensionlessAndGuardrails,
@@ -16,8 +17,13 @@ import {
   calculateAeroTelemetry,
   computeBenchmarkMatchConditions,
   getNominalPresetState,
+  solveAeroStateSI,
 } from '../../utils/airfoilGenerators';
-import { generateEngineeringPdfBlob } from '../../utils/engineeringReport';
+import {
+  buildEngineeringReportBundle,
+  formatEngineeringReportMarkdown,
+  generateEngineeringPdfBlob,
+} from '../../utils/engineeringReport';
 import type { SimulationParams } from '../../types/aerodynamics';
 
 describe('International Standard Atmosphere (ISA, 0–20,000 m)', () => {
@@ -290,3 +296,121 @@ describe('Finite-Wing Lifting-Line, Exact Drag Sum, Presets & Flat-Plate Cf', ()
     expect(stalledFoil.modelValidity?.isValid).toBe(false);
   });
 });
+
+function expectWithinRelTolerance(actual: number, expected: number, relTol = 0.001): void {
+  const relErr = Math.abs(actual - expected) / Math.max(1e-12, Math.abs(expected));
+  expect(relErr).toBeLessThanOrEqual(relTol);
+}
+
+describe('F-22 Acceptance Test & 4-Page PDF Report Verification', () => {
+  it('matches all F-22 reference SI operating point values within ±0.1% at α = 5°, V = 180.06 m/s, h = 3000.1 m', () => {
+    const { telemetry } = solveAeroStateSI('f22', 5.0, 180.06, 3000.1, 0);
+    const raw = telemetry.rawSI!;
+    expect(raw).toBeDefined();
+
+    // ISA state
+    expectWithinRelTolerance(raw.temperature_K, 268.65, 0.001);
+    expectWithinRelTolerance(raw.pressure_Pa, 70108, 0.001);
+    expectWithinRelTolerance(raw.density_kg_m3, 0.9091, 0.001);
+    expectWithinRelTolerance(raw.dynamicViscosity_Pa_s, 1.6937e-5, 0.001);
+    expectWithinRelTolerance(raw.speedOfSound_ms, 328.58, 0.001);
+
+    // Dimensionless parameters & planform geometry
+    expectWithinRelTolerance(raw.dynamicPressure_Pa, 14737, 0.001);
+    expectWithinRelTolerance(raw.mach, 0.548, 0.001);
+    expectWithinRelTolerance(raw.prandtlGlauertFactor, 1.195, 0.001);
+    expectWithinRelTolerance(raw.reynolds, 5.562e7, 0.001);
+    expectWithinRelTolerance(raw.knudsen, 1.461e-8, 0.001);
+    expectWithinRelTolerance(raw.aspectRatio, 2.36, 0.002); // 13.56^2 / 78.04 = 2.356145
+    expectWithinRelTolerance(raw.meanChord_m, 5.76, 0.0015); // 78.04 / 13.56 = 5.755162
+
+    // Helmbold/Raymer lift, induced drag, forces, circulation & flat-plate CD,f
+    expectWithinRelTolerance(raw.clAlpha_per_rad, 2.837, 0.001);
+    expectWithinRelTolerance(raw.cl, 0.248, 0.002); // 2.837 * (5*pi/180) = 0.2476
+    expectWithinRelTolerance((raw.inducedAlpha_rad * 180) / Math.PI, 2.52, 0.002);
+    expectWithinRelTolerance((raw.downwashAngle_rad * 180) / Math.PI, 5.04, 0.002);
+    expectWithinRelTolerance(raw.cdi, 0.0109, 0.002);
+    expectWithinRelTolerance(raw.cdTotal, 0.0299, 0.001);
+    expectWithinRelTolerance(raw.lift_N, 284761, 0.001);
+    expectWithinRelTolerance(raw.drag_N, 34385, 0.001);
+    expectWithinRelTolerance(raw.ldRatio, 8.28, 0.001);
+    expectWithinRelTolerance(telemetry.equivalentCirculation_m2_s, 128.29, 0.001);
+    expectWithinRelTolerance(telemetry.ellipticRootCirculation_m2_s, 163.34, 0.001);
+    expectWithinRelTolerance(telemetry.skinFrictionDrag_cdf, 0.00418, 0.001);
+  });
+
+  it('produces an attached 0°–15° alphaSweep (step 0.2°) consistent with F-22 telemetry at 5.0°', () => {
+    const sweep = alphaSweep({
+      modelType: 'f22',
+      velocity_ms: 180.06,
+      altitude_m: 3000.1,
+    });
+    expect(sweep.alphaDeg.length).toBe(76);
+    expect(sweep.alphaDeg[0]).toBe(0);
+    expect(sweep.alphaDeg[sweep.alphaDeg.length - 1]).toBe(15);
+
+    const pt5 = sweep.points.find((p) => Math.abs(p.alphaDeg - 5.0) < 1e-6);
+    expect(pt5).toBeDefined();
+    expectWithinRelTolerance(pt5!.cl, 0.248, 0.002);
+    expectWithinRelTolerance(pt5!.cd, 0.0299, 0.001);
+    expectWithinRelTolerance(pt5!.cdi, 0.0109, 0.002);
+    expectWithinRelTolerance(pt5!.ldRatio, 8.28, 0.001);
+  });
+
+  it('exports an exact 4-page F-22 PDF with verified <1e-9 residuals, <0.1% Cp quadrature, and clean wording', async () => {
+    const airspeedKts = 180.06 / ISA_CONSTANTS.KTS_TO_MS;
+    const altitudeFt = 3000.1 / ISA_CONSTANTS.FT_TO_M;
+    const params: SimulationParams = {
+      modelType: 'f22',
+      angle_of_attack: 5.0,
+      airspeed_kts: airspeedKts,
+      altitude_ft: altitudeFt,
+      flaps_deg: 0,
+      viscosity: 0.25,
+      smoke_density: 0.8,
+      show_streamlines: true,
+      show_particles: true,
+      show_heatmap: false,
+      show_pressure_vectors: true,
+      show_quiver: false,
+      show_shockwaves: false,
+      audio_enabled: false,
+    };
+    const { telemetry } = solveAeroStateSI('f22', 5.0, 180.06, 3000.1, 0);
+    const { blob, fileName, bundle } = generateEngineeringPdfBlob('f22', params, telemetry);
+
+    expect(fileName).toBe('aerolab_report_f22_aoa5.0deg.pdf');
+    expect(bundle.model.name).toBe('F-22 Raptor (Fighter)');
+    expect(bundle.verificationDistinction.numericalVerification.status).toBe('verified');
+    expect(bundle.verificationDistinction.numericalVerification.quadraturePassed).toBe(true);
+    expect(bundle.verificationDistinction.numericalVerification.quadratureRelErrorPct).toBeLessThan(0.1);
+    for (const check of bundle.verificationDistinction.numericalVerification.residuals) {
+      expect(check.passed).toBe(true);
+      expect(check.residual).toBeLessThan(1e-9);
+    }
+    expect(bundle.verificationDistinction.modelValidation.status).toBe('empirical-only');
+    expect(bundle.verificationDistinction.operatingApplicability.status).toBe('within-envelope');
+    expect(bundle.reproducibility.logoAssetPath).toBe('/public/aerolab-logo.png');
+
+    const md = formatEngineeringReportMarkdown(bundle);
+    expect(md).not.toContain('80/20');
+    expect(md).not.toContain('Kutta Residual');
+    expect(md).not.toContain('REFERENCE LAYOUT');
+    expect(md).not.toContain('Annex A');
+    expect(md).not.toContain('(Fighter) (Fighter)');
+    expect(md).toContain('Re > 3×10⁵');
+
+    const pdfBytes = new Uint8Array(await blob.arrayBuffer());
+    const pdfAscii = new TextDecoder('latin1').decode(pdfBytes);
+    expect(pdfAscii.startsWith('%PDF-')).toBe(true);
+    // jsPDF writes /Count 4 in the root /Pages dictionary; verify exact 4-page layout
+    expect(pdfAscii).toMatch(/\/Type\s*\/Pages[\s\S]*?\/Count\s+4\b/);
+    expect(pdfAscii).not.toContain('REFERENCE LAYOUT');
+    expect(pdfAscii).not.toContain('Annex A');
+
+    // Also verify buildEngineeringReportBundle works equivalently
+    const bundleCheck = buildEngineeringReportBundle('f22', params, telemetry);
+    expect(bundleCheck.verificationDistinction.numericalVerification.status).toBe('verified');
+  });
+});
+

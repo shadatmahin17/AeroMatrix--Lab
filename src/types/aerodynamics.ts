@@ -14,17 +14,18 @@ export interface AircraftModelConfig {
   name: string;
   category: 'Fighter' | 'Commercial' | 'Airfoil' | 'Supersonic' | 'Bluff Body';
   description: string;
-  wingspan: number; // meters
-  chord: number; // meters
-  sweepDeg?: number; // quarter-chord sweep angle in degrees
-  oswaldEfficiency?: number; // Oswald span efficiency factor e (0 < e <= 1)
-  thicknessRatio?: number; // max thickness-to-chord t/c
+  wingspan: number; // reference wingspan b (meters)
+  wingArea_m2: number; // explicit reference planform area S (m^2)
+  chord: number; // mean geometric chord c_bar = S / b (meters)
+  sweepDeg: number; // sweep angle Lambda at max-thickness line (degrees)
+  oswaldEfficiency: number; // Oswald span efficiency factor e (0 < e <= 1)
+  thicknessRatio: number; // max thickness-to-chord t/c
   camberRatio?: number; // max camber-to-chord m/c
   stallAngle: number; // degrees
   cl0: number; // nominal 2D section lift coefficient at 0 deg AoA
   alphaZeroLift?: number; // zero-lift angle of attack in degrees
   clMax: number;
-  cd0: number; // parasitic drag preset
+  cd0: number; // parasitic drag preset referenced to S
   flapCapable: boolean;
   supersonicCapable: boolean;
   glbPath?: string;
@@ -149,6 +150,10 @@ export interface AeroTelemetry {
   kuttaLift_N: number; // Equivalent lift rho * V_inf * Gamma_eq * b (consistency identity with CL)
   pressureLiftCheck_N: number; // L_p = q_inf * S * (clUpper + clLower) (quadrature check)
 
+  wingArea_m2?: number; // explicit reference planform area S (m^2)
+  meanChord_m?: number; // mean geometric chord c_bar = S / b (m)
+  sweepDeg?: number; // sweep angle Lambda at max-thickness line (deg)
+  liftCurveSlope_per_rad?: number; // Helmbold/Raymer CL_alpha (rad^-1)
   aspectRatio: number; // AR = b^2 / S
   oswaldEfficiency: number; // Oswald span efficiency e
   inducedAlpha_deg: number; // alpha_i = CL / (pi * e * AR) in degrees
@@ -165,7 +170,7 @@ export interface AeroTelemetry {
   xTransitionLower: number; // Empirical transition estimate x_tr / c on lower surface (0..1)
   xSeparationUpper: number; // Empirical separation onset estimate x_sep / c (0..1)
   stagnationXc: number; // Estimated leading-edge stagnation location x_stag / c
-  skinFrictionDrag_cdf: number; // Integrated Blasius + Schlichting Cf(x) flat-plate reference CD,f
+  skinFrictionDrag_cdf: number; // Wing flat-plate skin-friction ref CD,f = 2 * Cf_turb
   laminarFlatPlateCfMean: number; // Blasius plate-averaged Cf_bar = 1.328 / sqrt(Re)
   turbulentFlatPlateCfMean: number; // Schlichting plate-averaged Cf_bar = 0.074 / Re^0.2
   maxAdversePressureGrad: number; // Peak upper adverse pressure gradient max(dCp / d(x/c))
@@ -180,6 +185,36 @@ export interface AeroTelemetry {
     isValid: boolean;
     reason: string;
     outOfRangeMetrics: string[];
+  };
+  rawSI?: {
+    temperature_K: number;
+    pressure_Pa: number;
+    density_kg_m3: number;
+    dynamicViscosity_Pa_s: number;
+    speedOfSound_ms: number;
+    velocity_ms: number;
+    dynamicPressure_Pa: number;
+    reynolds: number;
+    mach: number;
+    knudsen: number;
+    prandtlGlauertFactor: number;
+    wingArea_m2: number;
+    meanChord_m: number;
+    aspectRatio: number;
+    clAlpha_per_rad: number;
+    cl: number;
+    cd0: number;
+    cdi: number;
+    cdSep: number;
+    cdWave: number;
+    cdTotal: number;
+    inducedAlpha_rad: number;
+    downwashAngle_rad: number;
+    lift_N: number;
+    drag_N: number;
+    ldRatio: number;
+    pressureLiftCheck_N: number;
+    cpIntegratedCl: number;
   };
 }
 
