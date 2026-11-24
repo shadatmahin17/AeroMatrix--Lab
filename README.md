@@ -2,61 +2,147 @@
   <img src="public/aerolab-logo.png" alt="AeroLab Logo" width="220" />
 </p>
 
-<h1 align="center">AeroLab — 3D Aircraft CFD &amp; 2D Airfoil Wind Tunnel</h1>
+<h1 align="center">AeroLab — 3D Aircraft Wind Tunnel &amp; 2D Airfoil CFD Workstation</h1>
 
 <p align="center">
-  Unified aerodynamic simulation workstation combining a <strong>3D Biot-Savart Aircraft CFD Wind Tunnel</strong> and a GPU-accelerated <strong>2D Lattice-Boltzmann (D2Q9) Airfoil Lab</strong> with live 2D-to-3D wing extrusion, Bézier airfoil sculpting, NeuroFoil surrogate polars, and pilot flight logs.
+  Modular aerospace simulation workstation combining an <strong>SI Aerodynamic Physics Engine</strong>, a <strong>3D Biot–Savart Vortex-Lattice &amp; SDF Flow Tunnel</strong>, a GPU-accelerated <strong>2D Lattice-Boltzmann (D2Q9) Airfoil Lab</strong>, and a <strong>NeuroFoil Surrogate Predictor</strong> orchestrated over dedicated Web Workers with reproducible audit records and 5-level scientific verification.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL_v3-blue.svg" alt="License: AGPL v3" /></a>
-  <a href="LICENSES/Apache-2.0.txt"><img src="https://img.shields.io/badge/3D_CFD_Engine-Apache_2.0-green.svg" alt="Apache 2.0" /></a>
-  <a href="LICENSES/MIT.txt"><img src="https://img.shields.io/badge/Kutta_LBM-MIT-lightgrey.svg" alt="MIT License" /></a>
+  <a href="LICENSES/MIT.txt"><img src="https://img.shields.io/badge/Kutta_LBM-MIT-lightgrey.svg" alt="Kutta LBM: MIT License" /></a>
 </p>
 
 ---
 
-## Key Capabilities
+## System Architecture
 
-### 1. 3D Aircraft CFD Wind Tunnel (`/` — 3D CFD Mode)
-- **Built-in Aircraft & Airfoil Geometries (`public/models/` + Procedural)**:
-  - **F-22 Raptor** (`f22_raptor.glb`, Meshopt PBR)
-  - **Boeing 787 Dreamliner** (`boeing_787.glb`)
-  - **Concorde SST** (`concorde_free_with_interior.glb`)
-  - **Airfoil Section 3D** (`airfoil.glb`), **NACA 0012**, **Circular Cylinder**, and **2D Custom Foil** (live extruded 3D wing built directly from your active 2D airfoil coordinates)
-- **Biot-Savart Vortex Lattice & Surface Distance Field (`src/engine/`)**:
-  - `AircraftSurfaceField.ts` extracts triangle meshes into a `64 × 32 × 48` 3D Euclidean Distance Transform (EDT) grid with smooth $C^1$ surface normals ($\nabla d$) for non-penetrating tangential slip.
-  - `FluidDynamics3D.ts` solves a 6-panel horseshoe vortex lattice with Lamb-Oseen viscous core regularization, RK2 advection for smoke ribbons & PIV particles, wingtip vortex roll-up, and stall wake separation.
-- **Dual 3D Renderers + CAD Inspector**:
-  - **Three.js WebGL2 Wind Tunnel** (`WindTunnelCanvasWebGL.tsx`) with PBR, Wireframe, X-Ray, and CFD $C_p$ Pressure Heatmap shaders, velocity quiver grid, Mach shock cones ($\mu = \arcsin(1/M)$), and 3D Lift/Drag vectors.
-  - **Automatic Software 3D Canvas Fallback** (`WindTunnelCanvas3D.tsx`) when WebGL2 is unavailable.
-  - **3D CAD Inspector Modal** (`ModelViewerModal.tsx`) with turntable inspection, bounding-box metrics, and PNG capture.
-- **Flight Telemetry HUD & Interactive Polars (`TelemetryHUD.tsx`, `AeroCharts.tsx`)**:
-  - Real-time $C_L$, $C_D$, $L/D$, Mach number, dynamic pressure $q$, ISA atmospheric density $\rho$, boundary-layer state, upper/lower surface lift split, and downwash angle $\epsilon$.
-  - Apache ECharts polars ($C_L$ vs. $\alpha$, Drag Polar $C_L$ vs. $C_D$, Chordwise $C_p$) with **JSON**, **CSV**, **2× PNG**, and **SVG** export.
+AeroLab separates UI presentation, state management, simulation orchestration, numerical solvers, geometry preprocessing, and persistence into decoupled layers:
 
-### 2. 2D Lattice-Boltzmann Airfoil Lab (`/` — 2D Airfoil Mode)
-- **GPU D2Q9 WebGL2 Wind Tunnel (`src/lib/lbm/`)**:
-  - Real-time `640 × 320` lattice-Boltzmann fluid solver with adaptive steps-per-frame, pause/resume, full reset, and PNG flow snapshot export.
-  - Four visualization modes: **Velocity**, **Pressure ($C_p$)**, **Vorticity**, and **Smoke**.
-- **Airfoil Library & Bézier Shape Editor (`AirfoilPicker.tsx`, `ShapeEditor2D.tsx`)**:
-  - Built-in NACA/Selig `.dat` catalog (`public/examples/`), drag-and-drop `.dat`/`.txt` parser (`src/lib/airfoilParser.js`), and interactive cubic Bézier camber & thickness sculpting that syncs live to both the 2D tunnel and the 3D **2D Custom Foil** wing.
-- **NeuroFoil Surrogate & Benchmark Comparison (`src/lib/neurofoil.ts`, `ResultsAnalytics.tsx`, `BenchmarkComparison.tsx`)**:
-  - Extracts 7 geometric descriptors to predict $-8^\circ \dots +20^\circ$ viscous polars, peak $L/D$, optimal $\alpha^*$ (with 1-click **`Jump α*`**), stall margin, and Plotly polar/time-series comparison against uploaded `.csv`/`.json`/`.dat` reference polars.
+```text
++-------------------------------------------------------------------------+
+|                    React 19 + TypeScript Workstation                    |
+|  Setup . 3D Tunnel . 2D LBM Lab . D3.js Telemetry . Learning . Reports  |
++------------------------------------+------------------------------------+
+                                     |
+         +---------------------------+---------------------------+
+         v                                                       v
++-----------------------------------+   +---------------------------------+
+|        Application Services       |   |     Simulation Orchestrator     |
+| Zustand Stores (src/state/)       |   | SimulationManager (src/sim...)  |
+| IndexedDB + Supabase Repositories |   | Registry . Scheduler . LRU Cache|
++-----------------------------------+   +----------------+----------------+
+                                                         |
+                   Dedicated Web Workers (Transferable ArrayBuffers)
+         +-----------------------+-----------------------+-----------------------+
+         v                       v                       v                       v
++-----------------+     +-----------------+     +-----------------+     +-----------------+
+| SI Physics      |     | 3D Flow Engine  |     | 2D CFD Engine   |     | Surrogate       |
+| physics.worker  |     | fluid3d.worker  |     | tunnel2d.worker |     | NeuroFoilEngine |
+| ISA . VLM . Drag|     | 84x48x84 SDF/RK2|     | D2Q9 Mach/tau0  |     | Bezier Polars   |
++--------+--------+     +--------+--------+     +--------+--------+     +--------+--------+
+         |                       |                       |                       |
+         +-----------------------+-----------------------+-----------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+|                Geometry, Verification & Reproducibility                 |
+| Mesh Validator . PCA Normalization . Benchmarks . 3-Tier Audit Hashes   |
++------------------------------------+------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+|                          Persistence & Export                           |
+| IndexedDB (Local) . Supabase (Cloud) . A4 PDF (export.worker) . JSON/CSV|
++-------------------------------------------------------------------------+
+```
 
-### 3. Pilot Profile & Local / Cloud Sync (`/profile`)
-- **Profile Customization (`ProfilePage.tsx`, `SupabaseProvider.tsx`)**:
-  - Client-side resilient image cropper (`256 × 256` avatar & `1200 × 320` wide cover banner) with multi-stage decoding (`createImageBitmap` + `FileReader` data URL + object URL fallback) and drag-and-drop support.
-  - **Local Pilot Mode** saves pilot details, avatars, and cover banners in `localStorage` automatically when Supabase credentials are absent.
-  - **Optional Supabase Cloud Sync**: Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` to enable Email/Google Auth, community `.dat` airfoil sharing, simulation benchmark publishing, and cloud storage buckets.
+---
+
+## Core Architectural Pillars
+
+### 1. Dedicated Web Workers & Zero-Copy Buffers (`src/workers/`, `src/simulation/workers/`)
+Heavy computational workloads run off the browser's main UI thread via typed `SimulationRequest` / `SimulationResponse` protocols with Transferable `ArrayBuffer` objects (`Float32Array`, `Uint8Array`, PDF `ArrayBuffer`) and automatic in-process fallback in Node/Vitest environments:
+- `physics.worker.ts` — SI atmospheric thermodynamics, polar sweeps, and NACA benchmark deviation checks.
+- `fluid3d.worker.ts` — `84 × 48 × 84` SDF generation and adaptive RK2 streamline integration batches.
+- `geometry.worker.ts` — Triangle soup topology validation and mesh bounding diagnostics.
+- `tunnel2d.worker.ts` — Airfoil solid/fluid mask rasterization (`640 × 320`) and D2Q9 stability/Mach verification.
+- `export.worker.ts` — Off-thread A4 engineering verification PDF, Markdown, and JSON serialization.
+
+### 2. Unified Simulation Orchestration (`src/simulation/core/`, `src/simulation/engines/`)
+- **`SimulationManager`**: Central coordinator unifying `SiPhysicsEngine` (`si-physics`), `Fluid3DFlowEngine` (`fluid-3d`), `Lbm2DEngine` (`lbm-2d`), and `NeuroFoilEngine` (`neurofoil`) behind a single `SimulationEngine<I, O>` interface (`validate`, `run`, `cancel`).
+- **`SimulationRegistry` & `SimulationScheduler`**: Run-ID tracking, `AbortController` cancellation, and latest-wins superseding during rapid slider interaction.
+- **`SimulationCache` & `SimulationEventBus`**: LRU result cache keyed by `engine@version::geometryHash::inputHash` plus typed progress/completion events.
+
+### 3. Single-Source Scientific Data Contracts (`src/simulation/contracts/`, `src/domain/`, `src/physics/`)
+- Strict SI calculation kernel (`src/lib/aeroPhysics.ts`) and derived `FlowConditions` (`deriveFlowConditions`) compute ISA air density $\rho(h)$, Sutherland dynamic viscosity $\mu(T)$, speed of sound $a(T)$, Mach number $M = V / \sqrt{\gamma R T}$, Reynolds number $Re = \rho V c / \mu$, Knudsen number $Kn$, and Prandtl–Glauert compressibility scaling from primary inputs so all solvers share one authoritative thermodynamic state.
+- Explicit separation of physical computation (**SI Physics**), reduced-order visual flow trajectories (**Biot–Savart VLM**), and surface collision queries (**Geometry SDF**).
+
+### 4. Universal 3D Geometry Normalization & Mesh Validation (`src/geometry/`, `src/engine/`)
+- **Automatic Normalization & Framing**: Every built-in or uploaded `.glb` airframe is oriented (`nose -> -X`, `up -> +Y`, `span -> +Z`), centered with its aerodynamic center (`35%` aft of nose) at `(0, 0, 0)` in canonical `10.0`-unit wind-tunnel coordinates, and validated via `meshValidator.ts` (detecting degenerate triangles, disconnected mesh components, non-manifold edges, inverted hull normals, and raw unit scale mismatches) alongside 3D PCA orientation estimation.
+- **`84 × 48 × 84` Dynamic SDF & RK2 Flow Pipeline**: `AircraftSurfaceField.ts` clears stale buffers on model switch and auto-sizes the distance grid to `1.35 × boundingBox` with minimum clearance $d_{\min} = 2.0 \times \text{cellSize}$. `FluidDynamics3D.ts` combines a 6-panel Biot–Savart horseshoe vortex lattice (auto-fitted to actual model span), axisymmetric slender-body fuselage potential deflection, and 2-step adaptive RK2 integration with smooth trilinear normal sliding.
+- **Built-In Airframes & Validation Presets**: F-22 Raptor, Boeing 787 Dreamliner, Concorde SST, Airfoil Section 3D (`naca2412`), NACA 0012, **Validation Wing: Rectangular AR 6 (NACA 0012)** ($AR = 6.0, e = 0.95, Re = 3.0 \times 10^6, M = 0.15$), Circular Cylinder, Live 2D-to-3D Extruded Wing, and custom `.glb` uploads.
+
+### 5. GPU 2D Lattice-Boltzmann CFD & Stability Diagnostics (`src/lib/lbm/`)
+- Real-time `640 × 320` WebGL2 D2Q9 solver with Smagorinsky subgrid turbulence and four visualization shaders (**Velocity**, **Pressure $C_p$**, **Vorticity**, **Smoke**).
+- `lbmDiagnostics.ts` continuously verifies low-Mach incompressible validity ($Ma_{\text{LBM}} = u_0\sqrt{3} < 0.30$), BGK relaxation stability ($\tau_0 > 0.505$), chord lattice resolution, and residual convergence.
+- Interactive cubic Bézier airfoil editor (`ShapeEditor2D.tsx`), Selig `.dat` parser (`airfoilParser.js`), and **NeuroFoil** surrogate polar prediction (`neurofoil.ts`).
+
+### 6. State Management & Interchangeable Persistence (`src/state/`, `src/data/`)
+- **Zustand Domain Stores**: `useAircraftStore`, `useEnvironmentStore`, `useSimulationStore`, `useResultsStore`, and `useWorkspaceStore` decouple UI selections, execution progress, numerical telemetry, and geometry metadata.
+- **`ISimulationRepository` Adapters**: Interchangeable `LocalSimulationRepository` (native browser **IndexedDB** `aerolab_sim_db` with in-memory fallback) and `SupabaseSimulationRepository` (storing compact metadata/summaries in Postgres and geometry/results artifacts in Storage).
+
+### 7. D3.js Telemetry, Reproducible Simulation Records & 3-Tier Reporting (`src/reporting/`, `src/utils/`)
+- **Telemetry & Analytics**: D3.js aerodynamic polars (`D3AdvancedGraphs.tsx`, `D3AirfoilLabGraphs.tsx`), Apache ECharts, Plotly polar overlays, structural load factor ($n_z = L / W_{\text{ref}}$) monitoring, and a subsonic attached VLM envelope status badge.
+- **3-Tier Engineering Verification Reports**: `.pdf` (A4 document with embedded AeroLab logo), `.md`, `.json` (Verification Audit Record), and `.csv` explicitly distinguish:
+  1. **Numerical Verification** — Equation consistency, exact drag decomposition summation, and quadrature lift checks.
+  2. **Model Validation** — Comparison against NACA TR-824 / XFOIL polar benchmarks.
+  3. **Operating Applicability** — Subsonic attached envelope ($M \le 0.70$, continuum $Kn \le 0.01$, pre-stall $\alpha$).
+- Every run records deterministic `geometryHash`, `inputHash`, software/engine version, coordinate convention, discretization resolution, and validation status.
+
+---
+
+## Project Structure
+
+```text
+src/
+├── components/           # Workstations, 3D/2D canvases, D3/ECharts/Plotly charts, GLB uploader, HUD
+├── pages/                # Learning Lab (/learn) & Pilot Profile (/profile)
+├── domain/               # Domain contracts (aircraft, aerodynamics, geometry, simulation)
+├── physics/              # SI physics barrels (atmosphere, airfoil, compressibility, finite-wing, drag, validation)
+├── geometry/             # GLB/2D importers, tunnel normalization, topology & mesh validation
+├── simulation/
+│   ├── contracts/        # ScientificContracts, SimulationMetadata, SimulationInput/Output
+│   ├── core/             # SimulationManager, Registry, Scheduler, Cache, Events
+│   ├── engines/          # SiPhysicsEngine, Fluid3DFlowEngine, Lbm2DEngine, NeuroFoilEngine
+│   └── workers/          # WorkerClientPool (Transferables, cancellation, Node fallback)
+├── workers/              # Dedicated Web Workers (physics, fluid3d, tunnel2d, geometry, export)
+├── engine/               # Biot-Savart 3D flow field & 84x48x84 SDF surface collision grid
+├── lib/                  # ISA SI physics kernel, D2Q9 WebGL2 LBM + diagnostics, NeuroFoil, calibration
+├── data/                 # NACA TR-824 benchmarks, IndexedDB adapter, Repository interfaces
+├── state/                # Zustand domain stores (aircraft, environment, simulation, results, workspace)
+├── reporting/            # Typed PDF, Markdown, JSON, and CSV exporters
+└── tests/                # Multi-level verification tests (numerical, integration, benchmarks)
+```
+
+---
+
+## Scientific Verification Pyramid (`npm test`)
+
+Verification is structured across five progressive test layers in Vitest:
+- **Level 1–2 (Unit & Numerical Properties)**: `src/lib/__tests__/aeroPhysics.test.ts`, `src/engine/__tests__/biotSavart.test.ts`, and `src/tests/numerical/conservationAndSymmetry.test.ts` (ISA checkpoints, $\pm\alpha$ lift antisymmetry, Prandtl–Glauert $1/\sqrt{1-M^2}$, $C_{D,i} = C_L^2 / (\pi e AR)$, Biot–Savart core regularization).
+- **Level 3 (Integration)**: `src/tests/integration/orchestratorPipeline.test.ts` (`SimulationManager` execution across all 4 engines, LRU cache determinism, mesh topology defect detection, `LocalSimulationRepository` CRUD).
+- **Level 4–5 (Benchmarks & Experimental Validation)**: `src/tests/benchmarks/aerodynamicBenchmarks.test.ts` (NACA 0012 & 2412 TR-824 attached RMSE validation, Blasius/Schlichting skin friction, LBM Mach/$\tau_0$ stability guards, PDF & 3-tier verification audit generation).
 
 ---
 
 ## Tech Stack
 
-- **Frontend**: React 19, TypeScript, React Router, Tailwind CSS v4, Lucide & Phosphor Icons
-- **3D & Physics**: Three.js (`GLTFLoader`, `MeshoptDecoder`, `OrbitControls`, `RoomEnvironment`), WebGL2 GLSL D2Q9 Lattice-Boltzmann Solver, 3D Biot-Savart Vortex Lattice + EDT Surface Field
-- **Visualization**: Apache ECharts (`echarts`), `plotly.js-basic-dist-min`
+- **UI & State**: React 19, TypeScript, Tailwind CSS v4, React Router, Zustand, Lucide & Phosphor Icons
+- **3D & CFD**: Three.js (`GLTFLoader`, `MeshoptDecoder`, `OrbitControls`, `RoomEnvironment`), WebGL2 GLSL D2Q9 LBM Solver, Biot–Savart VLM + `84 × 48 × 84` EDT/SDF, Web Workers
+- **Visualization & Reports**: D3.js (`d3`), Apache ECharts (`echarts`), `plotly.js-basic-dist-min`, `jsPDF`
+- **Persistence**: Native IndexedDB (`aerolab_sim_db`) & optional Supabase (`@supabase/supabase-js`)
+- **Testing**: Vitest
 
 ---
 
@@ -68,7 +154,7 @@
    ```
 
 2. **Configure environment variables (optional)**
-   Copy `.env.example` to `.env` if using Supabase cloud sync:
+   Copy `.env.example` to `.env` if enabling Supabase cloud sync:
    ```env
    VITE_SUPABASE_URL=""
    VITE_SUPABASE_PUBLISHABLE_KEY=""
@@ -79,14 +165,15 @@
    npm run dev
    ```
 
-4. **Type-check and build**
+4. **Type-check, run verification tests, and build**
    ```bash
    npm run lint
+   npm test
    npm run build
    ```
 
-5. **Database & Storage Setup for `.glb` Models (Supabase SQL)**
-   Run this SQL in your Supabase SQL Editor if `glb_models` or the `models` bucket are not created yet:
+5. **Database & Storage Setup (Optional Supabase SQL)**
+   Run this SQL in your Supabase SQL Editor if `glb_models` or the `models` bucket are not yet provisioned:
    ```sql
    create table if not exists public.glb_models (
      id text primary key,
@@ -127,4 +214,4 @@
 ## Licenses
 
 - **Primary Project License**: **GNU Affero General Public License v3.0 (AGPL-3.0)** — see [`LICENSE`](LICENSE).
-- **Other / Component Licenses**: Incorporates components from **Aeromaterix-CFD** (`Apache-2.0`), the **Kutta** 2D LBM solver (`MIT`), and open-source npm dependencies (`MIT`, `Apache-2.0`, `BSD-2-Clause`, `ISC`, and GSAP Standard License). See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md), [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt), and [`LICENSES/MIT.txt`](LICENSES/MIT.txt) for complete details.
+- **Third-Party Components**: Incorporates the **Kutta** 2D LBM visualizer (`MIT`, [`LICENSES/MIT.txt`](LICENSES/MIT.txt)) and open-source npm packages (`MIT`, `Apache-2.0`, `BSD-2-Clause`, `ISC`, and GSAP Standard License). See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for full details.
