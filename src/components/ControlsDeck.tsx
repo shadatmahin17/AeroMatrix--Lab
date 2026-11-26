@@ -8,6 +8,7 @@ import {
 } from '../utils/airfoilGenerators';
 import { AeroCalibration } from '../lib/calibration';
 import type { SharedGlbModelDoc } from '../lib/airfoilRepository.ts';
+import type { ModelFlowProfile } from '../engine/FluidDynamics3D';
 import { CustomGlbAsset, GlbUploader, MeshPcaAnalysis } from './GlbUploader';
 import { PrecisionSlider } from './PrecisionSlider';
 import {
@@ -23,12 +24,12 @@ import {
   Repeat,
   Cube,
   Check,
-  Waves,
   Gauge,
   ArrowUpRight,
   Lightning,
-  Sparkle,
   GridFour,
+  Waves,
+  Sparkle,
 } from '@phosphor-icons/react';
 
 interface ControlsDeckProps {
@@ -56,6 +57,7 @@ interface ControlsDeckProps {
   onRotateCustomGlbYaw90?: () => void;
   onResetCustomGlbToDefault?: () => void;
   onRefitFlowDomain?: () => void;
+  flowProfile?: ModelFlowProfile | null;
 }
 
 export const ControlsDeck: React.FC<ControlsDeckProps> = ({
@@ -77,6 +79,7 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
   onRotateCustomGlbYaw90,
   onResetCustomGlbToDefault,
   onRefitFlowDomain,
+  flowProfile = null,
 }) => {
   const currentModel = AIRCRAFT_MODELS[params.modelType];
   const [isAutoSweeping, setIsAutoSweeping] = useState(false);
@@ -709,10 +712,20 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
         {/* Toggle switches */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3 gap-2">
           {[
-            { key: 'show_streamlines', label: 'Smoke Lines', desc: 'Vortex ribbons', icon: Waves },
+            {
+              key: 'show_streamlines',
+              label: 'Smoke Lines',
+              desc: `${params.streamline_count ?? 18} rake & tip lines`,
+              icon: Waves,
+            },
+            {
+              key: 'show_particles',
+              label: 'PIV Particles',
+              desc: `${params.particle_count ?? 480} RK2 tracers`,
+              icon: Sparkle,
+            },
             { key: 'show_heatmap', label: 'CFD Heatmap', desc: 'Cp pressure', icon: Gauge },
             { key: 'show_pressure_vectors', label: 'Force Vectors', desc: 'Lift & Drag 3D', icon: ArrowUpRight },
-            { key: 'show_particles', label: 'PIV Particles', desc: 'RK2 streaks', icon: Sparkle },
             { key: 'show_quiver', label: 'Vector Quiver', desc: 'Velocity grid', icon: GridFour },
             { key: 'show_shockwaves', label: 'Mach Cone', desc: 'Shockwave', icon: Lightning },
           ].map((item) => {
@@ -752,15 +765,125 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
                   <div className={`text-[11px] font-bold leading-tight ${active ? 'text-[#1769AA]' : 'text-[#161A1D]'}`}>
                     {item.label}
                   </div>
-                  <div className="text-[10px] text-[#5C6670] mt-0.5 leading-tight">{item.desc}</div>
+                  <div className="text-[10px] text-[#5C6670] mt-0.5 leading-tight font-mono tabular-nums">{item.desc}</div>
                 </div>
               </button>
             );
           })}
         </div>
 
-        {/* Smoke density, viscosity & dynamic flow-domain sliders */}
+        {/* Streamline & Particle Count Controls + Fluid Tuning */}
         <div className="flex flex-col gap-3 pt-2.5 border-t border-[var(--border)]">
+          <div className="flex flex-col gap-1.5">
+            <PrecisionSlider
+              id="streamline-count-slider"
+              label="Streamline Line Count"
+              subLabel="(Smoke)"
+              min={4}
+              max={48}
+              step={1}
+              value={params.streamline_count ?? 18}
+              displayValue={`${params.streamline_count ?? 18} lines`}
+              badgeTone={params.show_streamlines ? 'accent' : 'neutral'}
+              onChange={(val) => onParamChange('streamline_count', Math.round(val))}
+            />
+            <div className="grid grid-cols-4 gap-1 text-[10px] font-mono tabular-nums">
+              {[8, 18, 32, 48].map((count) => (
+                <button
+                  key={count}
+                  type="button"
+                  onClick={() => onParamChange('streamline_count', count)}
+                  className={`py-1 rounded-md text-center border transition-colors cursor-pointer ${
+                    (params.streamline_count ?? 18) === count
+                      ? 'bg-[var(--accent-light)] text-[#1769AA] border-[#1769AA]/45 font-bold'
+                      : 'bg-[var(--bg)] border-[var(--border)]/60 text-[#5C6670] hover:text-[#161A1D]'
+                  }`}
+                >
+                  {count} lines
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <PrecisionSlider
+              id="particle-count-slider"
+              label="Particle Flow Count"
+              subLabel="(PIV)"
+              min={40}
+              max={1200}
+              step={20}
+              value={params.particle_count ?? 480}
+              displayValue={`${params.particle_count ?? 480}`}
+              badgeTone={params.show_particles ? 'accent' : 'neutral'}
+              onChange={(val) => onParamChange('particle_count', Math.round(val))}
+            />
+            <div className="grid grid-cols-4 gap-1 text-[10px] font-mono tabular-nums">
+              {[120, 320, 600, 1000].map((count) => (
+                <button
+                  key={count}
+                  type="button"
+                  onClick={() => onParamChange('particle_count', count)}
+                  className={`py-1 rounded-md text-center border transition-colors cursor-pointer ${
+                    (params.particle_count ?? 480) === count
+                      ? 'bg-[var(--accent-light)] text-[#1769AA] border-[#1769AA]/45 font-bold'
+                      : 'bg-[var(--bg)] border-[var(--border)]/60 text-[#5C6670] hover:text-[#161A1D]'
+                  }`}
+                >
+                  {count} pts
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <PrecisionSlider
+            id="smoke-density-slider"
+            label="Smoke Density"
+            subLabel="(Opacity)"
+            min={0.25}
+            max={1.5}
+            step={0.05}
+            value={params.smoke_density}
+            displayValue={`${Math.round(params.smoke_density * 100)}%`}
+            onChange={(val) => onParamChange('smoke_density', val)}
+          />
+
+          <PrecisionSlider
+            id="rake-spread-slider"
+            label="Rake Spread"
+            subLabel="(Span/Y)"
+            min={0.5}
+            max={2.0}
+            step={0.05}
+            value={params.rake_spread ?? 1.0}
+            displayValue={`${(params.rake_spread ?? 1.0).toFixed(2)}×`}
+            onChange={(val) => onParamChange('rake_spread', val)}
+          />
+
+          <PrecisionSlider
+            id="layer-gap-slider"
+            label="Layer Gap"
+            subLabel="(ΔY Rake)"
+            min={0.25}
+            max={1.2}
+            step={0.05}
+            value={params.layer_gap ?? 0.55}
+            displayValue={(params.layer_gap ?? 0.55).toFixed(2)}
+            onChange={(val) => onParamChange('layer_gap', val)}
+          />
+
+          <PrecisionSlider
+            id="streamline-resolution-slider"
+            label="RK2 Resolution"
+            subLabel="(Step)"
+            min={0.5}
+            max={2.5}
+            step={0.1}
+            value={params.streamline_resolution ?? 1.0}
+            displayValue={`${(params.streamline_resolution ?? 1.0).toFixed(1)}×`}
+            onChange={(val) => onParamChange('streamline_resolution', val)}
+          />
+
           <PrecisionSlider
             id="viscosity-slider"
             label="Kinematic Viscosity"
@@ -773,40 +896,21 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
             onChange={(val) => onParamChange('viscosity', val)}
           />
 
-          <PrecisionSlider
-            id="smoke-slider"
-            label="Smoke Density"
-            min={0.2}
-            max={2.5}
-            step={0.1}
-            value={params.smoke_density}
-            displayValue={`${params.smoke_density.toFixed(1)}x`}
-            onChange={(val) => onParamChange('smoke_density', val)}
-          />
-
-          <PrecisionSlider
-            id="rake-spread-slider"
-            label="Smoke Rake Spread"
-            subLabel="(Y/Z Frame)"
-            min={0.5}
-            max={2.0}
-            step={0.1}
-            value={params.rake_spread ?? 1.0}
-            displayValue={`${(params.rake_spread ?? 1.0).toFixed(1)}x`}
-            onChange={(val) => onParamChange('rake_spread', val)}
-          />
-
-          <PrecisionSlider
-            id="streamline-res-slider"
-            label="Streamline Resolution"
-            subLabel="(RK2 Δs)"
-            min={0.5}
-            max={2.5}
-            step={0.1}
-            value={params.streamline_resolution ?? 1.0}
-            displayValue={`${(params.streamline_resolution ?? 1.0).toFixed(1)}x`}
-            onChange={(val) => onParamChange('streamline_resolution', val)}
-          />
+          {flowProfile && (
+            <div className="p-2.5 rounded-xl bg-[var(--bg)] border border-[var(--border)] flex flex-col gap-1">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-[#1769AA]">
+                  Auto-Optimized Flow
+                </span>
+                <span className="text-[10px] font-mono font-semibold text-[#161A1D]">
+                  {flowProfile.label}
+                </span>
+              </div>
+              <div className="text-[10px] font-mono text-[#5C6670] leading-snug">
+                {flowProfile.detail}
+              </div>
+            </div>
+          )}
 
           <button
             type="button"
@@ -818,10 +922,10 @@ export const ControlsDeck: React.FC<ControlsDeckProps> = ({
               }
             }}
             className="w-full py-2 px-3 rounded-xl bg-[var(--bg)] hover:bg-[var(--accent-light)] text-[#1769AA] border border-[#1769AA]/30 hover:border-[#1769AA] text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-            title="Re-compute normalized bounding box, 84×48×84 SDF collision grid, Biot–Savart wingtip span, and upstream emitter rake"
+            title="Re-analyze active model geometry, rebuild 84×48×84 SDF collision grid, and optimize smoke/PIV flow bounds"
           >
             <ArrowsClockwise weight="bold" className="w-3.5 h-3.5" />
-            <span>Re-fit Flow Domain</span>
+            <span>Re-fit &amp; Optimize Flow</span>
           </button>
         </div>
       </div>

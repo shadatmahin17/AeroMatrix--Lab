@@ -18,6 +18,22 @@ export interface SurfaceSample {
   inside: boolean;
 }
 
+export interface SurfaceFlowMetrics {
+  minChord: number;
+  maxChord: number;
+  meanChord: number;
+  taperRatio: number;
+  centerChord: number;
+  outboardChord: number;
+  centerThickness: number;
+  wingMeanThickness: number;
+  fuselageToWingRatio: number;
+  minWingYMid: number;
+  maxWingYMid: number;
+  activeSliceCount: number;
+  effectiveSpanRatio: number;
+}
+
 /**
  * Reduced-Order Approximate Spatial Surface Distance Field (SDF) on an 84×48×84
  * uniform voxel grid extracted from 3D aircraft mesh triangles and vertices.
@@ -134,6 +150,9 @@ export class AircraftSurfaceField {
 
     const sliceMinY = new Float32Array(this.spanSlices).fill(1e6);
     const sliceMaxY = new Float32Array(this.spanSlices).fill(-1e6);
+    const sliceYSum = new Float64Array(this.spanSlices);
+    const sliceY2Sum = new Float64Array(this.spanSlices);
+    const sliceYCount = new Uint32Array(this.spanSlices);
     this.sliceLeX.fill(1e6);
     this.sliceTeX.fill(-1e6);
 
@@ -150,6 +169,9 @@ export class AircraftSurfaceField {
       if (px > this.sliceTeX[sIdx]) this.sliceTeX[sIdx] = px;
       if (py < sliceMinY[sIdx]) sliceMinY[sIdx] = py;
       if (py > sliceMaxY[sIdx]) sliceMaxY[sIdx] = py;
+      sliceYSum[sIdx] += py;
+      sliceY2Sum[sIdx] += py * py;
+      sliceYCount[sIdx]++;
 
       const gx0 = Math.floor((px - this.padMinX) * this.invDx);
       const gy0 = Math.floor((py - this.padMinY) * this.invDy);
@@ -180,13 +202,18 @@ export class AircraftSurfaceField {
       }
     }
 
-    // Finalize spanwise chord slices
+    // Finalize spanwise chord slices using sample-weighted mean Y so tall centerline
+    // vertical stabilizers do not pull the lifting-line midplane upward.
     let chordSum = 0;
     let chordCount = 0;
     for (let s = 0; s < this.spanSlices; s++) {
-      if (this.sliceHasGeo[s]) {
-        this.sliceYMid[s] = 0.5 * (sliceMinY[s] + sliceMaxY[s]);
-        this.sliceThick[s] = Math.max(0.18, sliceMaxY[s] - sliceMinY[s]);
+      if (this.sliceHasGeo[s] && sliceYCount[s] > 0) {
+        const meanY = sliceYSum[s] / sliceYCount[s];
+        const varianceY = Math.max(0, sliceY2Sum[s] / sliceYCount[s] - meanY * meanY);
+        const rmsSpanThick = 2.8 * Math.sqrt(varianceY);
+        const fullThick = sliceMaxY[s] - sliceMinY[s];
+        this.sliceYMid[s] = meanY;
+        this.sliceThick[s] = Math.max(0.18, Math.min(fullThick, Math.max(0.18, rmsSpanThick)));
         const c = Math.max(0.5, this.sliceTeX[s] - this.sliceLeX[s]);
         chordSum += c;
         chordCount++;
@@ -835,6 +862,96 @@ export class AircraftSurfaceField {
     out.yMid = this.sliceYMid[sIdx];
     out.thickness = this.sliceThick[sIdx];
     return true;
+  }
+
+  /**
+   * Analyzes the 32 extracted spanwise mesh slices to characterize chord taper,
+   * fuselage-to-wing thickness ratio, and dihedral/vertical wing placement.
+   */
+  public analyzeSpanDistribution(): SurfaceFlowMetrics {
+    let minChord = Infinity;
+    let maxChord = 0;
+    let chordSum = 0;
+    let activeSliceCount = 0;
+
+    let centerChordSum = 0;
+    let centerThickSum = 0;
+    let centerCount = 0;
+
+    let wingChordSum = 0;
+    let wingThickSum = 0;
+    let wingCount = 0;
+    let minWingYMid = Infinity;
+    let maxWingYMid = -Infinity;
+
+    for (let s = 0; s < this.spanSlices; s++) {
+      if (!this.sliceHasGeo[s]) continue;
+      activeSliceCount++;
+
+      const chord = Math.max(0.4, this.sliceTeX[s] - this.sliceLeX[s]);
+      const thick = Math.max(0.12, this.sliceThick[s]);
+      const yMid = this.sliceYMid[s];
+
+      if (chord < minChord) minChord = chord;
+      if (chord > maxChord) maxChord = chord;
+      chordSum += chord;
+
+      const sNorm = (s + 0.5) / this.spanSlices;
+      const absFrac = Math.abs(sNorm - 0.5) * 2; // 0 at center, 1 at tips
+      if (absFrac <= 0.24) {
+        centerChordSum += chord;
+        centerThickSum += thick;
+        centerCount++;
+      } else if (absFrac <= 0.90) {
+        wingChordSum += chord;
+        wingThickSum += thick;
+        wingCount++;
+        if (yMid < minWingYMid) minWingYMid = yMid;
+        if (yMid > maxWingYMid) maxWingYMid = yMid;
+      }
+    }
+
+    if (activeSliceCount === 0) {
+      return {
+        minChord: this.meanChord,
+        maxChord: this.meanChord,
+        meanChord: this.meanChord,
+        taperRatio: 1,
+        centerChord: this.meanChord,
+        outboardChord: this.meanChord,
+        centerThickness: Math.max(0.2, this.height * 0.3),
+        wingMeanThickness: Math.max(0.2, this.height * 0.25),
+        fuselageToWingRatio: 1,
+        minWingYMid: 0,
+        maxWingYMid: 0,
+        activeSliceCount: 0,
+        effectiveSpanRatio: 0,
+      };
+    }
+
+    const safeMinChord = Number.isFinite(minChord) ? minChord : this.meanChord;
+    const safeMaxChord = Math.max(safeMinChord, maxChord, 0.4);
+    const meanChord = chordSum / activeSliceCount;
+    const centerChord = centerCount > 0 ? centerChordSum / centerCount : meanChord;
+    const outboardChord = wingCount > 0 ? wingChordSum / wingCount : meanChord;
+    const centerThickness = centerCount > 0 ? centerThickSum / centerCount : Math.max(0.18, this.height * 0.4);
+    const wingMeanThickness = wingCount > 0 ? wingThickSum / wingCount : centerThickness;
+
+    return {
+      minChord: safeMinChord,
+      maxChord: safeMaxChord,
+      meanChord,
+      taperRatio: Math.max(0.05, Math.min(1, safeMinChord / safeMaxChord)),
+      centerChord,
+      outboardChord,
+      centerThickness,
+      wingMeanThickness,
+      fuselageToWingRatio: centerThickness / Math.max(0.12, wingMeanThickness),
+      minWingYMid: Number.isFinite(minWingYMid) ? minWingYMid : 0,
+      maxWingYMid: Number.isFinite(maxWingYMid) ? maxWingYMid : 0,
+      activeSliceCount,
+      effectiveSpanRatio: activeSliceCount / this.spanSlices,
+    };
   }
 
   /**

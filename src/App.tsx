@@ -62,6 +62,7 @@ import {
 } from './components/GlbUploader';
 import { WindTunnelCanvas3D } from './components/WindTunnelCanvas3D';
 import { WindTunnelCanvasWebGL } from './components/WindTunnelCanvasWebGL';
+import type { ModelFlowProfile } from './engine/FluidDynamics3D';
 import { TelemetryHUD } from './components/TelemetryHUD';
 import { AeroCharts } from './components/AeroCharts';
 import { D3AdvancedGraphs } from './components/D3AdvancedGraphs';
@@ -142,7 +143,10 @@ const INITIAL_3D_PARAMS: SimulationParams = {
   show_vortex_filaments: false,
   show_downwash_vectors: false,
   rake_spread: 1.0,
+  layer_gap: 0.55,
   streamline_resolution: 1.0,
+  streamline_count: 18,
+  particle_count: 480,
   flowDomainVersion: 0,
 };
 
@@ -334,7 +338,10 @@ function UnifiedWorkstation({
       customGlbFlipNose: false,
       customGlbYawDeg: 0,
       rake_spread: 1.0,
+      layer_gap: 0.55,
       streamline_resolution: 1.0,
+      streamline_count: 18,
+      particle_count: 480,
       flowDomainVersion: (prev.flowDomainVersion ?? 0) + 1,
     }));
     setIsPaused3D(false);
@@ -367,6 +374,8 @@ function UnifiedWorkstation({
       flowDomainVersion: (prev.flowDomainVersion ?? 0) + 1,
     }));
   }, []);
+
+  const [flowProfile3D, setFlowProfile3D] = useState<ModelFlowProfile | null>(null);
 
   const handleRefitFlowDomain = useCallback(() => {
     setParams3D((prev) => ({
@@ -545,7 +554,10 @@ function UnifiedWorkstation({
       customGlbFlipNose: false,
       customGlbYawDeg: 0,
       rake_spread: 1.0,
+      layer_gap: 0.55,
       streamline_resolution: 1.0,
+      streamline_count: 18,
+      particle_count: 480,
       customGlbVersion: (prev.customGlbVersion || 0) + 1,
       flowDomainVersion: (prev.flowDomainVersion ?? 0) + 1,
     }));
@@ -1265,6 +1277,7 @@ function UnifiedWorkstation({
               onRotateCustomGlbYaw90={handleRotateCustomGlbYaw90}
               onResetCustomGlbToDefault={handleResetCustomGlbToDefault}
               onRefitFlowDomain={handleRefitFlowDomain}
+              flowProfile={flowProfile3D}
             />
           ) : (
             <form onSubmit={(e) => e.preventDefault()} className="flex flex-col gap-3">
@@ -1772,14 +1785,14 @@ function UnifiedWorkstation({
                   </span>
                 </div>
                 <p className="text-[11px] leading-relaxed text-[#5C6670]">
-                  Streamlines and PIV streaks are integrated with RK2 midpoint advection through a 3D Biot-Savart horseshoe vortex lattice coupled to real surface vertex normals for boundary tangential slip (not a 3D Navier–Stokes RANS/LES solver).
+                  Velocity vectors, volumetric smoke streamlines, and Lagrangian PIV tracers combine a 3D Biot-Savart horseshoe vortex lattice, Rankine fuselage displacement, Prandtl boundary-layer shear, and SDF wall impermeability (real-time reduced-order model, not a volumetric Navier–Stokes RANS/LES solver).
                   {telemetry3D.isStalled ? (
                     <span className="text-red-700 font-medium block mt-2 p-2 rounded-lg bg-red-50 border border-red-200">
-                      Critical angle of attack exceeded. Adverse pressure gradients have detached the boundary layer, shedding unsteady von Kármán wake vortices.
+                      Critical angle of attack exceeded. Adverse pressure gradients have detached the boundary layer, shedding unsteady von Kármán wake streaklines.
                     </span>
                   ) : (
                     <span className="text-[#161A1D] block mt-1.5 font-medium">
-                      Attached circulation Γ remains steady; Lamb-Oseen wingtip vortices trail downstream from actual spanwise tips.
+                      Attached circulation Γ remains steady; Lamb-Oseen wingtip vortices trail downstream from spanwise tips along the Trefftz downwash plane.
                     </span>
                   )}
                 </p>

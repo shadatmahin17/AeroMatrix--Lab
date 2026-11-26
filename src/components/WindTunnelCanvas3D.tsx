@@ -1,9 +1,9 @@
 import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { SimulationParams, AeroTelemetry } from '../types/aerodynamics';
-import { AIRCRAFT_MODELS, getEffectiveStallAngles } from '../utils/airfoilGenerators';
+import { AIRCRAFT_MODELS } from '../utils/airfoilGenerators';
 import { getAircraft3DModel, computeFaceNormal, Vertex3D } from '../utils/aircraft3DGeometry';
 import { AircraftSurfaceField } from '../engine/AircraftSurfaceField';
-import { FluidDynamics3D, Fluid3DParams } from '../engine/FluidDynamics3D';
+import { FluidDynamics3D, Fluid3DParams, SmokeRakeSeed, Velocity3DResult } from '../engine/FluidDynamics3D';
 import { windTunnelAudio } from '../utils/audio';
 import {
   ArrowsClockwise,
@@ -16,7 +16,6 @@ import {
   Pulse,
   CompassRose,
   Cube,
-  Info,
 } from '@phosphor-icons/react';
 
 import { AeroCalibration } from '../lib/calibration';
@@ -36,18 +35,6 @@ interface CameraState {
   theta: number; // Azimuth
   phi: number;   // Elevation
   target: Vertex3D;
-}
-
-interface Particle3D {
-  x: number;
-  y: number;
-  z: number;
-  vx: number;
-  vy: number;
-  vz: number;
-  age: number;
-  maxAge: number;
-  color: string;
 }
 
 /**
@@ -93,9 +80,6 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
   // Cinematic 360 Auto-Orbit Mode
   const [isAutoOrbit, setIsAutoOrbit] = useState(false);
 
-  // 3D Particles
-  const particlesRef = useRef<Particle3D[]>([]);
-
   // Active camera preset button
   const [activePreset, setActivePreset] = useState<'side' | 'iso' | 'top' | 'chase' | 'front'>('iso');
 
@@ -105,47 +89,25 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
     return AircraftSurfaceField.fromProceduralMesh(baseMesh);
   }, [params.modelType, params.flaps_deg, params.customAirfoilVersion]);
 
-  // Initialize Dynamic Flow Particles seeded around wing & vortex tips
-  useEffect(() => {
-    const num = 850;
-    const vibrantColors = ['#38bdf8', '#0ea5e9', '#34d399', '#60a5fa', '#a7f3d0', '#fbbf24'];
-    const frame = FluidDynamics3D.getDynamicEmitterFrame(
-      surfaceField,
-      params.rake_spread ?? 1.0,
-      params.streamline_resolution ?? 1.0
-    );
-    const halfSpan = surfaceField?.halfSpan ?? 5.5;
-    const spread = params.rake_spread ?? 1.0;
-    const pArr: Particle3D[] = [];
-    for (let i = 0; i < num; i++) {
-      const roll = Math.random();
-      let y = frame.yMid;
-      let z = 0;
-      if (roll < 0.70) {
-        y = frame.yMid + (Math.random() - 0.5) * Math.max(0.9, frame.modelHeight * 1.1 * spread);
-        z = (Math.random() - 0.5) * 2 * Math.max(1.2, halfSpan * 0.92 * spread);
-      } else if (roll < 0.90) {
-        const tipSign = Math.random() > 0.5 ? 1 : -1;
-        z = tipSign * (halfSpan * 0.94 + (Math.random() - 0.5) * 0.9);
-        y = frame.yMid + (Math.random() - 0.5) * Math.max(0.85, frame.modelHeight * 0.65);
-      } else {
-        y = frame.yMid + (Math.random() - 0.5) * 2 * frame.yHalf;
-        z = (Math.random() - 0.5) * 2 * frame.zHalf;
-      }
-      pArr.push({
-        x: frame.xSpawn + Math.random() * Math.max(8, frame.xRecycle - frame.xSpawn),
-        y,
-        z,
-        vx: 0.35 + Math.random() * 0.22,
-        vy: 0,
-        vz: 0,
-        age: Math.random() * 200,
-        maxAge: 180 + Math.random() * 100,
-        color: vibrantColors[i % vibrantColors.length],
-      });
-    }
-    particlesRef.current = pArr;
-  }, [surfaceField, params.rake_spread, params.flowDomainVersion]);
+  // Lagrangian PIV tracer pool & unsteady simulation clock for 2D-projected fallback renderer
+  const CANVAS_PIV_COUNT = 1200;
+  const pivPoolRef = useRef<{
+    initialized: boolean;
+    modelKey: string;
+    x: Float32Array;
+    y: Float32Array;
+    z: Float32Array;
+    inner: Uint8Array;
+  }>({
+    initialized: false,
+    modelKey: '',
+    x: new Float32Array(CANVAS_PIV_COUNT),
+    y: new Float32Array(CANVAS_PIV_COUNT),
+    z: new Float32Array(CANVAS_PIV_COUNT),
+    inner: new Uint8Array(CANVAS_PIV_COUNT),
+  });
+  const simTimeRef = useRef<number>(0);
+  const lastPerfRef = useRef<number>(performance.now());
 
   // Sync Audio with simulation speed & stall
   useEffect(() => {
@@ -233,6 +195,12 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
     const cy = height / 2;
     const focalLength = Math.min(width, height) * 1.35;
     const now = Date.now();
+    const perfNow = performance.now();
+    const dtReal = Math.min(0.05, Math.max(0.001, (perfNow - lastPerfRef.current) * 0.001));
+    lastPerfRef.current = perfNow;
+    if (!isPaused) {
+      simTimeRef.current += dtReal;
+    }
 
     // 1. Calculate Camera Position & View Matrix
     const cam = cameraStateRef.current;
@@ -313,10 +281,7 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
       }
     }
 
-    // 4. Update and Render Dynamic 3D Flow Particles (Adaptive RK2 Vortex + Vertex Flow PIV Streaks)
-    const rakeSpread = params.rake_spread ?? 1.0;
-    const streamlineRes = params.streamline_resolution ?? 1.0;
-    const emitterFrame = FluidDynamics3D.getDynamicEmitterFrame(surfaceField, rakeSpread, streamlineRes);
+    // 4. 3D Fluid Velocity Field Parameters (for Smoke Streamlines, PIV Particles & Quiver)
     const fluid3DParams: Fluid3DParams = {
       modelType: params.modelType,
       aoaDeg: params.angle_of_attack,
@@ -328,119 +293,206 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
       isStalled: telemetry.isStalled,
       cl: telemetry.cl,
       cd: telemetry.cd,
-      timeSec: now * 0.001,
-      streamlineResolution: streamlineRes,
+      timeSec: simTimeRef.current,
+      streamlineResolution: params.streamline_resolution ?? 1.0,
       surfaceField,
       calibration: params.modelType === 'custom_glb' ? customGlbCalibration : null,
     };
 
-    if (params.show_particles) {
-      const pList = particlesRef.current;
-      const activeCount = Math.min(pList.length, Math.max(200, Math.round(pList.length * Math.min(1, params.smoke_density * 0.85))));
-      const dtStep = 0.28;
-      const halfSpan = surfaceField?.halfSpan ?? 5.5;
-      const outPos = { x: 0, y: 0, z: 0 };
-      const outVel = {
-        u: 0,
-        v: 0,
-        w: 0,
-        speed: 0,
-        cpIncompressible: 0,
-        pressureCoeff: 0,
-        pressureCoeffClamped: 0,
-        vorticity: 0,
-        isSeparated: false,
-      };
-      const yLim = Math.max(8, emitterFrame.yHalf * 4.2);
-      const zLim = Math.max(13, emitterFrame.zHalf * 1.8);
+    // 4a. Realistic Smoke Streamlines & Unsteady Streaklines (RK2 Biot-Savart + Prandtl Boundary Layer)
+    if (params.show_streamlines) {
+      const requestedLines = Math.min(48, Math.max(2, Math.round(params.streamline_count ?? 18)));
+      const seeds: SmokeRakeSeed[] = FluidDynamics3D.buildSmokeRakeSeeds(
+        surfaceField,
+        fluid3DParams,
+        params.rake_spread ?? 1.0,
+        params.smoke_density,
+        requestedLines
+      ).slice(0, requestedLines);
+      const resScale = Math.max(0.5, Math.min(2.0, params.streamline_resolution ?? 1.0));
+      const ds = Math.max(0.16, 0.28 / resScale);
+      const steps = Math.round(92 * resScale);
+      const densityAlpha = Math.min(0.9, 0.35 + params.smoke_density * 0.42);
+      const flowSpeedVis = Math.min(7.0, Math.max(1.2, ((params.airspeed_kts * 0.514444) / 180.0554) * 3.0));
 
-      for (let i = 0; i < activeCount; i++) {
-        const p = pList[i];
-        const prevPos = { x: p.x, y: p.y, z: p.z };
-        const v1 = FluidDynamics3D.getVelocity(p, fluid3DParams);
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
 
-        if (!isPaused) {
-          FluidDynamics3D.stepParticleRK2(
-            p.x,
-            p.y,
-            p.z,
-            fluid3DParams,
-            dtStep,
-            emitterFrame.dsMax,
-            outPos,
-            outVel
-          );
-          p.x = outPos.x;
-          p.y = outPos.y;
-          p.z = outPos.z;
-          p.vx = outVel.u;
-          p.vy = outVel.v;
-          p.vz = outVel.w;
-          p.age += 1;
+      for (const seed of seeds) {
+        const pts = FluidDynamics3D.traceStreamline(seed, fluid3DParams, steps, ds);
+        if (pts.length < 3) continue;
 
-          if (
-            p.x > emitterFrame.xRecycle ||
-            Math.abs(p.y - emitterFrame.yMid) > yLim ||
-            Math.abs(p.z) > zLim ||
-            p.age > p.maxAge
-          ) {
-            const roll = Math.random();
-            p.x = emitterFrame.xSpawn;
-            if (roll < 0.70) {
-              p.y = emitterFrame.yMid + (Math.random() - 0.5) * Math.max(0.9, emitterFrame.modelHeight * 1.1 * rakeSpread);
-              p.z = (Math.random() - 0.5) * 2 * Math.max(1.2, halfSpan * 0.92 * rakeSpread);
-            } else if (roll < 0.90) {
-              const tipSign = Math.random() > 0.5 ? 1 : -1;
-              p.z = tipSign * (halfSpan * 0.94 + (Math.random() - 0.5) * 0.9);
-              p.y = emitterFrame.yMid + (Math.random() - 0.5) * Math.max(0.85, emitterFrame.modelHeight * 0.65);
-            } else {
-              p.y = emitterFrame.yMid + (Math.random() - 0.5) * 2 * emitterFrame.yHalf;
-              p.z = (Math.random() - 0.5) * 2 * emitterFrame.zHalf;
+        let arcDist = 0;
+        let prevPt = pts[0];
+        let prevProj = project3Dto2D(prevPt, camX, camY, camZ, viewMatrix, focalLength, cx, cy);
+
+        for (let i = 1; i < pts.length; i++) {
+          const curPt = pts[i];
+          arcDist += Math.hypot(curPt.x - prevPt.x, curPt.y - prevPt.y, curPt.z - prevPt.z);
+          const curProj = project3Dto2D(curPt, camX, camY, camZ, viewMatrix, focalLength, cx, cy);
+
+          if (prevProj && curProj) {
+            const uFrac = i / (pts.length - 1);
+            const endFade = Math.min(1, uFrac * 12) * Math.min(1, (1 - uFrac) * 6);
+            const wisp = 0.72 + 0.28 * Math.sin(arcDist * 1.45 - simTimeRef.current * flowSpeedVis);
+            const segAlpha = densityAlpha * endFade * wisp * (seed.role === 'tip' ? 0.95 : 0.78);
+
+            if (segAlpha > 0.03) {
+              const strokeRgb = curPt.isSeparated
+                ? '244, 86, 76'
+                : seed.role === 'tip' || curPt.vorticity > 1.35
+                ? '72, 214, 252'
+                : curPt.pressureCoeffClamped < -0.25
+                ? '56, 189, 248'
+                : curPt.pressureCoeffClamped > 0.22
+                ? '245, 168, 52'
+                : '214, 236, 255';
+
+              // Outer volumetric smoke halo (widens slowly downstream via viscous diffusion)
+              const haloWidth = Math.min(5.0, (1.8 + Math.sqrt(arcDist) * 0.35) * (0.7 + params.smoke_density * 0.45));
+              ctx.strokeStyle = `rgba(${strokeRgb}, ${(segAlpha * 0.26).toFixed(3)})`;
+              ctx.lineWidth = haloWidth;
+              ctx.beginPath();
+              ctx.moveTo(prevProj.x, prevProj.y);
+              ctx.lineTo(curProj.x, curProj.y);
+              ctx.stroke();
+
+              // Inner filament core
+              ctx.strokeStyle = `rgba(${strokeRgb}, ${(segAlpha * 0.85).toFixed(3)})`;
+              ctx.lineWidth = Math.max(0.9, haloWidth * 0.36);
+              ctx.beginPath();
+              ctx.moveTo(prevProj.x, prevProj.y);
+              ctx.lineTo(curProj.x, curProj.y);
+              ctx.stroke();
             }
-            p.age = 0;
           }
-        } else if (FluidDynamics3D.isInsideSolid(p, fluid3DParams, surfaceField ? surfaceField.dMin * 0.75 : 0.08)) {
-          const out = FluidDynamics3D.constrainToExterior(p, fluid3DParams, surfaceField ? surfaceField.dMin : 0.12);
-          p.x = out.x;
-          p.y = out.y;
-          p.z = out.z;
-        }
-
-        const head = project3Dto2D(p, camX, camY, camZ, viewMatrix, focalLength, cx, cy);
-        const tailPos = isPaused
-          ? { x: p.x - v1.u * dtStep * 0.9, y: p.y - v1.v * dtStep * 0.9, z: p.z - v1.w * dtStep * 0.9 }
-          : prevPos;
-        const tail = project3Dto2D(tailPos, camX, camY, camZ, viewMatrix, focalLength, cx, cy);
-
-        if (head && tail) {
-          const alpha = Math.min(0.92, (1 - p.age / p.maxAge) * (0.55 + params.smoke_density * 0.3));
-
-          let strokeCol = '#34d399';
-          if (v1.isSeparated || (telemetry.isStalled && p.x > -1.0 && p.y > -0.2)) {
-            strokeCol = '#ef4444';
-          } else if (v1.vorticity > 0.35) {
-            strokeCol = '#38bdf8';
-          } else if (v1.pressureCoeffClamped < -0.5) {
-            strokeCol = '#0ea5e9';
-          } else if (v1.pressureCoeffClamped > 0.22) {
-            strokeCol = '#f59e0b';
-          }
-
-          ctx.strokeStyle = strokeCol;
-          ctx.globalAlpha = alpha;
-          ctx.lineWidth = Math.max(1.0, 20 / head.depth);
-          ctx.beginPath();
-          ctx.moveTo(tail.x, tail.y);
-          ctx.lineTo(head.x, head.y);
-          ctx.stroke();
-
-          ctx.fillStyle = strokeCol;
-          ctx.beginPath();
-          ctx.arc(head.x, head.y, Math.max(1.1, 15 / head.depth), 0, Math.PI * 2);
-          ctx.fill();
+          prevPt = curPt;
+          prevProj = curProj;
         }
       }
-      ctx.globalAlpha = 1.0;
+      ctx.restore();
+    }
+
+    // 4a-bis. Lagrangian PIV Tracer Particles (RK2 stratified advection)
+    if (params.show_particles) {
+      const pool = pivPoolRef.current;
+      const frame = FluidDynamics3D.getDynamicEmitterFrame(
+        surfaceField,
+        params.rake_spread ?? 1.0,
+        params.streamline_resolution ?? 1.0
+      );
+      const modelKey = `${params.modelType}_${params.flaps_deg}_${params.flowDomainVersion}_${params.rake_spread}`;
+      const activeCount = Math.min(
+        CANVAS_PIV_COUNT,
+        Math.max(20, Math.round(params.particle_count ?? 480))
+      );
+
+      if (!pool.initialized || pool.modelKey !== modelKey) {
+        const inletX = frame.xSpawn;
+        const modelStartX = surfaceField ? surfaceField.minX - 0.5 : -3.2;
+        const fillSpan = Math.max(2.0, modelStartX - inletX);
+        const clearance = surfaceField ? Math.max(0.08, surfaceField.dMin * 0.38) : 0.12;
+        for (let i = 0; i < CANVAS_PIV_COUNT; i++) {
+          const isInner = i < Math.round(CANVAS_PIV_COUNT * 0.65);
+          const rawPt = {
+            x: inletX + Math.random() * fillSpan,
+            y: frame.yMid + (Math.random() * 2 - 1) * frame.yHalf * (isInner ? 0.65 : 1.05),
+            z: (Math.random() * 2 - 1) * frame.zHalf * (isInner ? 0.72 : 1.05),
+          };
+          const pt = FluidDynamics3D.constrainToExterior(rawPt, fluid3DParams, clearance);
+          pool.x[i] = pt.x;
+          pool.y[i] = pt.y;
+          pool.z[i] = pt.z;
+          pool.inner[i] = isInner ? 1 : 0;
+        }
+        pool.initialized = true;
+        pool.modelKey = modelKey;
+      }
+
+      const scratchPos = { x: 0, y: 0, z: 0 };
+      const scratchVel: Velocity3DResult = {
+        u: 1, v: 0, w: 0, speed: 1, cpIncompressible: 0, pressureCoeff: 0,
+        pressureCoeffClamped: 0, vorticity: 0, isSeparated: false,
+      };
+      const dtPiv = isPaused ? 0 : Math.min(0.04, dtReal * 1.35);
+      const spanTotal = Math.max(4.0, frame.xRecycle - frame.xSpawn);
+
+      ctx.save();
+      ctx.lineWidth = 1.65;
+      ctx.lineCap = 'round';
+      for (let i = 0; i < activeCount; i++) {
+        let px = pool.x[i];
+        let py = pool.y[i];
+        let pz = pool.z[i];
+
+        if (!isPaused) {
+          FluidDynamics3D.stepParticleRK2(px, py, pz, fluid3DParams, dtPiv, frame.dsMax, scratchPos, scratchVel);
+          px = scratchPos.x;
+          py = scratchPos.y;
+          pz = scratchPos.z;
+        } else {
+          const vNow = FluidDynamics3D.getVelocity({ x: px, y: py, z: pz }, fluid3DParams);
+          scratchVel.u = vNow.u;
+          scratchVel.v = vNow.v;
+          scratchVel.w = vNow.w;
+          scratchVel.speed = vNow.speed;
+          scratchVel.pressureCoeffClamped = vNow.pressureCoeffClamped;
+          scratchVel.vorticity = vNow.vorticity;
+          scratchVel.isSeparated = vNow.isSeparated;
+        }
+
+        if (
+          px > frame.xRecycle ||
+          px < frame.xSpawn - 2.0 ||
+          Math.abs(py - frame.yMid) > frame.yHalf * 2.8 ||
+          Math.abs(pz) > frame.zHalf * 2.2
+        ) {
+          const isInner = pool.inner[i] === 1;
+          px = frame.xSpawn;
+          py = frame.yMid + (Math.random() * 2 - 1) * frame.yHalf * (isInner ? 0.65 : 1.05);
+          pz = (Math.random() * 2 - 1) * frame.zHalf * (isInner ? 0.72 : 1.05);
+          if (!FluidDynamics3D.isValidEmitterSeed(px, py, pz, fluid3DParams)) {
+            py = frame.yMid + (py >= frame.yMid ? 1 : -1) * Math.max(0.8, frame.yHalf);
+          }
+        }
+
+        pool.x[i] = px;
+        pool.y[i] = py;
+        pool.z[i] = pz;
+
+        const invS = scratchVel.speed > 1e-4 ? 1 / scratchVel.speed : 1;
+        const tailLen = Math.min(0.85, Math.max(0.1, scratchVel.speed * 0.14));
+        const pHead = project3Dto2D({ x: px, y: py, z: pz }, camX, camY, camZ, viewMatrix, focalLength, cx, cy);
+        const pTail = project3Dto2D(
+          {
+            x: px - scratchVel.u * invS * tailLen,
+            y: py - scratchVel.v * invS * tailLen,
+            z: pz - scratchVel.w * invS * tailLen,
+          },
+          camX, camY, camZ, viewMatrix, focalLength, cx, cy
+        );
+        if (pHead && pTail) {
+          const lifeIn = Math.min(1, Math.max(0, (px - frame.xSpawn) / (0.12 * spanTotal)));
+          const lifeOut = Math.min(1, Math.max(0, (frame.xRecycle - px) / (0.15 * spanTotal)));
+          const alpha = Math.min(lifeIn, lifeOut) * Math.min(0.95, 0.45 + params.smoke_density * 0.4);
+          if (alpha > 0.04) {
+            const rgb = scratchVel.isSeparated
+              ? '244, 86, 76'
+              : scratchVel.vorticity > 1.35
+              ? '72, 214, 252'
+              : scratchVel.pressureCoeffClamped < -0.25
+              ? '56, 189, 248'
+              : '165, 232, 252';
+            ctx.strokeStyle = `rgba(${rgb}, ${alpha.toFixed(3)})`;
+            ctx.beginPath();
+            ctx.moveTo(pTail.x, pTail.y);
+            ctx.lineTo(pHead.x, pHead.y);
+            ctx.stroke();
+          }
+        }
+      }
+      ctx.restore();
     }
 
     // 4b. Vector Quiver Grid Overlay (when show_quiver is active)
@@ -681,79 +733,7 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
       ctx.restore();
     }
 
-    // 8. Render Dynamic High-Density 3D Smoke Streamlines (Vortex + Vertex Flow Rake)
-    if (params.show_streamlines) {
-      const halfSpan = surfaceField?.halfSpan ?? 5.5;
-      const spanSpread = halfSpan * rakeSpread;
 
-      const rakeZ = params.modelType === 'cylinder'
-        ? [-2.2, -1.25, -0.55, 0.0, 0.55, 1.25, 2.2].map((z) => z * rakeSpread)
-        : [
-            -halfSpan * 0.96, -spanSpread * 0.65, -spanSpread * 0.35,
-            -0.8, 0.0, 0.8,
-            spanSpread * 0.35, spanSpread * 0.65, halfSpan * 0.96,
-          ];
-      const rakeY = params.modelType === 'cylinder'
-        ? [-2.0, 0.0, 2.0].map((y) => y * rakeSpread)
-        : [-0.65, -0.1, 0.45, 1.1].map((dy) => emitterFrame.yMid + dy * rakeSpread);
-
-      ctx.save();
-      ctx.lineWidth = Math.max(1.2, 1.6 * params.smoke_density);
-
-      for (let rkIdx = 0; rkIdx < rakeZ.length; rkIdx++) {
-        const z = rakeZ[rkIdx];
-        for (let ryIdx = 0; ryIdx < rakeY.length; ryIdx++) {
-          const y = rakeY[ryIdx];
-          const startPt = { x: emitterFrame.xSpawn, y, z };
-          const pts = FluidDynamics3D.traceStreamline(startPt, fluid3DParams, 175, 0.22);
-
-          if (pts.length > 2) {
-            ctx.beginPath();
-            let started = false;
-
-            for (let i = 0; i < pts.length; i++) {
-              const p2d = project3Dto2D(pts[i], camX, camY, camZ, viewMatrix, focalLength, cx, cy);
-              if (p2d) {
-                if (!started) {
-                  ctx.moveTo(p2d.x, p2d.y);
-                  started = true;
-                } else {
-                  ctx.lineTo(p2d.x, p2d.y);
-                }
-              }
-            }
-
-            const isSeparatedFilament = pts.some((pt) => pt.isSeparated);
-            const isVortexFilament = Math.abs(Math.abs(z) - halfSpan * 0.96) < 0.25 || pts.some((pt) => pt.vorticity > 0.35);
-            if (isSeparatedFilament || (telemetry.isStalled && y > -0.2)) {
-              ctx.strokeStyle = 'rgba(239, 68, 68, 0.78)';
-            } else if (isVortexFilament) {
-              ctx.strokeStyle = 'rgba(56, 189, 248, 0.85)';
-            } else if (y >= 0.35) {
-              ctx.strokeStyle = 'rgba(14, 165, 233, 0.72)';
-            } else {
-              ctx.strokeStyle = 'rgba(52, 211, 153, 0.62)';
-            }
-            ctx.stroke();
-
-            // Animated travelling smoke pulse node along each streamline
-            const pulsePhase = ((now * 0.055 * (params.airspeed_kts / 300) + rkIdx * 9 + ryIdx * 17) % 100) / 100;
-            const nodeIdx = Math.floor(pulsePhase * (pts.length - 1));
-            const nodePt = pts[nodeIdx];
-            if (nodePt) {
-              const node2d = project3Dto2D(nodePt, camX, camY, camZ, viewMatrix, focalLength, cx, cy);
-              if (node2d) {
-                ctx.fillStyle = isSeparatedFilament ? '#ef4444' : isVortexFilament ? '#7dd3fc' : '#38bdf8';
-                ctx.beginPath();
-                ctx.arc(node2d.x, node2d.y, Math.max(1.2, 15 / node2d.depth), 0, Math.PI * 2);
-                ctx.fill();
-              }
-            }
-          }
-        }
-      }
-      ctx.restore();
-    }
 
     // 10. Dynamic Supersonic Mach Shockwave Cone & Transonic Vapor Cloud (Mach >= 0.92)
     if (params.show_shockwaves && telemetry.mach >= 0.92) {
@@ -1133,14 +1113,6 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
     cam.distance = Math.max(8, Math.min(32, cam.distance + e.deltaY * 0.02));
   };
 
-  const { posStallAngle, negStallAngle } = getEffectiveStallAngles(params.modelType, params.flaps_deg);
-  const isNearOrAboveStall =
-    telemetry.isStalled ||
-    (posStallAngle > 0 && params.angle_of_attack >= posStallAngle - 2) ||
-    (negStallAngle > 0 && params.angle_of_attack <= -(negStallAngle - 2));
-  const showStreamlineCaveat =
-    isNearOrAboveStall || params.modelType === 'concorde' || telemetry.mach > 0.7;
-
   return (
     <div className="relative w-full h-full min-h-[220px] sm:min-h-[360px] lg:min-h-[460px] rounded-xl overflow-hidden border border-[var(--border)] bg-[#0D1114] select-none shadow-[var(--shadow-tech)]">
       {/* Real 3D Canvas */}
@@ -1309,17 +1281,8 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
         </button>
       </div>
 
-      {/* Bottom Floating Legend & Regime-Aware Streamline Caveat */}
+      {/* Bottom Floating Legend */}
       <div className="absolute bottom-2.5 left-2.5 right-2.5 flex flex-col gap-1.5 pointer-events-none text-[10px] sm:text-xs text-slate-300">
-        {showStreamlineCaveat && (
-          <div className="self-start max-w-full sm:max-w-xl px-2.5 py-1 rounded-lg bg-[#151A1E]/92 border border-amber-500/35 text-[10px] sm:text-[10.5px] text-slate-300 leading-snug flex items-start gap-1.5">
-            <Info weight="duotone" className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
-            <span>
-              Visual streamlines show attached subsonic potential-flow trajectories; nonlinear leading-edge vortex separation and shock waves are not resolved in 3D.
-            </span>
-          </div>
-        )}
-
         <div className="flex items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2 bg-[#151A1E]/95 px-2.5 sm:px-3 py-1 sm:py-1.5 rounded-lg border border-slate-700/80">
             <span className="hidden sm:inline text-slate-100 font-medium">Canvas 3D</span>
@@ -1333,6 +1296,18 @@ export const WindTunnelCanvas3D: React.FC<WindTunnelCanvas3DProps> = ({
               <span className="text-[10px] sm:text-[11px] text-sky-300 font-mono">Suction</span>
               <span className="w-2 h-2 rounded-full bg-amber-400 ml-0.5" />
               <span className="text-[10px] sm:text-[11px] text-amber-300 font-mono">Press</span>
+              {params.show_streamlines && (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-cyan-300 ml-0.5" />
+                  <span className="text-[10px] sm:text-[11px] text-cyan-200 font-mono">Smoke</span>
+                </>
+              )}
+              {params.show_particles && (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-sky-300 ml-0.5" />
+                  <span className="text-[10px] sm:text-[11px] text-sky-200 font-mono">PIV</span>
+                </>
+              )}
               {params.show_pressure_vectors && (
                 <>
                   <span className="w-2 h-2 rounded-full bg-emerald-400 ml-0.5" />

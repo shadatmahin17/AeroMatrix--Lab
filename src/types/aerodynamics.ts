@@ -74,9 +74,12 @@ export interface SimulationParams {
   show_separation_annotation?: boolean;
   show_vortex_filaments?: boolean;
   show_downwash_vectors?: boolean;
-  // Flow domain & integration controls
+  // Flow domain, integration & emitter count controls
   rake_spread?: number; // multiplier on smoke & streamline emitter cross-section (0.5..2.0)
+  layer_gap?: number; // vertical spacing between symmetric Y-layers in unified Box3 rake (0.25..1.20)
   streamline_resolution?: number; // multiplier on RK2 sub-step resolution (0.5..2.5)
+  streamline_count?: number; // number of smoke streamlines / streaklines (4..48)
+  particle_count?: number; // number of Lagrangian PIV tracer particles (40..1200)
   flowDomainVersion?: number; // increments when user triggers "Re-fit Flow Domain"
 }
 

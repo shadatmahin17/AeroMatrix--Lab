@@ -3,8 +3,8 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { SimulationParams, AeroTelemetry } from '../types/aerodynamics';
-import { AIRCRAFT_MODELS, getEffectiveStallAngles } from '../utils/airfoilGenerators';
-import { getAircraft3DModel, Vertex3D } from '../utils/aircraft3DGeometry';
+import { AIRCRAFT_MODELS } from '../utils/airfoilGenerators';
+import { getAircraft3DModel } from '../utils/aircraft3DGeometry';
 import {
   loadGlbAircraftModel,
   GLB_MODEL_REGISTRY,
@@ -16,7 +16,16 @@ import {
   normalizeAircraftGroupToTunnel,
   disposeThreeGroupResources,
 } from '../utils/aircraftGlbModels';
-import { FluidDynamics3D, Fluid3DParams } from '../engine/FluidDynamics3D';
+import {
+  DEFAULT_LAYER_GAP,
+  FluidDynamics3D,
+  Fluid3DParams,
+  MAX_UNIFIED_FILAMENTS,
+  ModelBoundingBox,
+  SmokeRakeSeed,
+  Velocity3DResult,
+} from '../engine/FluidDynamics3D';
+import { MeshBvhCollider } from '../engine/MeshBvhCollider';
 import { AircraftSurfaceField } from '../engine/AircraftSurfaceField';
 import { AeroCalibration, formatModelClassLabel } from '../lib/calibration';
 import { CustomGlbAsset, buildOrientedCustomGlbRoot } from './GlbUploader';
@@ -29,7 +38,6 @@ import {
   Cube,
   Camera,
   ArrowsClockwise,
-  Info,
 } from '@phosphor-icons/react';
 
 interface WindTunnelCanvasWebGLProps {
@@ -41,25 +49,6 @@ interface WindTunnelCanvasWebGLProps {
   onOpenModelInspector?: () => void;
   customGlbAsset?: CustomGlbAsset | null;
 }
-
-interface TracedCurveData {
-  points: (Vertex3D & { speed: number; pressureCoeff: number; pressureCoeffClamped: number; vorticity: number; isSeparated: boolean })[];
-}
-
-// Module-level scratch objects to keep 60fps particle animation strictly zero-allocation
-const _pOutPos: Vertex3D = { x: 0, y: 0, z: 0 };
-const _pOutVel = {
-  u: 0,
-  v: 0,
-  w: 0,
-  speed: 0,
-  cpIncompressible: 0,
-  pressureCoeff: 0,
-  pressureCoeffClamped: 0,
-  vorticity: 0,
-  isSeparated: false,
-};
-const _pTailRaw: Vertex3D = { x: 0, y: 0, z: 0 };
 
 function applyCachedXrayMaterial(root: THREE.Group): void {
   root.traverse((child) => {
@@ -82,6 +71,369 @@ function applyCachedXrayMaterial(root: THREE.Group): void {
   });
 }
 
+interface FilamentNode {
+  x: number;
+  y: number;
+  z: number;
+  speed: number;
+  cp: number;
+  vorticity: number;
+  isSeparated: boolean;
+}
+
+interface UnsteadyFilamentState {
+  seed: SmokeRakeSeed;
+  nodes: FilamentNode[];
+}
+
+const MAX_FILAMENTS = MAX_UNIFIED_FILAMENTS; // 200
+const MAX_NODES_PER_FILAMENT = 160;
+const MAX_SMOKE_VERTS = MAX_FILAMENTS * MAX_NODES_PER_FILAMENT * 2;
+const MAX_SMOKE_INDICES = MAX_FILAMENTS * (MAX_NODES_PER_FILAMENT - 1) * 6;
+const MAX_PIV_PARTICLES = 1200;
+
+// Pre-allocated scratch helpers for zero-GC 60fps animation loops & centripetal Catmull-Rom smoothing
+const _scratchPos = { x: 0, y: 0, z: 0 };
+const _scratchVel: Velocity3DResult = {
+  u: 1,
+  v: 0,
+  w: 0,
+  speed: 1,
+  cpIncompressible: 0,
+  pressureCoeff: 0,
+  pressureCoeffClamped: 0,
+  vorticity: 0,
+  isSeparated: false,
+};
+const _catmullControlPool: THREE.Vector3[] = Array.from(
+  { length: MAX_NODES_PER_FILAMENT },
+  () => new THREE.Vector3()
+);
+const _catmullCurve = new THREE.CatmullRomCurve3([], false, 'centripetal');
+const _catmullEvalPt = new THREE.Vector3();
+const _smoothedNodesBuf: FilamentNode[] = Array.from(
+  { length: MAX_NODES_PER_FILAMENT },
+  () => ({
+    x: 0,
+    y: 0,
+    z: 0,
+    speed: 1,
+    cp: 0,
+    vorticity: 0,
+    isSeparated: false,
+  })
+);
+const _boxBoundsTmp = new THREE.Box3();
+const _boxCenterTmp = new THREE.Vector3();
+const _boxSizeTmp = new THREE.Vector3();
+
+function computeFlowColorRGB(
+  cpClamped: number,
+  vorticity: number,
+  isSeparated: boolean,
+  role: SmokeRakeSeed['role'] | 'piv',
+  outRgb: [number, number, number]
+): void {
+  if (isSeparated) {
+    // Separated turbulent wake: warm coral-crimson
+    outRgb[0] = 0.96;
+    outRgb[1] = 0.34;
+    outRgb[2] = 0.30;
+    return;
+  }
+  if (role === 'tip' || vorticity > 1.35) {
+    // Wingtip / strong vortex core: luminous sky cyan
+    outRgb[0] = 0.28;
+    outRgb[1] = 0.84;
+    outRgb[2] = 0.99;
+    return;
+  }
+  if (cpClamped < -0.25) {
+    // Suction acceleration crest: vivid electric cyan-azure
+    const t = Math.min(1, (-cpClamped - 0.25) / 1.4);
+    outRgb[0] = 0.72 - 0.50 * t;
+    outRgb[1] = 0.92 - 0.08 * t;
+    outRgb[2] = 1.0;
+    return;
+  }
+  if (cpClamped > 0.22) {
+    // Forward stagnation compression: warm amber-gold
+    const t = Math.min(1, (cpClamped - 0.22) / 0.78);
+    outRgb[0] = 0.94 + 0.05 * t;
+    outRgb[1] = 0.85 - 0.24 * t;
+    outRgb[2] = 0.70 - 0.52 * t;
+    return;
+  }
+  if (role === 'piv') {
+    outRgb[0] = 0.52;
+    outRgb[1] = 0.88;
+    outRgb[2] = 0.98;
+    return;
+  }
+  // Attached freestream smoke core: clean icy white-blue
+  outRgb[0] = 0.82;
+  outRgb[1] = 0.93;
+  outRgb[2] = 1.0;
+}
+
+const _tmpRgb: [number, number, number] = [0.85, 0.94, 1.0];
+
+function createSmokeRibbonShaderMaterial(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 },
+      uFlowSpeed: { value: 2.2 },
+      uSmokeDensity: { value: 0.8 },
+    },
+    vertexShader: `
+      attribute vec3 aTangent;
+      attribute float aSide;
+      attribute vec3 aColor;
+      attribute vec4 aParams;
+
+      varying float vCross;
+      varying float vArcDist;
+      varying float vUFrac;
+      varying float vAlpha;
+      varying vec3 vColor;
+
+      void main() {
+        vCross = aSide;
+        vArcDist = aParams.x;
+        vUFrac = aParams.y;
+        vAlpha = aParams.w;
+        vColor = aColor;
+
+        vec3 viewDir = normalize(cameraPosition - position);
+        vec3 tanDir = normalize(aTangent);
+        vec3 sideDir = cross(tanDir, viewDir);
+        float sLen = length(sideDir);
+        if (sLen < 0.001) {
+          sideDir = normalize(cross(tanDir, vec3(0.0, 1.0, 0.001)));
+        } else {
+          sideDir /= sLen;
+        }
+
+        vec3 worldPos = position + sideDir * (aSide * aParams.z);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(worldPos, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float uTime;
+      uniform float uFlowSpeed;
+      uniform float uSmokeDensity;
+
+      varying float vCross;
+      varying float vArcDist;
+      varying float vUFrac;
+      varying float vAlpha;
+      varying vec3 vColor;
+
+      void main() {
+        float radial = exp(-vCross * vCross * 4.2);
+        float endFade = smoothstep(0.0, 0.055, vUFrac) * (1.0 - smoothstep(0.84, 1.0, vUFrac));
+        float wavePhase = vArcDist * 1.45 - uTime * uFlowSpeed;
+        float wisps = 0.72 + 0.28 * (0.65 * sin(wavePhase) + 0.35 * sin(wavePhase * 2.3 + 1.1));
+        vec3 finalCol = mix(vColor, vec3(0.96, 0.99, 1.0), radial * 0.32);
+        float alpha = radial * endFade * wisps * vAlpha * uSmokeDensity;
+        if (alpha < 0.01) discard;
+        gl_FragColor = vec4(finalCol, clamp(alpha, 0.0, 0.85));
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+}
+
+function createPivParticleShaderMaterial(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uOpacity: { value: 0.9 },
+    },
+    vertexShader: `
+      attribute float aAlpha;
+      attribute vec3 aColor;
+      varying float vAlpha;
+      varying vec3 vColor;
+      void main() {
+        vAlpha = aAlpha;
+        vColor = aColor;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float uOpacity;
+      varying float vAlpha;
+      varying vec3 vColor;
+      void main() {
+        float a = vAlpha * uOpacity;
+        if (a < 0.01) discard;
+        gl_FragColor = vec4(vColor, clamp(a, 0.0, 0.95));
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+  });
+}
+
+function packSmokeFilamentsToMesh(
+  mesh: THREE.Mesh | null,
+  filaments: UnsteadyFilamentState[],
+  viscosity: number,
+  smokeDensity: number
+): void {
+  if (!mesh) return;
+  const geo = mesh.geometry;
+  const posArr = (geo.attributes.position as THREE.BufferAttribute).array as Float32Array;
+  const tanArr = (geo.attributes.aTangent as THREE.BufferAttribute).array as Float32Array;
+  const sideArr = (geo.attributes.aSide as THREE.BufferAttribute).array as Float32Array;
+  const colArr = (geo.attributes.aColor as THREE.BufferAttribute).array as Float32Array;
+  const paramArr = (geo.attributes.aParams as THREE.BufferAttribute).array as Float32Array;
+  const idxArr = geo.index!.array as Uint32Array;
+
+  let vOffset = 0;
+  let iOffset = 0;
+  const densityScale = 0.65 + 0.45 * Math.max(0.25, Math.min(1.5, smokeDensity));
+
+  const fCount = Math.min(MAX_FILAMENTS, filaments.length);
+  for (let f = 0; f < fCount; f++) {
+    const fil = filaments[f];
+    const rawNodes = fil.nodes;
+    const rawLen = Math.min(MAX_NODES_PER_FILAMENT, rawNodes.length);
+    if (rawLen < 2) continue;
+
+    // Smooth filament centerline via centripetal THREE.CatmullRomCurve3 (zero-GC pre-allocated buffers)
+    const ctrlPts = _catmullCurve.points;
+    ctrlPts.length = 0;
+    let prevX = Infinity;
+    let prevY = Infinity;
+    let prevZ = Infinity;
+    for (let j = 0; j < rawLen; j++) {
+      const rn = rawNodes[j];
+      if (j === 0 || Math.hypot(rn.x - prevX, rn.y - prevY, rn.z - prevZ) > 1e-3) {
+        const pv = _catmullControlPool[ctrlPts.length];
+        pv.set(rn.x, rn.y, rn.z);
+        ctrlPts.push(pv);
+        prevX = rn.x;
+        prevY = rn.y;
+        prevZ = rn.z;
+      }
+    }
+
+    let nodes: FilamentNode[];
+    let nCount: number;
+    if (ctrlPts.length >= 4) {
+      nCount = Math.min(MAX_NODES_PER_FILAMENT, Math.max(ctrlPts.length, Math.round(ctrlPts.length * 1.15)));
+      const lastRawIdx = rawLen - 1;
+      for (let j = 0; j < nCount; j++) {
+        const uFrac = j / (nCount - 1);
+        _catmullCurve.getPoint(uFrac, _catmullEvalPt);
+
+        const fIdx = uFrac * lastRawIdx;
+        const i0 = Math.min(lastRawIdx, Math.floor(fIdx));
+        const i1 = Math.min(lastRawIdx, i0 + 1);
+        const alpha = fIdx - i0;
+        const aNode = rawNodes[i0];
+        const bNode = rawNodes[i1];
+
+        const dst = _smoothedNodesBuf[j];
+        dst.x = _catmullEvalPt.x;
+        dst.y = _catmullEvalPt.y;
+        dst.z = _catmullEvalPt.z;
+        dst.speed = aNode.speed + (bNode.speed - aNode.speed) * alpha;
+        dst.cp = aNode.cp + (bNode.cp - aNode.cp) * alpha;
+        dst.vorticity = aNode.vorticity + (bNode.vorticity - aNode.vorticity) * alpha;
+        dst.isSeparated = alpha < 0.5 ? aNode.isSeparated : bNode.isSeparated;
+      }
+      nodes = _smoothedNodesBuf;
+    } else {
+      nodes = rawNodes;
+      nCount = rawLen;
+    }
+
+    const baseVert = vOffset;
+    let arcDist = 0;
+    for (let j = 0; j < nCount; j++) {
+      const cur = nodes[j];
+      const prev = j > 0 ? nodes[j - 1] : cur;
+      const next = j < nCount - 1 ? nodes[j + 1] : cur;
+      if (j > 0) {
+        arcDist += Math.hypot(cur.x - prev.x, cur.y - prev.y, cur.z - prev.z);
+      }
+
+      let tx = next.x - prev.x;
+      let ty = next.y - prev.y;
+      let tz = next.z - prev.z;
+      const tLen = Math.hypot(tx, ty, tz) || 1;
+      tx /= tLen;
+      ty /= tLen;
+      tz /= tLen;
+
+      computeFlowColorRGB(cur.cp, cur.vorticity, cur.isSeparated, fil.seed.role, _tmpRgb);
+
+      // Mass-conservation narrowing where speed accelerates + downstream wake diffusion
+      const speedRatio = Math.max(0.45, Math.min(2.2, cur.speed / 1.2));
+      const wakeSpread = Math.sqrt(1 + 0.075 * arcDist * (0.4 + viscosity * 2.2));
+      const roleWidth = fil.seed.role === 'tip' ? 0.042 : 0.052;
+      const halfWidth =
+        (roleWidth * wakeSpread * densityScale) / Math.pow(speedRatio, 0.35) +
+        Math.min(0.025, cur.vorticity * 0.008);
+
+      const uFrac = j / (nCount - 1);
+      const roleAlpha = fil.seed.role === 'tip' ? 0.88 : 0.72;
+      const wakeAtten = 1.0 / (1.0 + 0.028 * arcDist * (0.3 + viscosity));
+      const localAlpha = roleAlpha * wakeAtten;
+
+      for (const side of [-1, 1]) {
+        const p3 = vOffset * 3;
+        const p4 = vOffset * 4;
+        posArr[p3] = cur.x;
+        posArr[p3 + 1] = cur.y;
+        posArr[p3 + 2] = cur.z;
+
+        tanArr[p3] = tx;
+        tanArr[p3 + 1] = ty;
+        tanArr[p3 + 2] = tz;
+
+        sideArr[vOffset] = side;
+
+        colArr[p3] = _tmpRgb[0];
+        colArr[p3 + 1] = _tmpRgb[1];
+        colArr[p3 + 2] = _tmpRgb[2];
+
+        paramArr[p4] = arcDist;
+        paramArr[p4 + 1] = uFrac;
+        paramArr[p4 + 2] = halfWidth;
+        paramArr[p4 + 3] = localAlpha;
+
+        vOffset++;
+      }
+
+      if (j < nCount - 1) {
+        const a = baseVert + j * 2;
+        const b = a + 1;
+        const c = a + 2;
+        const d = a + 3;
+        idxArr[iOffset++] = a;
+        idxArr[iOffset++] = b;
+        idxArr[iOffset++] = c;
+        idxArr[iOffset++] = b;
+        idxArr[iOffset++] = d;
+        idxArr[iOffset++] = c;
+      }
+    }
+  }
+
+  (geo.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+  (geo.attributes.aTangent as THREE.BufferAttribute).needsUpdate = true;
+  (geo.attributes.aSide as THREE.BufferAttribute).needsUpdate = true;
+  (geo.attributes.aColor as THREE.BufferAttribute).needsUpdate = true;
+  (geo.attributes.aParams as THREE.BufferAttribute).needsUpdate = true;
+  geo.index!.needsUpdate = true;
+  geo.setDrawRange(0, iOffset);
+}
+
 export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
   params,
   onParamChange,
@@ -98,13 +450,7 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
   const controlsRef = useRef<OrbitControls | null>(null);
   const animFrameIdRef = useRef<number | null>(null);
 
-  // Live state refs so the 60fps WebGL loop accesses current model and aerodynamic telemetry
-  const paramsRef = useRef(params);
-  paramsRef.current = params;
-  const telemetryRef = useRef(telemetry);
-  telemetryRef.current = telemetry;
-  const isPausedRef = useRef(isPaused);
-  isPausedRef.current = isPaused;
+  // Live state refs
   const customGlbAssetRef = useRef<CustomGlbAsset | null>(customGlbAsset);
   customGlbAssetRef.current = customGlbAsset;
   const activeCalibrationRef = useRef<AeroCalibration | null>(
@@ -113,27 +459,50 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
   activeCalibrationRef.current =
     params.modelType === 'custom_glb' && customGlbAsset ? customGlbAsset.calibration : null;
   const surfaceFieldRef = useRef<AircraftSurfaceField | null>(null);
+  const bvhColliderRef = useRef<MeshBvhCollider | null>(null);
 
   // Model & Simulation Roots
   const aircraftGroupRef = useRef<THREE.Group | null>(null);
   const glbRootRef = useRef<THREE.Group | null>(null);
   const isGlbCustomRef = useRef<boolean>(false);
   const proceduralMeshRef = useRef<THREE.Group | null>(null);
-  const spawnParticleRef = useRef<((idx: number, isInitial?: boolean) => void) | null>(null);
-  const streamlinesGroupRef = useRef<THREE.Group | null>(null);
   const quiverGroupRef = useRef<THREE.Group | null>(null);
-  const tracedCurvesRef = useRef<TracedCurveData[]>([]);
-  const smokePulsesRef = useRef<THREE.Points | null>(null);
-
-  // PIV Particle Streak Buffers
-  const particleStreaksRef = useRef<THREE.LineSegments | null>(null);
-  const particlePositionsRef = useRef<Float32Array | null>(null);
+  const smokeRibbonMeshRef = useRef<THREE.Mesh | null>(null);
+  const smokeShaderMatRef = useRef<THREE.ShaderMaterial | null>(null);
+  const smokeFilamentsRef = useRef<UnsteadyFilamentState[]>([]);
+  const smokeUnsteadyRef = useRef<boolean>(false);
+  const pivLinesRef = useRef<THREE.LineSegments | null>(null);
+  const pivShaderMatRef = useRef<THREE.ShaderMaterial | null>(null);
+  const pivStateRef = useRef<{
+    count: number;
+    x: Float32Array;
+    y: Float32Array;
+    z: Float32Array;
+    age: Float32Array;
+    innerFlag: Uint8Array;
+  }>({
+    count: 0,
+    x: new Float32Array(MAX_PIV_PARTICLES),
+    y: new Float32Array(MAX_PIV_PARTICLES),
+    z: new Float32Array(MAX_PIV_PARTICLES),
+    age: new Float32Array(MAX_PIV_PARTICLES),
+    innerFlag: new Uint8Array(MAX_PIV_PARTICLES),
+  });
 
   const machConeMeshRef = useRef<THREE.Mesh | null>(null);
   const forceVectorsGroupRef = useRef<THREE.Group | null>(null);
   const afterburnerGroupRef = useRef<THREE.Group | null>(null);
   const bodyAnnotationsGroupRef = useRef<THREE.Group | null>(null);
   const worldAnnotationsGroupRef = useRef<THREE.Group | null>(null);
+
+  // Live prop refs for zero-rebind 60fps loop
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
+  const telemetryRef = useRef(telemetry);
+  telemetryRef.current = telemetry;
+  const isPausedRef = useRef(isPaused);
+  isPausedRef.current = isPaused;
+  const simTimeRef = useRef<number>(0);
 
   // UI state
   const [activePreset, setActivePreset] = useState<'iso' | 'side' | 'top' | 'front' | 'chase'>('iso');
@@ -280,137 +649,45 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     }
     abGroup.visible = false;
 
-    // 8. PIV Velocity-Aligned Particle Streak System (LineSegments: 2 vertices per particle)
-    const particleCount = 900;
-    const pPositions = new Float32Array(particleCount * 3);
-    const streakPositions = new Float32Array(particleCount * 6);
-    const streakColors = new Float32Array(particleCount * 6);
-
-    const spawnParticle = (idx: number, isInitial = false) => {
-      const currentParams = paramsRef.current;
-      const currentTelemetry = telemetryRef.current;
-      const sf = surfaceFieldRef.current;
-      const frame = FluidDynamics3D.getDynamicEmitterFrame(
-        sf,
-        currentParams.rake_spread ?? 1.0,
-        currentParams.streamline_resolution ?? 1.0
-      );
-      const fluidCheckParams: Fluid3DParams = {
-        modelType: currentParams.modelType,
-        aoaDeg: currentParams.angle_of_attack,
-        airspeed_kts: currentParams.airspeed_kts,
-        mach: currentTelemetry.mach,
-        altitude_ft: currentParams.altitude_ft,
-        flapsDeg: currentParams.flaps_deg,
-        viscosity: currentParams.viscosity,
-        isStalled: currentTelemetry.isStalled,
-        cl: currentTelemetry.cl,
-        cd: currentTelemetry.cd,
-        surfaceField: sf,
-        calibration: activeCalibrationRef.current,
-      };
-
-      const activeSpan = sf ? sf.halfSpan : frame.zHalf;
-      let x = frame.xSpawn;
-      let y = frame.yMid;
-      let z = 0;
-
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const roll = Math.random();
-        if (roll < 0.70) {
-          // Concentrate 70% of seeds near wing/fuselage stagnation band
-          y = frame.yMid + (Math.random() - 0.5) * Math.max(0.9, frame.modelHeight * 1.1 * (currentParams.rake_spread ?? 1.0));
-          z = (Math.random() - 0.5) * 2 * Math.max(1.2, activeSpan * 0.92 * (currentParams.rake_spread ?? 1.0));
-        } else if (roll < 0.90) {
-          // Wingtip vortex roll-up seeding
-          const tipSign = Math.random() > 0.5 ? 1 : -1;
-          z = tipSign * (activeSpan * 0.94 + (Math.random() - 0.5) * 0.9);
-          y = frame.yMid + (Math.random() - 0.5) * Math.max(0.85, frame.modelHeight * 0.65);
-        } else {
-          // Outer tunnel flow framing
-          y = frame.yMid + (Math.random() - 0.5) * 2 * frame.yHalf;
-          z = (Math.random() - 0.5) * 2 * frame.zHalf;
-        }
-
-        x = isInitial
-          ? frame.xSpawn + Math.random() * Math.max(8, frame.xRecycle - frame.xSpawn)
-          : frame.xSpawn;
-
-        if (FluidDynamics3D.isValidEmitterSeed(x, y, z, fluidCheckParams)) {
-          break;
-        }
-      }
-
-      pPositions[idx * 3] = x;
-      pPositions[idx * 3 + 1] = y;
-      pPositions[idx * 3 + 2] = z;
-
-      streakPositions[idx * 6] = x - 0.35;
-      streakPositions[idx * 6 + 1] = y;
-      streakPositions[idx * 6 + 2] = z;
-      streakPositions[idx * 6 + 3] = x;
-      streakPositions[idx * 6 + 4] = y;
-      streakPositions[idx * 6 + 5] = z;
-
-      // Initial freestream tint
-      streakColors[idx * 6] = 0.09;
-      streakColors[idx * 6 + 1] = 0.41;
-      streakColors[idx * 6 + 2] = 0.67;
-      streakColors[idx * 6 + 3] = 0.35;
-      streakColors[idx * 6 + 4] = 0.78;
-      streakColors[idx * 6 + 5] = 0.98;
-    };
-    spawnParticleRef.current = spawnParticle;
-
-    for (let i = 0; i < particleCount; i++) {
-      spawnParticle(i, true);
-    }
-
-    const streakGeo = new THREE.BufferGeometry();
-    streakGeo.setAttribute('position', new THREE.BufferAttribute(streakPositions, 3));
-    streakGeo.setAttribute('color', new THREE.BufferAttribute(streakColors, 3));
-
-    const streakMat = new THREE.LineBasicMaterial({
-      vertexColors: true,
-      transparent: true,
-      opacity: 0.85,
-      blending: THREE.AdditiveBlending,
-    });
-
-    const particleStreaks = new THREE.LineSegments(streakGeo, streakMat);
-    particleStreaks.frustumCulled = false;
-    scene.add(particleStreaks);
-    particleStreaksRef.current = particleStreaks;
-    particlePositionsRef.current = pPositions;
-
-    // 9. Streamlines & Travelling Smoke Pulse Beads
-    const streamlinesGroup = new THREE.Group();
-    scene.add(streamlinesGroup);
-    streamlinesGroupRef.current = streamlinesGroup;
-
-    const pulseMaxCount = 240;
-    const pulsePos = new Float32Array(pulseMaxCount * 3);
-    const pulseCol = new Float32Array(pulseMaxCount * 3);
-    const pulseGeo = new THREE.BufferGeometry();
-    pulseGeo.setAttribute('position', new THREE.BufferAttribute(pulsePos, 3));
-    pulseGeo.setAttribute('color', new THREE.BufferAttribute(pulseCol, 3));
-    const pulseMat = new THREE.PointsMaterial({
-      size: 0.24,
-      vertexColors: true,
-      transparent: true,
-      opacity: 0.95,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    });
-    const smokePulses = new THREE.Points(pulseGeo, pulseMat);
-    smokePulses.frustumCulled = false;
-    scene.add(smokePulses);
-    smokePulsesRef.current = smokePulses;
-
-    // 10. Vector Quiver Group
+    // 8. Vector Quiver Group
     const quiverGroup = new THREE.Group();
     scene.add(quiverGroup);
     quiverGroupRef.current = quiverGroup;
+
+    // 9. Volumetric Billboarded Smoke Streamlines / Streaklines Ribbon Mesh
+    const smokeGeo = new THREE.BufferGeometry();
+    smokeGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_SMOKE_VERTS * 3), 3));
+    smokeGeo.setAttribute('aTangent', new THREE.BufferAttribute(new Float32Array(MAX_SMOKE_VERTS * 3), 3));
+    smokeGeo.setAttribute('aSide', new THREE.BufferAttribute(new Float32Array(MAX_SMOKE_VERTS), 1));
+    smokeGeo.setAttribute('aColor', new THREE.BufferAttribute(new Float32Array(MAX_SMOKE_VERTS * 3), 3));
+    smokeGeo.setAttribute('aParams', new THREE.BufferAttribute(new Float32Array(MAX_SMOKE_VERTS * 4), 4));
+    smokeGeo.setIndex(new THREE.BufferAttribute(new Uint32Array(MAX_SMOKE_INDICES), 1));
+    smokeGeo.setDrawRange(0, 0);
+
+    const smokeMat = createSmokeRibbonShaderMaterial();
+    smokeShaderMatRef.current = smokeMat;
+    const smokeMesh = new THREE.Mesh(smokeGeo, smokeMat);
+    smokeMesh.frustumCulled = false;
+    smokeMesh.renderOrder = 10;
+    smokeMesh.visible = false;
+    scene.add(smokeMesh);
+    smokeRibbonMeshRef.current = smokeMesh;
+
+    // 10. Lagrangian PIV Tracer Particle Streaks
+    const pivGeo = new THREE.BufferGeometry();
+    pivGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_PIV_PARTICLES * 2 * 3), 3));
+    pivGeo.setAttribute('aAlpha', new THREE.BufferAttribute(new Float32Array(MAX_PIV_PARTICLES * 2), 1));
+    pivGeo.setAttribute('aColor', new THREE.BufferAttribute(new Float32Array(MAX_PIV_PARTICLES * 2 * 3), 3));
+    pivGeo.setDrawRange(0, 0);
+
+    const pivMat = createPivParticleShaderMaterial();
+    pivShaderMatRef.current = pivMat;
+    const pivLines = new THREE.LineSegments(pivGeo, pivMat);
+    pivLines.frustumCulled = false;
+    pivLines.renderOrder = 11;
+    pivLines.visible = false;
+    scene.add(pivLines);
+    pivLinesRef.current = pivLines;
 
     // 11. Supersonic Mach Shockwave Cone
     const coneGeo = new THREE.ConeGeometry(6.0, 16.0, 32, 1, true);
@@ -444,14 +721,23 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     scene.add(worldAnnGroup);
     worldAnnotationsGroupRef.current = worldAnnGroup;
 
-    // 13. 60fps Simulation Loop (RK2 Particle Advection + Travelling Smoke Pulses)
-    let lastTime = performance.now();
+    // 13. 60fps Render Loop
+    let lastPerf = performance.now();
     const animate = () => {
       animFrameIdRef.current = requestAnimationFrame(animate);
 
       const now = performance.now();
-      const dt = Math.min((now - lastTime) / 1000, 0.05);
-      lastTime = now;
+      const dtReal = Math.min(0.05, Math.max(0.001, (now - lastPerf) * 0.001));
+      lastPerf = now;
+
+      const curParams = paramsRef.current;
+      const curTelemetry = telemetryRef.current;
+      const paused = isPausedRef.current;
+      const sf = surfaceFieldRef.current;
+
+      if (!paused) {
+        simTimeRef.current += dtReal;
+      }
 
       if (isAutoOrbitRef.current && controlsRef.current) {
         controlsRef.current.autoRotate = true;
@@ -460,184 +746,237 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
         controlsRef.current.autoRotate = false;
       }
 
-      const currentParams = paramsRef.current;
-      const currentTelemetry = telemetryRef.current;
-      const currentPaused = isPausedRef.current;
+      if (machConeMeshRef.current && machConeMeshRef.current.visible) {
+        const pulse = 1.0 + Math.sin(now * 0.008) * 0.035;
+        machConeMeshRef.current.scale.set(pulse, pulse, pulse);
+      }
 
-      const fluid3DParams: Fluid3DParams = {
-        modelType: currentParams.modelType,
-        aoaDeg: currentParams.angle_of_attack,
-        airspeed_kts: currentParams.airspeed_kts,
-        mach: currentTelemetry.mach,
-        altitude_ft: currentParams.altitude_ft,
-        flapsDeg: currentParams.flaps_deg,
-        viscosity: currentParams.viscosity,
-        isStalled: currentTelemetry.isStalled,
-        cl: currentTelemetry.cl,
-        cd: currentTelemetry.cd,
-        timeSec: now * 0.001,
-        streamlineResolution: currentParams.streamline_resolution ?? 1.0,
-        surfaceField: surfaceFieldRef.current,
-        calibration: activeCalibrationRef.current,
-      };
+      const needsFlowEval = curParams.show_streamlines || curParams.show_particles;
+      const vInfTunnel = Math.max(0.4, ((curParams.airspeed_kts * 0.514444) / 180.0554) * 1.2);
+      const frame = needsFlowEval
+        ? FluidDynamics3D.getDynamicEmitterFrame(
+            sf,
+            curParams.rake_spread ?? 1.0,
+            curParams.streamline_resolution ?? 1.0
+          )
+        : null;
+      const fluidParamsLive: Fluid3DParams | null = needsFlowEval
+        ? {
+            modelType: curParams.modelType,
+            aoaDeg: curParams.angle_of_attack,
+            airspeed_kts: curParams.airspeed_kts,
+            mach: curTelemetry.mach,
+            altitude_ft: curParams.altitude_ft,
+            flapsDeg: curParams.flaps_deg,
+            viscosity: curParams.viscosity,
+            isStalled: curTelemetry.isStalled,
+            cl: curTelemetry.cl,
+            cd: curTelemetry.cd,
+            timeSec: simTimeRef.current,
+            streamlineResolution: curParams.streamline_resolution ?? 1.0,
+            surfaceField: sf,
+            bvhCollider: bvhColliderRef.current,
+            calibration: activeCalibrationRef.current,
+          }
+        : null;
 
-      // A. Update PIV Velocity-Aligned Streaks via adaptive RK2 Midpoint Sub-Stepping
-      if (particlePositionsRef.current && particleStreaksRef.current) {
-        particleStreaksRef.current.visible = currentParams.show_particles;
-        if (currentParams.show_particles) {
-          const pos = particlePositionsRef.current;
-          const posAttr = particleStreaksRef.current.geometry.attributes.position as THREE.BufferAttribute;
-          const colAttr = particleStreaksRef.current.geometry.attributes.color as THREE.BufferAttribute;
-          const streakArr = posAttr.array as Float32Array;
-          const colArr = colAttr.array as Float32Array;
-          const activeCount = Math.min(particleCount, Math.max(220, Math.round(particleCount * Math.min(1, currentParams.smoke_density * 0.85))));
-          particleStreaksRef.current.geometry.setDrawRange(0, activeCount * 2);
-
-          const mat = particleStreaksRef.current.material as THREE.LineBasicMaterial;
-          mat.opacity = Math.min(0.95, 0.45 + currentParams.smoke_density * 0.32);
-
-          const frame = FluidDynamics3D.getDynamicEmitterFrame(
-            surfaceFieldRef.current,
-            currentParams.rake_spread ?? 1.0,
-            currentParams.streamline_resolution ?? 1.0
+      // Update Volumetric Smoke Streamlines / Unsteady Streaklines
+      if (smokeShaderMatRef.current && smokeRibbonMeshRef.current) {
+        smokeRibbonMeshRef.current.visible = curParams.show_streamlines;
+        if (curParams.show_streamlines && frame && fluidParamsLive) {
+          smokeShaderMatRef.current.uniforms.uTime.value = simTimeRef.current;
+          smokeShaderMatRef.current.uniforms.uFlowSpeed.value = Math.min(7.5, Math.max(1.2, vInfTunnel * 2.5));
+          smokeShaderMatRef.current.uniforms.uSmokeDensity.value = Math.min(
+            1.15,
+            0.35 + curParams.smoke_density * 0.55
           );
-          const stepScale = dt * 15.0;
-          const yRecycleLimit = Math.max(8.5, frame.yHalf * 4.5);
-          const zRecycleLimit = Math.max(14.5, frame.zHalf * 1.9);
+
+          // In unsteady wake regimes (cylinder von Kármán street, stall, bluff body), advect live streaklines
+          if (smokeUnsteadyRef.current && !paused && smokeFilamentsRef.current.length > 0) {
+            const nodeSpacing = Math.max(0.18, 0.24 / (curParams.streamline_resolution ?? 1.0));
+            const dtStep = Math.min(0.045, dtReal * 1.45);
+            for (let f = 0; f < smokeFilamentsRef.current.length; f++) {
+              const fil = smokeFilamentsRef.current[f];
+              const nodes = fil.nodes;
+              for (let j = 0; j < nodes.length; j++) {
+                const nd = nodes[j];
+                FluidDynamics3D.stepParticleRK2(
+                  nd.x,
+                  nd.y,
+                  nd.z,
+                  fluidParamsLive,
+                  dtStep,
+                  frame.dsMax,
+                  _scratchPos,
+                  _scratchVel
+                );
+                nd.x = _scratchPos.x;
+                nd.y = _scratchPos.y;
+                nd.z = _scratchPos.z;
+                nd.speed = _scratchVel.speed;
+                nd.cp = _scratchVel.pressureCoeffClamped;
+                nd.vorticity = _scratchVel.vorticity;
+                nd.isSeparated = _scratchVel.isSeparated;
+              }
+              if (nodes.length > 0) {
+                const head = nodes[0];
+                const distFromNozzle = Math.hypot(
+                  head.x - fil.seed.x,
+                  head.y - fil.seed.y,
+                  head.z - fil.seed.z
+                );
+                if (distFromNozzle >= nodeSpacing) {
+                  const vSeed = FluidDynamics3D.getVelocity(fil.seed, fluidParamsLive);
+                  nodes.unshift({
+                    x: fil.seed.x,
+                    y: fil.seed.y,
+                    z: fil.seed.z,
+                    speed: vSeed.speed,
+                    cp: vSeed.pressureCoeffClamped,
+                    vorticity: vSeed.vorticity,
+                    isSeparated: vSeed.isSeparated,
+                  });
+                  if (nodes.length > MAX_NODES_PER_FILAMENT) {
+                    nodes.pop();
+                  }
+                }
+                while (nodes.length > 10 && nodes[nodes.length - 1].x > frame.xRecycle + 4) {
+                  nodes.pop();
+                }
+              }
+            }
+            packSmokeFilamentsToMesh(
+              smokeRibbonMeshRef.current,
+              smokeFilamentsRef.current,
+              curParams.viscosity,
+              curParams.smoke_density
+            );
+          }
+        }
+      }
+
+      // Update Lagrangian PIV Tracer Particles
+      if (pivLinesRef.current && pivShaderMatRef.current) {
+        pivLinesRef.current.visible = curParams.show_particles;
+        if (curParams.show_particles && pivStateRef.current.count > 0 && frame && fluidParamsLive) {
+          const pState = pivStateRef.current;
+          const activeCount = pState.count;
+          const geo = pivLinesRef.current.geometry;
+          const posAttr = geo.attributes.position as THREE.BufferAttribute;
+          const alphaAttr = geo.attributes.aAlpha as THREE.BufferAttribute;
+          const colAttr = geo.attributes.aColor as THREE.BufferAttribute;
+          const posArr = posAttr.array as Float32Array;
+          const alphaArr = alphaAttr.array as Float32Array;
+          const colArr = colAttr.array as Float32Array;
+
+          pivShaderMatRef.current.uniforms.uOpacity.value = Math.min(
+            1.0,
+            0.48 + curParams.smoke_density * 0.42
+          );
+
+          const dtPiv = paused ? 0 : Math.min(0.04, dtReal * 1.35);
+          const streakScale = 0.085 + 0.045 * Math.min(2.2, vInfTunnel / 1.2);
+          const spanTotal = Math.max(4.0, frame.xRecycle - frame.xSpawn);
 
           for (let i = 0; i < activeCount; i++) {
-            const px = pos[i * 3];
-            const py = pos[i * 3 + 1];
-            const pz = pos[i * 3 + 2];
+            let px = pState.x[i];
+            let py = pState.y[i];
+            let pz = pState.z[i];
 
-            if (!currentPaused) {
+            if (!paused) {
               FluidDynamics3D.stepParticleRK2(
                 px,
                 py,
                 pz,
-                fluid3DParams,
-                stepScale,
+                fluidParamsLive,
+                dtPiv,
                 frame.dsMax,
-                _pOutPos,
-                _pOutVel
+                _scratchPos,
+                _scratchVel
               );
-
-              const nx = _pOutPos.x;
-              const ny = _pOutPos.y;
-              const nz = _pOutPos.z;
-
-              pos[i * 3] = nx;
-              pos[i * 3 + 1] = ny;
-              pos[i * 3 + 2] = nz;
-
-              const speed = _pOutVel.speed || 1;
-              const streakLen = Math.min(1.25, 0.24 + speed * 0.34);
-              const invS = streakLen / speed;
-
-              _pTailRaw.x = nx - _pOutVel.u * invS;
-              _pTailRaw.y = ny - _pOutVel.v * invS;
-              _pTailRaw.z = nz - _pOutVel.w * invS;
-              const tail = FluidDynamics3D.constrainToExterior(_pTailRaw, fluid3DParams, 0.07);
-
-              // Tail -> Head aligned with real velocity vector
-              streakArr[i * 6] = tail.x;
-              streakArr[i * 6 + 1] = tail.y;
-              streakArr[i * 6 + 2] = tail.z;
-              streakArr[i * 6 + 3] = nx;
-              streakArr[i * 6 + 4] = ny;
-              streakArr[i * 6 + 5] = nz;
-
-              // Color by real flow physics: Separation / Suction / Vorticity / Compression
-              let hr = 0.22, hg = 0.74, hb = 0.97;
-              if (_pOutVel.isSeparated || (currentTelemetry.isStalled && nx > -1.0 && ny > -0.5)) {
-                hr = 0.96; hg = 0.28; hb = 0.28; // Separated turbulent wake
-              } else if (_pOutVel.vorticity > 0.35) {
-                hr = 0.35; hg = 0.92; hb = 1.0; // Intense Biot-Savart vortex swirl
-              } else if (_pOutVel.pressureCoeffClamped < -0.55) {
-                hr = 0.09; hg = 0.58; hb = 0.92; // Bernoulli suction peak
-              } else if (_pOutVel.pressureCoeffClamped > 0.25) {
-                hr = 0.98; hg = 0.72; hb = 0.16; // Stagnation / compression
-              } else {
-                hr = 0.20; hg = 0.83; hb = 0.60; // Laminar freestream
-              }
-
-              // Dim tail, bright head
-              colArr[i * 6] = hr * 0.28;
-              colArr[i * 6 + 1] = hg * 0.28;
-              colArr[i * 6 + 2] = hb * 0.28;
-              colArr[i * 6 + 3] = hr;
-              colArr[i * 6 + 4] = hg;
-              colArr[i * 6 + 5] = hb;
+              px = _scratchPos.x;
+              py = _scratchPos.y;
+              pz = _scratchPos.z;
+              pState.age[i] += dtPiv;
+            } else {
+              const vNow = FluidDynamics3D.getVelocity({ x: px, y: py, z: pz }, fluidParamsLive);
+              _scratchVel.u = vNow.u;
+              _scratchVel.v = vNow.v;
+              _scratchVel.w = vNow.w;
+              _scratchVel.speed = vNow.speed;
+              _scratchVel.pressureCoeffClamped = vNow.pressureCoeffClamped;
+              _scratchVel.vorticity = vNow.vorticity;
+              _scratchVel.isSeparated = vNow.isSeparated;
             }
 
             if (
-              pos[i * 3] > frame.xRecycle ||
-              Math.abs(pos[i * 3 + 1] - frame.yMid) > yRecycleLimit ||
-              Math.abs(pos[i * 3 + 2]) > zRecycleLimit
+              px > frame.xRecycle ||
+              px < frame.xSpawn - 2.0 ||
+              Math.abs(py - frame.yMid) > frame.yHalf * 2.8 ||
+              Math.abs(pz) > frame.zHalf * 2.2
             ) {
-              spawnParticle(i, false);
+              const isInner = pState.innerFlag[i] === 1;
+              const yScale = isInner ? 0.65 : 1.05;
+              const zScale = isInner ? 0.72 : 1.05;
+              let rx = frame.xSpawn;
+              let ry = frame.yMid + (Math.random() * 2 - 1) * frame.yHalf * yScale;
+              let rz = (Math.random() * 2 - 1) * frame.zHalf * zScale;
+              if (!FluidDynamics3D.isValidEmitterSeed(rx, ry, rz, fluidParamsLive)) {
+                ry = frame.yMid + (ry >= frame.yMid ? 1 : -1) * Math.max(0.8, frame.yHalf);
+              }
+              px = rx;
+              py = ry;
+              pz = rz;
+              pState.age[i] = 0;
             }
+
+            pState.x[i] = px;
+            pState.y[i] = py;
+            pState.z[i] = pz;
+
+            const tailLen = Math.min(0.95, Math.max(0.08, _scratchVel.speed * streakScale));
+            const invS = _scratchVel.speed > 1e-4 ? 1 / _scratchVel.speed : 1;
+            const tailX = px - _scratchVel.u * invS * tailLen;
+            const tailY = py - _scratchVel.v * invS * tailLen;
+            const tailZ = pz - _scratchVel.w * invS * tailLen;
+
+            const lifeIn = Math.min(1.0, Math.max(0.0, (px - frame.xSpawn) / (0.12 * spanTotal)));
+            const lifeOut = Math.min(1.0, Math.max(0.0, (frame.xRecycle - px) / (0.15 * spanTotal)));
+            const headAlpha = Math.min(lifeIn, lifeOut);
+
+            computeFlowColorRGB(
+              _scratchVel.pressureCoeffClamped,
+              _scratchVel.vorticity,
+              _scratchVel.isSeparated,
+              'piv',
+              _tmpRgb
+            );
+
+            const vTail = i * 2;
+            const vHead = vTail + 1;
+            posArr[vTail * 3] = tailX;
+            posArr[vTail * 3 + 1] = tailY;
+            posArr[vTail * 3 + 2] = tailZ;
+            posArr[vHead * 3] = px;
+            posArr[vHead * 3 + 1] = py;
+            posArr[vHead * 3 + 2] = pz;
+
+            alphaArr[vTail] = 0.0;
+            alphaArr[vHead] = headAlpha;
+
+            colArr[vTail * 3] = _tmpRgb[0] * 0.6;
+            colArr[vTail * 3 + 1] = _tmpRgb[1] * 0.6;
+            colArr[vTail * 3 + 2] = _tmpRgb[2] * 0.6;
+            colArr[vHead * 3] = _tmpRgb[0];
+            colArr[vHead * 3 + 1] = _tmpRgb[1];
+            colArr[vHead * 3 + 2] = _tmpRgb[2];
           }
 
           posAttr.needsUpdate = true;
+          alphaAttr.needsUpdate = true;
           colAttr.needsUpdate = true;
+          geo.setDrawRange(0, activeCount * 2);
         }
-      }
-
-      // B. Animate Travelling Smoke Pulses along Traced Vortex Streamlines
-      if (smokePulsesRef.current) {
-        const curves = tracedCurvesRef.current;
-        const showSmoke = currentParams.show_streamlines && curves.length > 0;
-        smokePulsesRef.current.visible = showSmoke;
-
-        if (showSmoke) {
-          const pPosAttr = smokePulsesRef.current.geometry.attributes.position as THREE.BufferAttribute;
-          const pColAttr = smokePulsesRef.current.geometry.attributes.color as THREE.BufferAttribute;
-          const pArr = pPosAttr.array as Float32Array;
-          const cArr = pColAttr.array as Float32Array;
-
-          const pulsesPerCurve = 3;
-          const totalPulses = Math.min(pulseMaxCount, curves.length * pulsesPerCurve);
-          smokePulsesRef.current.geometry.setDrawRange(0, totalPulses);
-
-          const speedFactor = (currentParams.airspeed_kts / 350) * 0.35;
-          let idx = 0;
-
-          for (let c = 0; c < curves.length && idx < totalPulses; c++) {
-            const pts = curves[c].points;
-            if (pts.length < 2) continue;
-
-            for (let k = 0; k < pulsesPerCurve && idx < totalPulses; k++) {
-              const t = ((now * 0.001 * speedFactor + c * 0.17 + k / pulsesPerCurve) % 1 + 1) % 1;
-              const fIdx = t * (pts.length - 1);
-              const i0 = Math.floor(fIdx);
-              const i1 = Math.min(pts.length - 1, i0 + 1);
-              const alpha = fIdx - i0;
-
-              const a = pts[i0];
-              const b = pts[i1];
-              pArr[idx * 3] = a.x + (b.x - a.x) * alpha;
-              pArr[idx * 3 + 1] = a.y + (b.y - a.y) * alpha;
-              pArr[idx * 3 + 2] = a.z + (b.z - a.z) * alpha;
-
-              if (a.isSeparated) {
-                cArr[idx * 3] = 0.96; cArr[idx * 3 + 1] = 0.28; cArr[idx * 3 + 2] = 0.28;
-              } else if (a.vorticity > 0.35) {
-                cArr[idx * 3] = 0.45; cArr[idx * 3 + 1] = 0.95; cArr[idx * 3 + 2] = 1.0;
-              } else {
-                cArr[idx * 3] = 0.9; cArr[idx * 3 + 1] = 0.96; cArr[idx * 3 + 2] = 1.0;
-              }
-              idx++;
-            }
-          }
-          pPosAttr.needsUpdate = true;
-          pColAttr.needsUpdate = true;
-        }
-      }
-
-      if (machConeMeshRef.current && machConeMeshRef.current.visible) {
-        const pulse = 1.0 + Math.sin(now * 0.008) * 0.035;
-        machConeMeshRef.current.scale.set(pulse, pulse, pulse);
       }
 
       controls.update();
@@ -665,10 +1004,12 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
       renderer.domElement.removeEventListener('webglcontextlost', handleContextLost, false);
       if (animFrameIdRef.current) cancelAnimationFrame(animFrameIdRef.current);
       if (envTex) envTex.dispose();
-      streakGeo.dispose();
-      streakMat.dispose();
-      pulseGeo.dispose();
-      pulseMat.dispose();
+      bvhColliderRef.current?.dispose();
+      bvhColliderRef.current = null;
+      smokeGeo.dispose();
+      smokeMat.dispose();
+      pivGeo.dispose();
+      pivMat.dispose();
       coneGeo.dispose();
       coneMat.dispose();
       controls.dispose();
@@ -711,6 +1052,10 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
       surfaceFieldRef.current.clear();
       surfaceFieldRef.current = null;
     }
+    if (bvhColliderRef.current) {
+      bvhColliderRef.current.dispose();
+      bvhColliderRef.current = null;
+    }
 
     setModelLoading(true);
     setLoadProgress(0);
@@ -738,12 +1083,12 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
         Boolean(params.customGlbFlipNose),
         params.customGlbYawDeg ?? 0
       );
-      root.updateMatrixWorld(true);
-      surfaceFieldRef.current = AircraftSurfaceField.fromThreeGroup(root);
-
       glbRootRef.current = root;
       isGlbCustomRef.current = true;
       aircraftGroup.add(root);
+      aircraftGroup.updateMatrixWorld(true);
+      surfaceFieldRef.current = AircraftSurfaceField.fromThreeGroup(root);
+      bvhColliderRef.current = MeshBvhCollider.fromThreeGroup(root, aircraftGroup);
 
       setSurfaceVersion((v) => v + 1);
       setModelLoading(false);
@@ -762,13 +1107,13 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
       })
         .then(({ root }) => {
           if (cancelled || !aircraftGroupRef.current) return;
-          // Extract real 3D mesh vertices & triangle centroids in pure body frame (before AoA pitch)
-          root.updateMatrixWorld(true);
-          surfaceFieldRef.current = AircraftSurfaceField.fromThreeGroup(root);
-
+          // Extract real 3D mesh vertices & BVH collider in pure body frame (relative to aircraftGroup)
           glbRootRef.current = root;
           isGlbCustomRef.current = false;
           aircraftGroupRef.current.add(root);
+          aircraftGroupRef.current.updateMatrixWorld(true);
+          surfaceFieldRef.current = AircraftSurfaceField.fromThreeGroup(root);
+          bvhColliderRef.current = MeshBvhCollider.fromThreeGroup(root, aircraftGroupRef.current);
 
           setSurfaceVersion((v) => v + 1);
           setModelLoading(false);
@@ -833,8 +1178,10 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
 
       proceduralMeshRef.current = procGroup;
       aircraftGroup.add(procGroup);
+      aircraftGroup.updateMatrixWorld(true);
 
       surfaceFieldRef.current = AircraftSurfaceField.fromThreeGroup(procGroup);
+      bvhColliderRef.current = MeshBvhCollider.fromThreeGroup(procGroup, aircraftGroup);
       setSurfaceVersion((v) => v + 1);
       setModelLoading(false);
     }
@@ -853,73 +1200,7 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     webglUnavailable,
   ]);
 
-  // Re-frame particle emitter domain whenever model SDF, rake spread, or flow domain updates
-  useEffect(() => {
-    const pPositions = particlePositionsRef.current;
-    const pStreaks = particleStreaksRef.current;
-    const spawner = spawnParticleRef.current;
-    if (!pPositions || !pStreaks || !spawner) return;
 
-    const count = pPositions.length / 3;
-    for (let i = 0; i < count; i++) {
-      spawner(i, true);
-    }
-    const posAttr = pStreaks.geometry.attributes.position as THREE.BufferAttribute;
-    posAttr.needsUpdate = true;
-  }, [surfaceVersion, params.rake_spread, params.flowDomainVersion]);
-
-  // Evict any particles trapped inside newly loaded or re-pitched solid geometry
-  useEffect(() => {
-    const pPositions = particlePositionsRef.current;
-    const pStreaks = particleStreaksRef.current;
-    if (!pPositions || !pStreaks) return;
-
-    const sf = surfaceFieldRef.current;
-    const minClearance = sf ? Math.max(0.1, sf.dMin * 0.75) : 0.12;
-    const fluid3DParams: Fluid3DParams = {
-      modelType: params.modelType,
-      aoaDeg: params.angle_of_attack,
-      airspeed_kts: params.airspeed_kts,
-      mach: telemetry.mach,
-      altitude_ft: params.altitude_ft,
-      flapsDeg: params.flaps_deg,
-      viscosity: params.viscosity,
-      isStalled: telemetry.isStalled,
-      cl: telemetry.cl,
-      cd: telemetry.cd,
-      surfaceField: sf,
-      calibration: activeCalibrationRef.current,
-    };
-
-    const posAttr = pStreaks.geometry.attributes.position as THREE.BufferAttribute;
-    const streakArr = posAttr.array as Float32Array;
-    const count = pPositions.length / 3;
-    let changed = false;
-
-    for (let i = 0; i < count; i++) {
-      const pt = {
-        x: pPositions[i * 3],
-        y: pPositions[i * 3 + 1],
-        z: pPositions[i * 3 + 2],
-      };
-      if (FluidDynamics3D.isInsideSolid(pt, fluid3DParams, minClearance)) {
-        const out = FluidDynamics3D.constrainToExterior(pt, fluid3DParams, minClearance + 0.04);
-        pPositions[i * 3] = out.x;
-        pPositions[i * 3 + 1] = out.y;
-        pPositions[i * 3 + 2] = out.z;
-        streakArr[i * 6] = out.x - 0.25;
-        streakArr[i * 6 + 1] = out.y;
-        streakArr[i * 6 + 2] = out.z;
-        streakArr[i * 6 + 3] = out.x;
-        streakArr[i * 6 + 4] = out.y;
-        streakArr[i * 6 + 5] = out.z;
-        changed = true;
-      }
-    }
-    if (changed) {
-      posAttr.needsUpdate = true;
-    }
-  }, [surfaceVersion, params.modelType, params.angle_of_attack]);
 
   // Update Dynamic Aircraft Pitch (AoA)
   useEffect(() => {
@@ -1166,127 +1447,31 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     surfaceVersion,
   ]);
 
-  // Update Dynamic Smoke Streamlines (Vortex Flow Law + Real Vertex Surface Field)
+
+
+  // Build & Upload Volumetric Smoke Streamlines / Streakline Seed Geometry
   useEffect(() => {
-    const linesGroup = streamlinesGroupRef.current;
-    if (!linesGroup) return;
+    const smokeMesh = smokeRibbonMeshRef.current;
+    if (!smokeMesh) return;
 
-    // Dispose old geometries & materials cleanly
-    linesGroup.traverse((obj) => {
-      if ((obj as THREE.Mesh).isMesh) {
-        (obj as THREE.Mesh).geometry.dispose();
-        const m = (obj as THREE.Mesh).material;
-        if (Array.isArray(m)) m.forEach((x) => x.dispose());
-        else m.dispose();
-      }
-    });
-    linesGroup.clear();
-    tracedCurvesRef.current = [];
-
-    if (!params.show_streamlines) return;
+    smokeMesh.visible = params.show_streamlines;
+    if (!params.show_streamlines) {
+      smokeFilamentsRef.current = [];
+      smokeMesh.geometry.setDrawRange(0, 0);
+      return;
+    }
 
     const sf = surfaceFieldRef.current;
-    const rakeSpread = params.rake_spread ?? 1.0;
-    const streamlineRes = params.streamline_resolution ?? 1.0;
-    const frame = FluidDynamics3D.getDynamicEmitterFrame(sf, rakeSpread, streamlineRes);
-    const halfSpan = sf ? sf.halfSpan : frame.zHalf;
-    const spanSpread = halfSpan * rakeSpread;
+    const bvh = bvhColliderRef.current;
+    const cal = activeCalibrationRef.current;
+    const isBluffWake =
+      cal &&
+      ((cal.modelClass === 'bluff_body' && cal.wakeTurbulenceOnset >= 0.25) ||
+        (cal.modelClass === 'car' && cal.wakeTurbulenceOnset >= 0.35));
+    const isUnsteady = telemetry.isStalled || params.modelType === 'cylinder' || Boolean(isBluffWake);
+    smokeUnsteadyRef.current = isUnsteady;
 
-    interface RakeFilament {
-      y: number;
-      z: number;
-      type: 'vortex' | 'engine' | 'wing' | 'fuselage';
-    }
-
-    const filaments: RakeFilament[] = [];
-
-    if (params.modelType === 'cylinder') {
-      [-2.4, -1.2, 0.0, 1.2, 2.4].forEach((y) => {
-        [-2.2, -1.25, -0.55, 0.0, 0.55, 1.25, 2.2].forEach((z) =>
-          filaments.push({ y: y * rakeSpread, z: z * rakeSpread, type: 'wing' })
-        );
-      });
-    } else if (
-      params.modelType === 'naca2412' ||
-      params.modelType === 'naca0012' ||
-      params.modelType === 'validation_wing' ||
-      params.modelType === 'custom_airfoil'
-    ) {
-      [-0.85, -0.35, 0.05, 0.45, 0.9].forEach((y) => {
-        [-spanSpread * 0.78, -spanSpread * 0.38, 0.0, spanSpread * 0.38, spanSpread * 0.78].forEach((z) =>
-          filaments.push({ y: frame.yMid + y * rakeSpread, z, type: 'wing' })
-        );
-      });
-      [-halfSpan * 0.98, halfSpan * 0.98].forEach((z) => {
-        [-0.1, 0.2].forEach((y) => filaments.push({ y: frame.yMid + y, z, type: 'vortex' }));
-      });
-    } else if (params.modelType === 'custom_glb' && sf) {
-      const customCal = activeCalibrationRef.current;
-      const isNonLifting =
-        customCal?.modelClass === 'bluff_body' ||
-        customCal?.modelClass === 'car' ||
-        customCal?.modelClass === 'rocket' ||
-        (customCal?.stallAngleDeg ?? 16) <= 0;
-
-      const ySpan = Math.max(0.8, sf.height);
-      const yMid = frame.yMid;
-      const bodyZ = Math.min(0.85, halfSpan * 0.42);
-      const bodyYs = [
-        yMid - ySpan * 0.36 * rakeSpread,
-        yMid,
-        yMid + ySpan * 0.36 * rakeSpread,
-        sf.maxY + 0.35 * rakeSpread,
-      ];
-      [-bodyZ, 0, bodyZ].forEach((z) => {
-        bodyYs.forEach((y) => filaments.push({ y, z, type: 'fuselage' }));
-      });
-
-      const secScratch = { leX: 0, teX: 0, quarterChordX: 0, chord: 1, yMid: 0, thickness: 0.3 };
-      [-0.82, -0.56, -0.3, 0.3, 0.56, 0.82].forEach((frac) => {
-        const z = frac * spanSpread;
-        const secY = sf.getSpanSection(z, secScratch) ? secScratch.yMid : yMid;
-        [-0.45 * rakeSpread, 0.0, 0.45 * rakeSpread].forEach((dy) =>
-          filaments.push({ y: secY + dy, z, type: 'wing' })
-        );
-      });
-
-      if (!isNonLifting) {
-        const tipY = sf.getSpanSection(halfSpan * 0.9, secScratch) ? secScratch.yMid : yMid;
-        [-halfSpan * 0.98, -halfSpan * 0.92, halfSpan * 0.92, halfSpan * 0.98].forEach((z) => {
-          [-0.18, 0.18].forEach((dy) => filaments.push({ y: tipY + dy, z, type: 'vortex' }));
-        });
-      }
-    } else {
-      const yMid = frame.yMid;
-      const bodyH = Math.max(0.8, frame.modelHeight * 0.48 * rakeSpread);
-      // Fuselage / canopy stagnation band (70% focus around airframe)
-      [-0.8, 0.0, 0.8].forEach((z) => {
-        [-bodyH * 0.8, 0.0, bodyH * 0.9].forEach((dy) =>
-          filaments.push({ y: yMid + dy, z, type: 'fuselage' })
-        );
-      });
-      // Main spanwise wing rake adapted to real vertex span
-      [-0.78, -0.52, -0.28, 0.28, 0.52, 0.78].forEach((frac) => {
-        const z = frac * spanSpread;
-        [-0.55 * rakeSpread, 0.05, 0.65 * rakeSpread].forEach((dy) =>
-          filaments.push({ y: yMid + dy, z, type: 'wing' })
-        );
-      });
-      // Wingtip vortex filaments seeded right at actual span tips
-      [-halfSpan * 0.98, -halfSpan * 0.93, halfSpan * 0.93, halfSpan * 0.98].forEach((z) => {
-        [-0.12, 0.18].forEach((dy) => filaments.push({ y: yMid + dy, z, type: 'vortex' }));
-      });
-      // Engine streams
-      if (params.modelType === 'airliner') {
-        [-halfSpan * 0.38, halfSpan * 0.38].forEach((z) =>
-          filaments.push({ y: yMid - frame.modelHeight * 0.22, z, type: 'engine' })
-        );
-      } else if (params.modelType === 'f22') {
-        [-0.67, 0.67].forEach((z) => filaments.push({ y: yMid - 0.25, z, type: 'engine' }));
-      }
-    }
-
-    const fluid3DParams: Fluid3DParams = {
+    const fluidParams: Fluid3DParams = {
       modelType: params.modelType,
       aoaDeg: params.angle_of_attack,
       airspeed_kts: params.airspeed_kts,
@@ -1297,98 +1482,180 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
       isStalled: telemetry.isStalled,
       cl: telemetry.cl,
       cd: telemetry.cd,
-      timeSec: performance.now() * 0.001,
-      streamlineResolution: streamlineRes,
+      timeSec: simTimeRef.current,
+      streamlineResolution: params.streamline_resolution ?? 1.0,
       surfaceField: sf,
-      calibration: activeCalibrationRef.current,
+      bvhCollider: bvh,
+      calibration: cal,
     };
 
-    const densityScale = Math.max(0.4, Math.min(1.6, params.smoke_density));
-    const tubularSegments = Math.min(160, Math.max(84, Math.round(96 * streamlineRes)));
-    const radialSegments = 6;
-    const collectedCurves: TracedCurveData[] = [];
-    const totalPathSpan = Math.max(30, frame.xRecycle - frame.xSpawn + 2);
-    const traceDs = 0.22;
-    const traceSteps = Math.max(150, Math.min(260, Math.ceil(totalPathSpan / traceDs)));
-
-    filaments.forEach((fil) => {
-      let seedY = fil.y;
-      if (!FluidDynamics3D.isValidEmitterSeed(frame.xSpawn, seedY, fil.z, fluid3DParams)) {
-        seedY += fil.y >= frame.yMid ? 0.35 : -0.35;
+    // Derive active 3D Box3 bounds (fallback to analytical/SDF bounds while async GLB loads)
+    let modelBounds: ModelBoundingBox = FluidDynamics3D.getModelBoundingBox(sf, fluidParams);
+    const activeModelRoot = glbRootRef.current || proceduralMeshRef.current;
+    if (activeModelRoot && aircraftGroupRef.current) {
+      aircraftGroupRef.current.updateMatrixWorld(true);
+      _boxBoundsTmp.setFromObject(activeModelRoot);
+      if (!_boxBoundsTmp.isEmpty()) {
+        _boxBoundsTmp.getCenter(_boxCenterTmp);
+        _boxBoundsTmp.getSize(_boxSizeTmp);
+        modelBounds = {
+          center: { x: _boxCenterTmp.x, y: _boxCenterTmp.y, z: _boxCenterTmp.z },
+          minX: _boxBoundsTmp.min.x,
+          maxX: _boxBoundsTmp.max.x,
+          halfY: Math.max(0.25, _boxSizeTmp.y * 0.5),
+          halfZ: Math.max(0.35, _boxSizeTmp.z * 0.5),
+          lengthX: Math.max(0.8, _boxSizeTmp.x),
+        };
       }
-      const pts3D = FluidDynamics3D.traceStreamline(
-        { x: frame.xSpawn, y: seedY, z: fil.z },
-        fluid3DParams,
-        traceSteps,
-        traceDs
-      );
-      if (pts3D.length < 6) return;
+    }
 
-      collectedCurves.push({ points: pts3D });
-
-      const points = pts3D.map((p) => new THREE.Vector3(p.x, p.y, p.z));
-      const curve = new THREE.CatmullRomCurve3(points);
-      const baseRadius = fil.type === 'engine' ? 0.052 : fil.type === 'vortex' ? 0.044 : 0.032;
-      const tubeGeo = new THREE.TubeGeometry(curve, tubularSegments, baseRadius * (0.75 + densityScale * 0.25), radialSegments, false);
-
-      // Per-vertex coloring along the tube based on real Cp, vorticity & separation
-      const posAttr = tubeGeo.attributes.position;
-      const vColors = new Float32Array(posAttr.count * 3);
-      const ringSize = radialSegments + 1;
-
-      for (let seg = 0; seg <= tubularSegments; seg++) {
-        const sampleIdx = Math.min(pts3D.length - 1, Math.round((seg / tubularSegments) * (pts3D.length - 1)));
-        const pt = pts3D[sampleIdx];
-
-        let r = 0.2, g = 0.82, b = 0.6;
-        if (pt.isSeparated || (telemetry.isStalled && fil.y > frame.yMid && pt.x > -1)) {
-          r = 0.94; g = 0.27; b = 0.27; // Turbulent stall separation
-        } else if (fil.type === 'engine') {
-          r = 0.98; g = 0.55; b = 0.18; // Jet exhaust
-        } else if (pt.vorticity > 0.35 || fil.type === 'vortex') {
-          r = 0.22; g = 0.86; b = 1.0; // Biot-Savart vortex core
-        } else if (pt.pressureCoeffClamped < -0.5) {
-          r = 0.14; g = 0.62; b = 0.96; // Suction acceleration
-        } else if (pt.pressureCoeffClamped > 0.25) {
-          r = 0.96; g = 0.72; b = 0.16; // Compression / ram
-        }
-
-        for (let rad = 0; rad < ringSize; rad++) {
-          const vIdx = seg * ringSize + rad;
-          if (vIdx < posAttr.count) {
-            vColors[vIdx * 3] = r;
-            vColors[vIdx * 3 + 1] = g;
-            vColors[vIdx * 3 + 2] = b;
-          }
-        }
-      }
-
-      tubeGeo.setAttribute('color', new THREE.BufferAttribute(vColors, 3));
-
-      const tubeMat = new THREE.MeshBasicMaterial({
-        vertexColors: true,
-        transparent: true,
-        opacity: Math.min(0.92, (fil.type === 'vortex' ? 0.78 : 0.58) * (0.65 + densityScale * 0.35)),
-      });
-      linesGroup.add(new THREE.Mesh(tubeGeo, tubeMat));
+    const seeds = FluidDynamics3D.buildUnifiedRakeSeeds(modelBounds, fluidParams, {
+      layerGap: params.layer_gap ?? DEFAULT_LAYER_GAP,
+      rakeSpread: params.rake_spread ?? 1.0,
+      maxFilaments: MAX_FILAMENTS,
     });
 
-    tracedCurvesRef.current = collectedCurves;
+    const resScale = Math.max(0.5, Math.min(2.0, params.streamline_resolution ?? 1.0));
+    const maxSteps = Math.min(MAX_NODES_PER_FILAMENT - 1, Math.round(135 * Math.min(1.18, resScale)));
+    const xWakeEnd = modelBounds.maxX + Math.max(7.5, 1.8 * modelBounds.lengthX);
+    const xSpawn = modelBounds.minX - 1.5 * Math.max(0.8, modelBounds.lengthX);
+    const desiredSpan = Math.max(18.0, xWakeEnd - xSpawn);
+    const stepDs = Math.max(0.14, Math.max(desiredSpan / maxSteps, 0.24 / resScale));
+
+    const filaments: UnsteadyFilamentState[] = [];
+    for (const seed of seeds) {
+      const traced = FluidDynamics3D.traceStreamline(seed, fluidParams, maxSteps, stepDs);
+      if (traced.length < 2) continue;
+
+      const vSeed = FluidDynamics3D.getVelocity(seed, fluidParams);
+      const nodes: FilamentNode[] = [
+        {
+          x: seed.x,
+          y: seed.y,
+          z: seed.z,
+          speed: vSeed.speed,
+          cp: vSeed.pressureCoeffClamped,
+          vorticity: vSeed.vorticity,
+          isSeparated: vSeed.isSeparated,
+        },
+        ...traced.slice(0, MAX_NODES_PER_FILAMENT - 1).map((pt) => ({
+          x: pt.x,
+          y: pt.y,
+          z: pt.z,
+          speed: pt.speed,
+          cp: pt.pressureCoeffClamped,
+          vorticity: pt.vorticity,
+          isSeparated: pt.isSeparated,
+        })),
+      ];
+      filaments.push({ seed, nodes });
+    }
+
+    smokeFilamentsRef.current = filaments;
+    packSmokeFilamentsToMesh(smokeMesh, filaments, params.viscosity, params.smoke_density);
   }, [
     params.show_streamlines,
     params.modelType,
     params.angle_of_attack,
     params.airspeed_kts,
+    params.altitude_ft,
     params.flaps_deg,
     params.viscosity,
     params.smoke_density,
     params.rake_spread,
+    params.layer_gap,
     params.streamline_resolution,
+    params.streamline_count,
     params.flowDomainVersion,
     telemetry.cl,
+    telemetry.cd,
     telemetry.mach,
     telemetry.isStalled,
     surfaceVersion,
+    customGlbAsset,
+  ]);
+
+  // Seed Stratified Lagrangian PIV Particle Field
+  useEffect(() => {
+    const pivLines = pivLinesRef.current;
+    if (!pivLines) return;
+
+    pivLines.visible = params.show_particles;
+    const pState = pivStateRef.current;
+    if (!params.show_particles) {
+      pState.count = 0;
+      pivLines.geometry.setDrawRange(0, 0);
+      return;
+    }
+
+    const sf = surfaceFieldRef.current;
+    const frame = FluidDynamics3D.getDynamicEmitterFrame(
+      sf,
+      params.rake_spread ?? 1.0,
+      params.streamline_resolution ?? 1.0
+    );
+    const fluidParams: Fluid3DParams = {
+      modelType: params.modelType,
+      aoaDeg: params.angle_of_attack,
+      airspeed_kts: params.airspeed_kts,
+      mach: telemetry.mach,
+      altitude_ft: params.altitude_ft,
+      flapsDeg: params.flaps_deg,
+      viscosity: params.viscosity,
+      isStalled: telemetry.isStalled,
+      cl: telemetry.cl,
+      cd: telemetry.cd,
+      timeSec: simTimeRef.current,
+      streamlineResolution: params.streamline_resolution ?? 1.0,
+      surfaceField: sf,
+      bvhCollider: bvhColliderRef.current,
+      calibration: activeCalibrationRef.current,
+    };
+
+    const targetCount = Math.min(
+      MAX_PIV_PARTICLES,
+      Math.max(20, Math.round(params.particle_count ?? 480))
+    );
+    const inletX = frame.xSpawn;
+    const modelStartX = sf ? sf.minX - 0.5 : -3.2;
+    const fillSpan = Math.max(2.0, modelStartX - inletX);
+    const clearance = sf ? Math.max(0.08, sf.dMin * 0.38) : 0.12;
+
+    for (let i = 0; i < targetCount; i++) {
+      const isInner = i < Math.round(targetCount * 0.65);
+      const yScale = isInner ? 0.65 : 1.05;
+      const zScale = isInner ? 0.72 : 1.05;
+      const rawPt = {
+        x: inletX + Math.random() * fillSpan,
+        y: frame.yMid + (Math.random() * 2 - 1) * frame.yHalf * yScale,
+        z: (Math.random() * 2 - 1) * frame.zHalf * zScale,
+      };
+      if (bvhColliderRef.current) {
+        bvhColliderRef.current.deflectWorldPointAndVelocity(
+          rawPt,
+          null,
+          params.angle_of_attack,
+          clearance,
+          sf
+        );
+      }
+      const pt = FluidDynamics3D.constrainToExterior(rawPt, fluidParams, clearance);
+      pState.x[i] = pt.x;
+      pState.y[i] = pt.y;
+      pState.z[i] = pt.z;
+      pState.age[i] = Math.random() * 2.0;
+      pState.innerFlag[i] = isInner ? 1 : 0;
+    }
+    pState.count = targetCount;
+  }, [
+    params.show_particles,
+    params.particle_count,
+    params.smoke_density,
+    params.rake_spread,
+    params.modelType,
+    params.flowDomainVersion,
+    surfaceVersion,
+    customGlbAsset,
   ]);
 
   // Update 3D Vector Quiver Grid (when params.show_quiver is enabled)
@@ -1510,13 +1777,6 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
   };
 
   const currentMeta = GLB_MODEL_REGISTRY[params.modelType];
-  const { posStallAngle, negStallAngle } = getEffectiveStallAngles(params.modelType, params.flaps_deg);
-  const isNearOrAboveStall =
-    telemetry.isStalled ||
-    (posStallAngle > 0 && params.angle_of_attack >= posStallAngle - 2) ||
-    (negStallAngle > 0 && params.angle_of_attack <= -(negStallAngle - 2));
-  const showStreamlineCaveat =
-    isNearOrAboveStall || params.modelType === 'concorde' || telemetry.mach > 0.7;
 
   return (
     <div className="relative w-full h-full min-h-[220px] sm:min-h-[360px] lg:min-h-[420px] rounded-xl overflow-hidden border border-[var(--border)] bg-[#0D1114] shadow-[var(--shadow-tech)] flex flex-col group select-none">
@@ -1666,16 +1926,8 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
         </div>
       </div>
 
-      {/* Bottom Floating Controls Dock & Regime-Aware Streamline Caveat */}
+      {/* Bottom Floating Controls Dock */}
       <div className="absolute bottom-2 left-2 right-2 flex flex-col gap-1.5 pointer-events-none z-10">
-        {showStreamlineCaveat && (
-          <div className="self-start max-w-full sm:max-w-xl px-2.5 py-1 rounded-lg bg-[#151A1E]/92 border border-amber-500/35 text-[10px] sm:text-[10.5px] text-slate-300 leading-snug flex items-start gap-1.5">
-            <Info weight="duotone" className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
-            <span>
-              Visual streamlines show attached subsonic potential-flow trajectories; nonlinear leading-edge vortex separation and shock waves are not resolved in 3D.
-            </span>
-          </div>
-        )}
 
         <div className="flex flex-wrap items-center justify-between gap-1.5">
           {/* Camera Presets & Turntable */}
