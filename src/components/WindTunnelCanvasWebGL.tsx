@@ -1772,7 +1772,7 @@ export const WindTunnelCanvasWebGL: React.FC<WindTunnelCanvasWebGLProps> = ({
     const dataUrl = rendererRef.current.domElement.toDataURL('image/png');
     const a = document.createElement('a');
     a.href = dataUrl;
-    a.download = `aerolab-${params.modelType}-vortex-flow-${Date.now()}.png`;
+    a.download = `aeromatrix-${params.modelType}-vortex-flow-${Date.now()}.png`;
     a.click();
   };
 

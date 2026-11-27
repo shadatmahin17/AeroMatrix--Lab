@@ -763,7 +763,7 @@ export default function ResultsAnalytics({
     if (!sheetRows.length) return;
     const base = stem(airfoilName).replace(/[^\w.-]+/g, "_");
     const payload = {
-      tool: "AeroLab 2D Wind Tunnel",
+      tool: "AeroMatrix 2D Wind Tunnel",
       solver: "D2Q9 Lattice-Boltzmann (Smagorinsky LES)",
       exportedAt: new Date().toISOString(),
       rowCount: sheetRows.length,

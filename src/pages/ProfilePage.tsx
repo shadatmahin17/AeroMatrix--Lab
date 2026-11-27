@@ -682,7 +682,7 @@ export default function ProfilePage({
         >
           <img
             src="/aerolab-logo.png"
-            alt="AeroLab"
+            alt="AeroMatrix"
             className="h-6 sm:h-7 w-auto object-contain shrink-0"
           />
           <span className="hidden sm:inline font-script text-xl leading-none text-[#1769AA] pt-0.5 whitespace-nowrap">
@@ -756,7 +756,7 @@ export default function ProfilePage({
                 <div className="flex flex-col items-center gap-1.5">
                   <img
                     src="/aerolab-logo.png"
-                    alt="AeroLab"
+                    alt="AeroMatrix"
                     className="h-9 w-auto object-contain"
                   />
                   <span className="font-script text-2xl leading-none text-[#1769AA]">
@@ -1944,7 +1944,7 @@ export default function ProfilePage({
       )}
 
       <footer className="mt-auto py-3 px-4 sm:px-6 border-t border-[var(--border)] bg-[var(--surface)] flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#5C6670]">
-        <span className="font-medium text-[#161A1D]">AeroLab Workstation</span>
+        <span className="font-medium text-[#161A1D]">AeroMatrix Workstation</span>
         <div className="flex items-center gap-2 whitespace-nowrap">
           <span className="font-medium text-[#161A1D]">Develop by Shadat Hossen Mahin</span>
           <span className="text-[var(--border)]" aria-hidden="true">·</span>

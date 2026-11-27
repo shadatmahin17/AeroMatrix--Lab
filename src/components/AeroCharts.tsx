@@ -915,7 +915,7 @@ export const AeroCharts: React.FC<AeroChartsProps> = ({
           : activeTab === 'dragPolar'
             ? 'drag_polar_cl_cd'
             : 'pressure_dist_cp';
-    return `aerolab_${modelType}_${tabSuffix}_aoa${currentAoa >= 0 ? '+' : ''}${currentAoa.toFixed(1)}deg`;
+    return `aeromatrix_${modelType}_${tabSuffix}_aoa${currentAoa >= 0 ? '+' : ''}${currentAoa.toFixed(1)}deg`;
   };
 
   const handleExportSvg = () => {

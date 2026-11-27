@@ -248,7 +248,7 @@ describe('Finite-Wing Lifting-Line, Exact Drag Sum, Presets & Flat-Plate Cf', ()
     const telemetry = calculateAeroTelemetry('naca0012', 5, 150, 5000, 0);
     const { blob, fileName } = generateEngineeringPdfBlob('naca0012', params, telemetry);
 
-    expect(fileName).toBe('aerolab_report_naca0012_aoa5.0deg.pdf');
+    expect(fileName).toBe('aeromatrix_report_naca0012_aoa5.0deg.pdf');
     expect(blob.type).toBe('application/pdf');
     expect(blob.size).toBeGreaterThan(1500);
     const header = await blob.slice(0, 5).text();
@@ -379,7 +379,7 @@ describe('F-22 Acceptance Test & 4-Page PDF Report Verification', () => {
     const { telemetry } = solveAeroStateSI('f22', 5.0, 180.06, 3000.1, 0);
     const { blob, fileName, bundle } = generateEngineeringPdfBlob('f22', params, telemetry);
 
-    expect(fileName).toBe('aerolab_report_f22_aoa5.0deg.pdf');
+    expect(fileName).toBe('aeromatrix_report_f22_aoa5.0deg.pdf');
     expect(bundle.model.name).toBe('F-22 Raptor (Fighter)');
     expect(bundle.verificationDistinction.numericalVerification.status).toBe('verified');
     expect(bundle.verificationDistinction.numericalVerification.quadraturePassed).toBe(true);
@@ -390,7 +390,7 @@ describe('F-22 Acceptance Test & 4-Page PDF Report Verification', () => {
     }
     expect(bundle.verificationDistinction.modelValidation.status).toBe('empirical-only');
     expect(bundle.verificationDistinction.operatingApplicability.status).toBe('within-envelope');
-    expect(bundle.reproducibility.logoAssetPath).toBe('/public/aerolab-logo.png');
+    expect(bundle.reproducibility.logoAssetPath).toBe('/public/logo-white-pdf.png');
 
     const md = formatEngineeringReportMarkdown(bundle);
     expect(md).not.toContain('80/20');

@@ -286,7 +286,7 @@ export function runExportReportTask(
     const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     return {
       result: {
-        fileName: `aerolab_report_${input.modelType}_aoa${input.params.angle_of_attack.toFixed(1)}deg.md`,
+        fileName: `aeromatrix_report_${input.modelType}_aoa${input.params.angle_of_attack.toFixed(1)}deg.md`,
         mimeType: 'text/markdown;charset=utf-8',
         buffer,
         textContent: md,
@@ -300,7 +300,7 @@ export function runExportReportTask(
   const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   return {
     result: {
-      fileName: `aerolab_report_${input.modelType}_aoa${input.params.angle_of_attack.toFixed(1)}deg.json`,
+      fileName: `aeromatrix_report_${input.modelType}_aoa${input.params.angle_of_attack.toFixed(1)}deg.json`,
       mimeType: 'application/json;charset=utf-8',
       buffer,
       textContent: json,

@@ -451,7 +451,7 @@ export default function D3AirfoilLabGraphs({
     }
   }, [mode, width, validSamples, stats, alpha, neutralRef]);
 
-  const exportBase = `aerolab_2d_d3_${mode}_aoa${alpha.toFixed(1)}deg`;
+  const exportBase = `aeromatrix_2d_d3_${mode}_aoa${alpha.toFixed(1)}deg`;
 
   return (
     <div className="antigravity-glass rounded-xl p-3.5 flex flex-col gap-2.5 min-w-0">

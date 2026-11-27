@@ -982,8 +982,8 @@ export default function LearningLabPage({ onApplyToWorkstation }: LearningLabPag
           to="/"
           className="text-base sm:text-lg font-bold tracking-tight text-[#161A1D] whitespace-nowrap shrink-0 flex items-center gap-2.5"
         >
-          <img src="/aerolab-logo.png" alt="AeroLab" className="h-6 w-auto object-contain shrink-0" />
-          <span>AeroLab</span>
+          <img src="/aerolab-logo.png" alt="AeroMatrix" className="h-6 w-auto object-contain shrink-0" />
+          <span>AeroMatrix</span>
         </Link>
 
         <nav

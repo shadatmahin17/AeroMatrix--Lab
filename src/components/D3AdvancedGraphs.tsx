@@ -995,7 +995,7 @@ export const D3AdvancedGraphs: React.FC<D3AdvancedGraphsProps> = ({
     telemetry,
   ]);
 
-  const exportBase = `aerolab_d3_${modelType}_${activeTab}_aoa${currentAoa.toFixed(1)}deg`;
+  const exportBase = `aeromatrix_d3_${modelType}_${activeTab}_aoa${currentAoa.toFixed(1)}deg`;
 
   return (
     <div className="w-full p-3 sm:p-3.5 rounded-xl antigravity-glass flex flex-col gap-2.5">

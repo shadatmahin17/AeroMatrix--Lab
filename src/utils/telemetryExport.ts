@@ -68,7 +68,7 @@ export function downloadTelemetryJSON(payload: ExportDataPayload): string {
 
   const jsonSnapshot = {
     version: '2.0.0',
-    generator: 'AeroLab Aerodynamics Simulation & Engineering Laboratory',
+    generator: 'AeroMatrix Aerodynamics Simulation & Engineering Laboratory',
     solverModel: telemetry.solverModel,
     timestamp,
     aircraft: {
@@ -149,7 +149,7 @@ export function downloadTelemetryJSON(payload: ExportDataPayload): string {
 
   const jsonString = JSON.stringify(jsonSnapshot, null, 2);
   const blob = new Blob([jsonString], { type: 'application/json;charset=utf-8;' });
-  const fileName = `aerolab_${currentModel.id}_aoa${payload.aoaDeg >= 0 ? '+' : ''}${payload.aoaDeg.toFixed(1)}deg_m${telemetry.mach.toFixed(2)}.json`;
+  const fileName = `aeromatrix_${currentModel.id}_aoa${payload.aoaDeg >= 0 ? '+' : ''}${payload.aoaDeg.toFixed(1)}deg_m${telemetry.mach.toFixed(2)}.json`;
 
   triggerDownload(blob, fileName);
   return fileName;
@@ -275,7 +275,7 @@ export function downloadTelemetryCSV(payload: ExportDataPayload): string {
   ].join('\n');
 
   const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-  const fileName = `aerolab_${currentModel.id}_aoa${payload.aoaDeg >= 0 ? '+' : ''}${payload.aoaDeg.toFixed(1)}deg_m${payload.telemetry.mach.toFixed(2)}.csv`;
+  const fileName = `aeromatrix_${currentModel.id}_aoa${payload.aoaDeg >= 0 ? '+' : ''}${payload.aoaDeg.toFixed(1)}deg_m${payload.telemetry.mach.toFixed(2)}.csv`;
 
   triggerDownload(blob, fileName);
   return fileName;

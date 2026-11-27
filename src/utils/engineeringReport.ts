@@ -15,7 +15,7 @@ import {
 
 declare const __AEROLAB_LOGO_DATA_URL__: string | undefined;
 
-const EMBEDDED_LOGO_PATH = '/public/aerolab-logo.png';
+const EMBEDDED_LOGO_PATH = '/public/logo-white-pdf.png';
 
 interface NodeBuiltinFs {
   existsSync(path: string): boolean;
@@ -67,7 +67,7 @@ function getLogoDataUrl(): string {
   const pathMod = getNodeBuiltin<NodeBuiltinPath>('node:path');
   const proc = typeof process !== 'undefined' ? (process as unknown as NodeProcessLike) : null;
   if (fsMod && pathMod && proc?.cwd) {
-    const absPath = pathMod.resolve(proc.cwd(), 'public/aerolab-logo.png');
+    const absPath = pathMod.resolve(proc.cwd(), 'public/logo-white-pdf.png');
     if (fsMod.existsSync(absPath)) {
       cachedLogoDataUrl = `data:image/png;base64,${uint8ArrayToBase64(fsMod.readFileSync(absPath))}`;
       return cachedLogoDataUrl;
@@ -104,7 +104,7 @@ function tryLoadDejaVuFontsSyncNode(): DejaVuFontCache | null {
 }
 
 /**
- * Preloads /public/fonts/DejaVuSans.ttf and DejaVuSans-Bold.ttf (and /public/aerolab-logo.png
+ * Preloads /public/fonts/DejaVuSans.ttf and DejaVuSans-Bold.ttf (and /public/logo-white-pdf.png
  * if needed) so browser & Web Worker PDF exports render full Greek & mathematical Unicode glyphs.
  */
 export async function ensurePdfFontsLoaded(): Promise<void> {
@@ -130,7 +130,7 @@ export async function ensurePdfFontsLoaded(): Promise<void> {
         };
       }
       if (!cachedLogoDataUrl.startsWith('data:image/')) {
-        const logoRes = await fetch('/aerolab-logo.png');
+        const logoRes = await fetch('/logo-white-pdf.png');
         if (logoRes.ok) {
           const logoBuf = await logoRes.arrayBuffer();
           cachedLogoDataUrl = `data:image/png;base64,${uint8ArrayToBase64(new Uint8Array(logoBuf))}`;
@@ -596,7 +596,7 @@ export function formatEngineeringReportMarkdown(bundle: EngineeringReportBundle)
         : 'Laminar-dominated, Re < 1×10⁵';
 
   const lines: string[] = [
-    `# AeroLab Engineering Simulation Report`,
+    `# AeroMatrix Engineering Simulation Report`,
     ``,
     `- **Configuration:** ${model.name}`,
     `- **Generated (UTC):** ${bundle.generatedAt}`,
@@ -693,7 +693,7 @@ export function downloadEngineeringMarkdownReport(
 ): string {
   const bundle = buildEngineeringReportBundle(modelType, params, telemetry);
   const md = formatEngineeringReportMarkdown(bundle);
-  const fileName = `aerolab_report_${modelType}_aoa${params.angle_of_attack.toFixed(1)}deg.md`;
+  const fileName = `aeromatrix_report_${modelType}_aoa${params.angle_of_attack.toFixed(1)}deg.md`;
   triggerBlobDownload(new Blob([md], { type: 'text/markdown;charset=utf-8' }), fileName);
   return fileName;
 }
@@ -705,7 +705,7 @@ export function downloadEngineeringJsonReport(
 ): string {
   const bundle = buildEngineeringReportBundle(modelType, params, telemetry);
   const json = JSON.stringify(bundle, null, 2);
-  const fileName = `aerolab_report_${modelType}_aoa${params.angle_of_attack.toFixed(1)}deg.json`;
+  const fileName = `aeromatrix_report_${modelType}_aoa${params.angle_of_attack.toFixed(1)}deg.json`;
   triggerBlobDownload(new Blob([json], { type: 'application/json;charset=utf-8' }), fileName);
   return fileName;
 }
@@ -836,7 +836,7 @@ function toAsciiFallback(text: string): string {
 
 /**
  * Generates a structured 4-page A4 PDF Aerospace Engineering Simulation Report
- * matching the AeroLab reference layout using jsPDF and DejaVu Sans.
+ * matching the AeroMatrix reference layout using jsPDF and DejaVu Sans.
  */
 export function generateEngineeringPdfBlob(
   modelType: AircraftModelType,
@@ -1068,60 +1068,57 @@ export function generateEngineeringPdfBlob(
   };
 
   doc.setProperties({
-    title: `AeroLab Engineering Report - ${model.name}`,
+    title: `AeroMatrix Engineering Report - ${model.name}`,
     subject: 'Aerodynamic Simulation & SI Telemetry Verification Report',
-    creator: 'AeroLab Wind Tunnel',
+    creator: 'AeroMatrix Wind Tunnel',
   });
 
   // =========================================================================
   // PAGE 1: HEADER + OPERATING-POINT SUMMARY + SECTIONS 1, 2, 3
   // =========================================================================
 
-  // Header band: #1b6aa5, 22 mm tall, full content width (174 mm), Page 1 only
+  // Header band: dark slate-navy (#0f172a) with accent border so the transparent
+  // white + blue AeroMatrix logo renders directly without any white background box.
   const bannerH = 22;
-  doc.setFillColor(ACCENT_BLUE[0], ACCENT_BLUE[1], ACCENT_BLUE[2]);
+  const HEADER_DARK_BG: [number, number, number] = [15, 23, 42];
+  doc.setFillColor(HEADER_DARK_BG[0], HEADER_DARK_BG[1], HEADER_DARK_BG[2]);
   doc.rect(marginX, y, contentW, bannerH, 'F');
+  doc.setFillColor(ACCENT_BLUE[0], ACCENT_BLUE[1], ACCENT_BLUE[2]);
+  doc.rect(marginX, y + bannerH - 1.0, contentW, 1.0, 'F');
 
-  const logoBoxW = 36;
-  const logoBoxH = 16;
-  const logoBoxX = marginX + 3;
-  const logoBoxY = y + (bannerH - logoBoxH) / 2;
-  doc.setFillColor(255, 255, 255);
-  doc.roundedRect(logoBoxX, logoBoxY, logoBoxW, logoBoxH, 1.8, 1.8, 'F');
-
-  const logoW = 30;
-  const logoH = Number(((logoW * 409) / 830).toFixed(2));
-  const logoX = logoBoxX + (logoBoxW - logoW) / 2;
-  const logoY = logoBoxY + (logoBoxH - logoH) / 2;
+  const logoW = 34;
+  const logoH = Number(((logoW * 440) / 938).toFixed(2));
+  const logoX = marginX + 4;
+  const logoY = y + (bannerH - 1.0 - logoH) / 2;
   const logoDataUrl = getLogoDataUrl();
   if (logoDataUrl.startsWith('data:image/')) {
     try {
-      doc.addImage(logoDataUrl, 'PNG', logoX, logoY, logoW, logoH, 'aerolab-logo', 'FAST');
+      doc.addImage(logoDataUrl, 'PNG', logoX, logoY, logoW, logoH, 'aeromatrix-logo', 'FAST');
     } catch {
-      drawRichText('AERO Lab', logoBoxX + logoBoxW / 2, logoBoxY + 9.5, 10, ACCENT_BLUE, {
+      drawRichText('AERO Matrix', logoX + logoW / 2, y + 11.5, 10, [255, 255, 255], {
         bold: true,
         align: 'center',
       });
     }
   } else {
-    drawRichText('AERO Lab', logoBoxX + logoBoxW / 2, logoBoxY + 9.5, 10, ACCENT_BLUE, {
+    drawRichText('AERO Matrix', logoX + logoW / 2, y + 11.5, 10, [255, 255, 255], {
       bold: true,
       align: 'center',
     });
   }
 
   const headerTextX = marginX + 43;
-  drawRichText('AEROLAB ENGINEERING SIMULATION REPORT', headerTextX, y + 7.8, 12.5, [255, 255, 255], {
+  drawRichText('AEROMATRIX ENGINEERING SIMULATION REPORT', headerTextX, y + 7.6, 12.0, [255, 255, 255], {
     bold: true,
   });
   drawRichText(
     `Configuration: ${model.name}  |  Generated (UTC): ${bundle.generatedAt}`,
     headerTextX,
-    y + 13.0,
+    y + 12.8,
     8.0,
-    [240, 247, 253]
+    [226, 232, 240]
   );
-  drawRichText(`Solver: ${bundle.solverLabel}`, headerTextX, y + 17.5, 6.8, [215, 234, 248]);
+  drawRichText(`Solver: ${bundle.solverLabel}`, headerTextX, y + 17.3, 6.8, [160, 185, 210]);
 
   y += bannerH + 6.0;
 
@@ -1697,7 +1694,7 @@ export function generateEngineeringPdfBlob(
     doc.setLineWidth(0.25);
     doc.line(marginX, pageHeight - 12, marginX + contentW, pageHeight - 12);
     drawRichText(
-      'AeroLab Aerospace Simulation & Engineering Laboratory (SI Units)',
+      'AeroMatrix Aerospace Simulation & Engineering Laboratory (SI Units)',
       marginX,
       pageHeight - 7.5,
       7.5,
@@ -1708,7 +1705,7 @@ export function generateEngineeringPdfBlob(
     });
   }
 
-  const fileName = `aerolab_report_${modelType}_aoa${params.angle_of_attack.toFixed(1)}deg.pdf`;
+  const fileName = `aeromatrix_report_${modelType}_aoa${params.angle_of_attack.toFixed(1)}deg.pdf`;
   const arrayBuffer = doc.output('arraybuffer');
   const blob = new Blob([arrayBuffer], { type: 'application/pdf' });
   return { blob, fileName, bundle };

@@ -964,7 +964,7 @@ function UnifiedWorkstation({
   return (
     <div className="h-screen h-[100dvh] w-full overflow-hidden bg-[var(--bg)] text-[var(--text)] flex flex-col font-sans select-none selection:bg-[var(--accent-light)] selection:text-[var(--accent)]">
       <h1 className="sr-only">
-        AeroLab - Unified 3D Aircraft CFD &amp; 2D Airfoil Wind Tunnel Workstation
+        AeroMatrix - Unified 3D Aircraft CFD &amp; 2D Airfoil Wind Tunnel Workstation
       </h1>
 
       {/* 1. UNIFIED RESPONSIVE WORKSTATION HEADER */}
@@ -976,7 +976,7 @@ function UnifiedWorkstation({
             <div className="flex items-center gap-2">
               <img
                 src="/aerolab-logo.png"
-                alt="AeroLab"
+                alt="AeroMatrix"
                 className="h-5 sm:h-6 lg:h-7 w-auto object-contain shrink-0"
               />
               <span className="hidden lg:inline font-script text-xl leading-none text-[#1769AA] pt-0.5 whitespace-nowrap">

@@ -49,7 +49,7 @@ function toAppUser(u: SupabaseAuthUser | null): AppUser | null {
   const localBanner = getLocalBanner(u.id);
   const avatarRemoved = meta.avatar_removed === true;
   const displayName = String(
-    meta.full_name || meta.name || localDetails.displayName || u.email?.split("@")[0] || "AeroLab Pilot"
+    meta.full_name || meta.name || localDetails.displayName || u.email?.split("@")[0] || "AeroMatrix Pilot"
   );
   const photoURL = localAvatar
     ? localAvatar
@@ -154,7 +154,7 @@ export class AppErrorBoundary extends Component<{ children: ReactNode }, ErrorBo
       return (
         <div className="min-h-screen w-full bg-[var(--bg)] text-[var(--text)] flex items-center justify-center p-4">
           <div className="max-w-md w-full antigravity-glass rounded-xl p-5 flex flex-col gap-3">
-            <h1 className="text-base font-bold text-[#161A1D]">AeroLab Encountered an Error</h1>
+            <h1 className="text-base font-bold text-[#161A1D]">AeroMatrix Encountered an Error</h1>
             <p className="text-xs text-[#5C6670] font-mono break-all bg-[var(--bg)] border border-[var(--border)] rounded-lg p-3">
               {this.state.message}
             </p>
@@ -303,7 +303,7 @@ export function SupabaseProvider({ children }: { children: ReactNode }) {
       setAuthError(null);
       setAuthNotice(null);
       try {
-        const cleanName = (displayName || email.split("@")[0] || "AeroLab Pilot").trim().slice(0, 80);
+        const cleanName = (displayName || email.split("@")[0] || "AeroMatrix Pilot").trim().slice(0, 80);
         const { data, error } = await supabase.auth.signUp({
           email: email.trim(),
           password,

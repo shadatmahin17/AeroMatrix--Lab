@@ -255,7 +255,7 @@ export function computeAirfoilGeometryStats(coords: number[][]): { camberPct: nu
 function mapUserProfile(row: Record<string, unknown>, fallbackUid: string): UserProfileDoc {
   return {
     uid: String(row.uid || fallbackUid),
-    displayName: String(row.display_name || "AeroLab Pilot"),
+    displayName: String(row.display_name || "AeroMatrix Pilot"),
     photoURL: String(row.photo_url || ""),
     totalUploads: Number(row.total_uploads || 0),
     totalRuns: Number(row.total_runs || 0),
@@ -424,7 +424,7 @@ export async function ensureUserProfile(statsHint?: {
     (user.user_metadata?.full_name as string | undefined) ||
     (user.user_metadata?.name as string | undefined) ||
     user.email?.split("@")[0] ||
-    "AeroLab Pilot";
+    "AeroMatrix Pilot";
   const fallbackName = metaName.slice(0, 80);
   const photoURL = String(user.user_metadata?.avatar_url || user.user_metadata?.picture || "").slice(0, 512);
 
